@@ -74,9 +74,18 @@ class DesktopDecoder:
         self.codec = av.CodecContext.create("h264", "r")
         self.codec.thread_count = min(4, os.cpu_count() or 1)
         self.codec.thread_type = "SLICE"
+        self.decode_ms = self.convert_ms = 0.0
 
     def decode(self, payload):
-        return [frame.reformat(format="rgb24") for frame in self.codec.decode(av.Packet(payload))]
+        started = time.perf_counter()
+        decoded = self.codec.decode(av.Packet(payload))
+        converted = time.perf_counter()
+        # Qt paints native 32-bit pixels; RGB24 requires another expansion.
+        frames = [frame.reformat(format="bgra") for frame in decoded]
+        finished = time.perf_counter()
+        self.decode_ms = (converted - started) * 1000
+        self.convert_ms = (finished - converted) * 1000
+        return frames
 
 
 def create_encoder(config, encoder="libx264", monitor_index=1):

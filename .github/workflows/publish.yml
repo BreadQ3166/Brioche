@@ -1,0 +1,89 @@
+name: Publish verified Brioche
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Successful Build Brioche run on main
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_RUN: ${{ inputs.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate build, verify artifacts and publish prerelease
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, re, shutil, subprocess, zipfile
+          from pathlib import Path
+
+          def gh(*args):
+              return subprocess.check_output(['gh', *args], text=True).strip()
+
+          run_id = os.environ['BUILD_RUN']
+          assert re.fullmatch(r'[0-9]+', run_id)
+          repo = os.environ['GH_REPO']
+          run = json.loads(gh('api', f'repos/{repo}/actions/runs/{run_id}'))
+          assert run['repository']['full_name'] == repo
+          assert run['name'] == 'Build Brioche'
+          assert run['conclusion'] == 'success' and run['status'] == 'completed'
+          assert run['head_branch'] == 'main' and run['event'] in ('push', 'workflow_dispatch')
+          sha = run['head_sha']
+          assert re.fullmatch(r'[0-9a-f]{40}', sha)
+          subprocess.run(['git', 'checkout', '--detach', sha], check=True)
+          import runpy
+          version = runpy.run_path('src/brioche/__init__.py')['__version__']
+          assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', version)
+          tag = 'v' + version
+          output = Path(os.environ['RUNNER_TEMP']) / 'publish'
+          output.mkdir()
+          for platform in ('Windows', 'Ubuntu'):
+              folder = Path(os.environ['RUNNER_TEMP']) / platform
+              gh('run', 'download', run_id, '-n', f'Brioche-{platform}-x64', '-D', str(folder))
+              verified = set()
+              for line in (folder / 'SHA256SUMS').read_text().splitlines():
+                  digest, name = line.split(maxsplit=1)
+                  assert Path(name).name == name and re.fullmatch(r'[0-9a-f]{64}', digest)
+                  path = folder / name
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+                  verified.add(name)
+              name = f'Brioche-{version}-windows-x64.zip' if platform == 'Windows' else f'brioche_{version}_amd64.deb'
+              media = 'Brioche-media-sources-' + ('windows' if platform == 'Windows' else 'linux') + '.zip'
+              for item in (name, media):
+                  assert item in verified
+                  if item.endswith('.zip'):
+                      with zipfile.ZipFile(folder / item) as archive:
+                          assert archive.testzip() is None
+                  shutil.copy2(folder / item, output / item)
+          source = output / f'brioche-{version}-source.zip'
+          subprocess.run(['git', 'archive', '--format=zip', '--prefix=Brioche/', '--output=' + str(source), sha], check=True)
+          subprocess.run(['python3', 'scripts/checksums.py', str(output)], check=True)
+          notes = Path('docs/releases') / (version + '.md')
+          assert notes.is_file()
+          gh('release', 'create', tag, '--target', sha, '--draft', '--prerelease', '--title', 'Brioche ' + version,
+             '--notes-file', str(notes))
+          gh('release', 'upload', tag, *(str(p) for p in sorted(output.iterdir())))
+          remote = json.loads(gh('api', f'repos/{repo}/releases/tags/{tag}'))
+          assert len(remote['assets']) == len(list(output.iterdir()))
+          for asset in remote['assets']:
+              path = output / asset['name']
+              assert path.is_file() and asset['state'] == 'uploaded' and path.stat().st_size == asset['size']
+              assert asset['digest'] == 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
+          gh('release', 'edit', tag, '--draft=false', '--prerelease', '--latest=false')
+          print(f'https://github.com/{repo}/releases/tag/{tag}')
+          PY

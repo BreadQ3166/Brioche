@@ -35,6 +35,7 @@ def stream_info(media, monitors, selected, epoch, view_only, kind="welcome", req
         "source_left": media.monitor["left"], "source_top": media.monitor["top"],
         "fps_limit": int(media.codec.framerate), "encoder": media.encoder_name,
         "capture": media.capture.backend, "encoder_fallback": getattr(media,"fallback_reason",""), "input": not view_only,
+        "timing_scope": "packet_wait" if getattr(media, "paced", False) else "capture_encode",
         "monitors": monitors, "monitor": selected, "stream_id": epoch, "request": request,
     }
 
@@ -222,6 +223,7 @@ class Host:
             receiver = asyncio.create_task(self._receive_input(reader, writer, sink, state))
             interval = 1 / config.fps
             frames, process_ms, report_at = 0, 0.0, time.monotonic()
+            send_ms = 0.0
             while not receiver.done():
                 started = time.monotonic()
                 if state["pending"] is not None:
@@ -247,11 +249,14 @@ class Host:
                             media, monitors, selected, state["stream_id"], self.view_only, "stream", request)))
                         self.status(f"正在共享显示器 {selected} · {media.width}×{media.height}")
                         frames, process_ms, report_at = 0, 0.0, time.monotonic()
+                        send_ms = 0.0
                     finally:
                         state["switching"] = False
                 packets, elapsed = await self.loop.run_in_executor(executor, media.frame, state.pop("force_keyframe", False))
+                sending = time.perf_counter()
                 for packet in packets:
                     await send(writer, pack_video(packet))
+                send_ms += (time.perf_counter() - sending) * 1000
                 frames += bool(packets)
                 process_ms += elapsed
                 now = time.monotonic()
@@ -259,9 +264,12 @@ class Host:
                     await send(writer, pack_control({
                         "type": "stats", "encoded_fps": round(frames / (now - report_at), 1),
                         "capture_encode_ms": round(process_ms / max(frames, 1), 2),
+                        "send_ms": round(send_ms / max(frames, 1), 2),
                     }))
                     frames, process_ms, report_at = 0, 0.0, now
-                await asyncio.sleep(max(0, interval - (time.monotonic() - started)))
+                    send_ms = 0.0
+                if not getattr(media, "paced", False):
+                    await asyncio.sleep(max(0, interval - (time.monotonic() - started)))
             await receiver
         except asyncio.CancelledError:
             pass
@@ -516,23 +524,33 @@ class Viewer:
             decoder = DesktopDecoder()
             sender = asyncio.create_task(self._send_commands(writer))
             frames, byte_count, since = 0, 0, time.monotonic()
+            decode_ms = convert_ms = submit_ms = 0.0
             while not self.stopped.is_set():
                 kind, payload = await asyncio.wait_for(read_message(reader), 12)
                 if self._switching.is_set() and time.monotonic() - self._switch_started > 10:
                     raise ProtocolError("切换显示器超时，请断开后重新连接")
                 if kind == VIDEO:
                     byte_count += len(payload)
-                    for frame in decoder.decode(payload):
+                    decoded = decoder.decode(payload)
+                    decode_ms += decoder.decode_ms
+                    convert_ms += decoder.convert_ms
+                    submitting = time.perf_counter()
+                    for frame in decoded:
                         if frame.width != w or frame.height != h:
                             raise ProtocolError("视频尺寸与协商结果不符")
                         if not self._switching.is_set():
                             self.on_frame(frame)
                         frames += 1
+                    submit_ms += (time.perf_counter() - submitting) * 1000
                     now = time.monotonic()
                     if now - since >= 1:
                         self.on_stats({"decoded_fps": round(frames / (now - since), 1),
-                                       "mbps": round(byte_count * 8 / (now - since) / 1e6, 2)})
+                                       "mbps": round(byte_count * 8 / (now - since) / 1e6, 2),
+                                       "decode_ms": round(decode_ms / max(1, frames), 2),
+                                       "convert_ms": round(convert_ms / max(1, frames), 2),
+                                       "submit_ms": round(submit_ms / max(1, frames), 2)})
                         frames, byte_count, since = 0, 0, now
+                        decode_ms = convert_ms = submit_ms = 0.0
                 elif payload["type"] == "pong":
                     self.on_stats({"rtt_ms": round((time.monotonic() - payload["stamp"]) * 1000, 1)})
                 elif payload["type"] == "stats":
@@ -547,6 +565,7 @@ class Viewer:
                     self._switching.clear()
                     self.on_info(payload)
                     frames, byte_count, since = 0, 0, time.monotonic()
+                    decode_ms = convert_ms = submit_ms = 0.0
                 elif payload["type"] == "monitor_error":
                     if payload.get("request") == self._request_id:
                         self._switching.clear()

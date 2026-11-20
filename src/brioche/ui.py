@@ -57,10 +57,16 @@ class FrameMailbox:
         self.image = None
 
     def publish(self, frame):
+        if frame.format.name == "bgra" and sys.byteorder == "little":
+            pixel_format = QImage.Format.Format_RGB32
+        else:
+            if frame.format.name != "rgb24":
+                frame = frame.reformat(format="rgb24")
+            pixel_format = QImage.Format.Format_RGB888
         plane = frame.planes[0]
         # A deep copy owns the pixels after PyAV releases the decoded frame.
         image = QImage(memoryview(plane), frame.width, frame.height, plane.line_size,
-                       QImage.Format.Format_RGB888).copy()
+                       pixel_format).copy()
         with self.lock:
             self.image = image
 
@@ -97,6 +103,9 @@ class RemoteCanvas(QWidget):
         self.input_enabled = False
         self.allowed = False
         self.pressed_keys = {}
+        self.painted = 0
+        self.paint_ms = 0.0
+        self._painted_key = None
         self.setMinimumSize(480, 270)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -109,6 +118,7 @@ class RemoteCanvas(QWidget):
         return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
 
     def paintEvent(self, event):
+        started = time.perf_counter()
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#171714"))
         if self.image:
@@ -116,6 +126,11 @@ class RemoteCanvas(QWidget):
         else:
             painter.setPen(QColor("#d8d2c6"))
             painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "正在等待远程画面…")
+        painter.end()
+        if self.image is not None and self.image.cacheKey() != self._painted_key:
+            self._painted_key = self.image.cacheKey()
+            self.painted += 1
+            self.paint_ms += (time.perf_counter() - started) * 1000
 
     def release_input(self):
         self.viewer.input({"event": "release"})
@@ -338,13 +353,24 @@ class RemoteWindow(QMainWindow):
             self.presented += 1
         now = time.monotonic()
         if now - self.since >= 1:
+            painted_fps = self.canvas.painted / (now - self.since)
+            paint_ms = self.canvas.paint_ms / max(1, self.canvas.painted)
+            self.canvas.painted = 0
+            self.canvas.paint_ms = 0.0
             self.presented_fps = self.presented / (now - self.since)
             self.presented, self.since = 0, now
             s = self.stats_values
+            source = self.current_info
+            timing_label = "取帧等待" if source.get("timing_scope") == "packet_wait" else "采集+编码"
             self.stats_text.setText(
-                f"{self.current_info.get('encoder', 'H.264')} · 界面提交 {self.presented_fps:.1f} FPS · 解码 {s.get('decoded_fps', '—')} FPS · "
+                f"源 {source.get('source_width', '—')}×{source.get('source_height', '—')} → "
+                f"{source.get('width', '—')}×{source.get('height', '—')} · {source.get('capture', '—')}\n"
+                f"{self.current_info.get('encoder', 'H.264')} · 绘制 {painted_fps:.1f} FPS · 界面提交 {self.presented_fps:.1f} FPS · 解码 {s.get('decoded_fps', '—')} FPS · "
                 f"编码 {s.get('encoded_fps', '—')} FPS · RTT {s.get('rtt_ms', '—')} ms · "
-                f"接收 {s.get('mbps', '—')} Mbps · 采集+编码 {s.get('capture_encode_ms', '—')} ms")
+                f"接收 {s.get('mbps', '—')} Mbps · {timing_label} {s.get('capture_encode_ms', '—')} ms · "
+                f"发送等待 {s.get('send_ms', '—')} ms · "
+                f"解码 {s.get('decode_ms', '—')} ms · 颜色转换 {s.get('convert_ms', '—')} ms · "
+                f"画面提交 {s.get('submit_ms', '—')} ms · 绘制 {paint_ms:.2f} ms")
 
     def closeEvent(self, event):
         self._closed = True

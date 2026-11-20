@@ -67,6 +67,9 @@ def nvenc_available(path):
 
 
 class HardwareEncoder:
+    # FFmpeg's input owns the capture clock. A second sender sleep builds lag.
+    paced = True
+
     def __init__(self, config, monitor_index=1, path=None):
         self.path = path or executable()
         monitors = list_monitors()
