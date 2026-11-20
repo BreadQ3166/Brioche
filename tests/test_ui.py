@@ -117,6 +117,17 @@ class SimpleFlowTests(unittest.TestCase):
         self.assertIs(self.window.internet_list.currentItem(), original)
         self.assertIn("离线", self.window.internet_list.item(1).text())
 
+    def test_device_card_uses_live_probe_instead_of_cached_online_flag(self):
+        for cached, actual in ((True, False), (False, True)):
+            self.environment["tailscale"]["peers"] = [
+                {"ip": "100.70.1.3", "name": "Laptop", "online": cached,
+                 "reachable": actual, "sharing": True}
+            ]
+            self.window.apply_environment(self.environment)
+            data = self.window.internet_list.item(0).data(Qt.ItemDataRole.UserRole)
+            self.assertEqual(data["online"], actual)
+            self.assertEqual(data["connectable"], actual)
+
     def test_online_device_single_click_connects_without_code(self):
         self.environment["tailscale"]["peers"] = [
             {"ip": "100.70.1.3", "name": "Laptop", "reachable": True, "sharing": True}

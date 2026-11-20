@@ -447,6 +447,8 @@ class MainWindow(QMainWindow):
         enabled = not self.reduced_motion.isChecked()
         self.store.configure(reduced_motion=not enabled)
         for widget in (self.internet_list,self.lan_list):widget.set_animations(enabled)
+        if not enabled and hasattr(self, 'transitions'):
+            self.transitions.show(self.pages.currentIndex(), False)
 
     def mac_permission(self, kind):
         from .mac_permissions import screen_allowed,input_allowed
@@ -567,6 +569,7 @@ class MainWindow(QMainWindow):
                     label,
                     {
                         **peer,
+                        "online": alive,
                         "connectable": alive
                         and peer.get("sharing")
                         and not peer.get("busy"),

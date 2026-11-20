@@ -141,6 +141,8 @@ class DeviceList(QListWidget):
         self.setMouseTracking(True)
         self.setSpacing(8)
         self.setUniformItemSizes(True)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setItemDelegate(DeviceDelegate(self))
         self.hover, self.hover_key, self.entries = 0.0, None, {}
         self.animations = True

@@ -49,6 +49,11 @@ QProgressBar { background: #eae5db; border: none; border-radius: 4px; max-height
 QProgressBar::chunk { background: #bb835b; border-radius: 4px; }
 QCheckBox { padding: 8px 0; }
 QScrollArea { border: none; }
+QScrollBar:vertical { background: transparent; width: 8px; margin: 2px; }
+QScrollBar::handle:vertical { background: #cfc5b5; border-radius: 3px; min-height: 28px; }
+QScrollBar::handle:vertical:hover { background: #b8aa96; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
 """
 
 
