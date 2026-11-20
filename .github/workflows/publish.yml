@@ -75,10 +75,16 @@ jobs:
           subprocess.run(['python3', 'scripts/checksums.py', str(output)], check=True)
           notes = Path('docs/release-notes') / (version + '.md')
           assert notes.is_file()
-          gh('release', 'create', tag, '--target', sha, '--draft', '--prerelease', '--title', 'Brioche ' + version,
-             '--notes-file', str(notes))
-          gh('release', 'upload', tag, *(str(p) for p in sorted(output.iterdir())))
-          remote = json.loads(gh('api', f'repos/{repo}/releases/tags/{tag}'))
+          releases = json.loads(gh('api', f'repos/{repo}/releases?per_page=100'))
+          existing = next((release for release in releases if release['tag_name'] == tag), None)
+          if existing:
+              assert existing['draft'] and existing['target_commitish'] == sha, 'Refusing to overwrite a public or unrelated release'
+          else:
+              gh('release', 'create', tag, '--target', sha, '--draft', '--prerelease', '--title', 'Brioche ' + version,
+                 '--notes-file', str(notes))
+          gh('release', 'upload', tag, '--clobber', *(str(p) for p in sorted(output.iterdir())))
+          releases = json.loads(gh('api', f'repos/{repo}/releases?per_page=100'))
+          remote = next(release for release in releases if release['tag_name'] == tag)
           assert len(remote['assets']) == len(list(output.iterdir()))
           for asset in remote['assets']:
               path = output / asset['name']
