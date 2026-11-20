@@ -11,7 +11,7 @@ def main():
     host.add_argument("--bind", default="127.0.0.1")
     host.add_argument("--advertise", default="127.0.0.1", help="Reachable LAN or Tailscale host address")
     host.add_argument("--port", type=int, default=47995)
-    host.add_argument("--encoder", choices=("libx264", "h264_nvenc", "h264_qsv", "h264_videotoolbox"), default="libx264")
+    host.add_argument("--encoder", choices=("auto", "libx264", "h264_nvenc", "h264_qsv", "h264_videotoolbox"), default="libx264")
     host.add_argument("--monitor", type=int, default=1)
     host.add_argument("--view-only", action="store_true")
     host.add_argument("--state-dir")

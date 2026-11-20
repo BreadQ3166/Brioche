@@ -1,66 +1,33 @@
-# Brioche 0.5
+# Brioche 0.6
 
-轻量模块化远程桌面：局域网和 Tailscale 外网可选，支持客户端及局域网浏览器控制，连接后可以切换远端显示器。
+简洁的设备目录式远程桌面，提供内置 Tailscale 外网连接、局域网 IP 配对和局域网网页控制。Windows 与 Ubuntu 提供独立安装包，无需额外安装 Python、Go、Tailscale、Sunshine 或 Moonlight。
 
-当前已在 Ubuntu 22.04 Xorg 验证。Windows 11 与 macOS 12 为适配目标，尚未真机验收。
+## 外网：同账号设备，点击连接
 
-## 最简单的使用方法
+1. 两台电脑打开新版 Brioche，点击“登录 Tailscale”，在官方浏览器页面登录同一账号。若启用设备审批，先在管理页批准。
+2. 被控电脑勾选“允许同账号设备连接这台电脑”。选择会保存，之后启动 Brioche 自动恢复共享；首次安装默认关闭。
+3. 控制端在“外网设备”页点击在线设备，直接进入远程桌面，无需连接码。
 
-原生连接建议两台电脑均使用 **Brioche 0.5**；0.2/0.3 原生客户端仍可互通，0.1 协议不兼容。浏览器连接只需在被控电脑安装 0.5，控制设备无需安装 Brioche。
+设备状态约每3秒后台检测，区分在线可连接、未允许共享、使用中和离线；离线设备保留。网络超时会延长检测间隔。“在线”来自实际应用探测，不仅依靠 Tailscale 缓存状态。
 
-### 局域网
+仅接受同一 Tailscale 用户的无标签 Brioche 节点，仍受 tailnet ACL/grants 限制。共享关闭即撤下访问入口并断开入站会话。登录状态保存在本用户数据目录；退出账号会结束外网共享与连接。
 
-1. 被控端进入“共享这台电脑”，选择“局域网”。
-2. 软件自动读取本机地址和显示器。一般保持默认，多张网卡时选择另一台电脑能访问的地址。
-3. 点击“开启共享”，再点击“复制连接码”。
-4. 控制端点击“粘贴连接码”，再点击“连接远程桌面”。连接方式会根据码中地址自动选择。
+内置 tsnet 是用户态网络模块，无需虚拟网卡或管理员权限，但仍使用 Tailscale 官方账号、协调与中继服务。优先直连，无法直连时中继，远程工具栏显示实际路径；不保证所有网络都能直连。软件运行和被控桌面登录是必要条件。
 
-局域网不需要 Tailscale 或云服务器。网络隔离和防火墙仍可能阻止互访，默认共享端口是 TCP 47995。
+## 局域网：输入 IP 添加到目录
 
-### 内置 Tailscale 外网（0.5 新增）
+1. 被控电脑进入“局域网设备”，勾选“允许局域网设备连接这台电脑”，记下页面显示的本机 IP。
+2. 控制端输入对方 IP，点击“查找并添加”。默认 TCP 47995，也可输入 `192.168.1.8:47995`。
+3. 点击刚添加的设备，首次两端显示同一组六位配对码，由被控端确认。
+4. 配对信息会保存，之后点击即可连接；设备离线时仍在目录中。
 
-无需另外安装 Tailscale、配置虚拟网卡或执行管理员命令。
+局域网免登录、免服务器。只接受私有 IPv4 地址；防火墙和网络隔离仍可能阻止访问。首次确认后固定证书指纹，设备身份变化会拒绝连接。设置的高级选项可撤销所有本机配对；删除控制端目录条目仅删除本地记录。
 
-1. 两台电脑安装 Brioche，在软件中点击 **“登录 Tailscale”**。
-2. 在系统浏览器打开的 Tailscale 官方页面完成授权，两端使用同一账号、同一 tailnet；若开启设备审批，需要在管理页批准。
-3. 被控端进入“共享这台电脑”，选择“外网 · Tailscale”，选择仅查看或允许控制，点击“开启共享”。这会允许同一账号的设备访问该桌面。
-4. 控制端选择“外网 · Tailscale”，从下拉框选择对方在线设备，点击“连接远程桌面”。**不必复制连接码**。
-5. 停止共享会撤下发现信息、关闭入站连接。点击“账号与登录 → 退出登录”会结束外网共享与连接。
+局域网和外网共享可以同时打开，共用“一个活动控制会话”的限制，避免两端争抢键鼠。共享开关会记住，下次启动恢复；退出软件后不提供系统登录前控制。
 
-内置的是 Go/tsnet 用户态节点，由 Brioche 自动管理生命周期，网络身份与系统 Tailscale 独立。普通用户不需要安装 Go；Go 只在开发构建时使用。登录状态保存在本用户应用数据目录，重启后自动恢复；不内置共用 auth key，不在软件里收集 Tailscale 密码。
+## 设置与多屏
 
-当前只允许同一 Tailscale 用户的无标签设备互通，且仍受 tailnet ACL/grants 限制；同一 tailnet 内的其他用户和标签设备不会因此获得控制权。列表只展示在线的 `brioche-` 节点；对方仍须开启 Brioche 共享。仅网络在线不代表已允许远程控制。
-
-仍依赖 Tailscale 官方的账号、协调和中继服务。优先直连，无法直连时使用中继；工具栏显示实际活动路径，未确认时显示待检测。内置并不会保证全球网络均可直连或保证中继高刷性能。局域网/回环继续免登录。
-
-可保留粘贴连接码的方式，外网共享固定使用 tailnet TCP 47995，发现服务为 tailnet TCP 47994；它们不是系统网卡的监听端口。真正的原生 TLS Host 仅绑定随机本机回环端口。原生证书指纹、临时令牌、输入权限和单活动连接校验保持有效。
-
-**平台范围：**本轮完成 Ubuntu 22.04 的构建与测试。内置 SDK 固定 Tailscale v1.104.7、Go 1.27.4；该 Go 版本的 macOS 最低要求是 13，**本版内置网络不支持 macOS 12**，不能据此声称原 macOS 12 目标已完成。macOS 12 需要单独的兼容后端与安全评估；Windows 11/macOS 的整包仍需真机验收。
-
-验证包括本机测试协调服务器下的两个真实 tsnet 节点、同账号传输及跨账号拒绝，并实测获取官方 HTTPS 登录链接。真实账号授权需要用户完成；真实公网双机穿透与中继性能尚未验收。
-
-### 本机回环
-
-在“共享这台电脑”选择“本机回环测试”，建议先选“仅查看画面”，开启共享并复制连接码，再切换到“连接电脑”粘贴连接。
-
-## 用浏览器远程控制
-
-1. 在被控电脑打开“共享这台电脑”，选择“局域网”。
-2. 勾选 **“允许局域网浏览器访问”**，选择访问权限并点击“开启共享”。
-3. 点击 **“复制浏览器链接”**，将完整链接通过可信渠道传递到另一台局域网设备。
-4. 在浏览器中打开完整的 `https://本机地址:47996/#访问码` 链接。首次访问使用本机自签名证书：先确认地址是被控电脑，可在 Brioche“首次访问说明”中查看证书 SHA256，与浏览器证书详情核对后继续。
-5. 点击网页中的 **“开始远程”**。默认先查看；需要操作时点击 **“启用控制”**。
-6. 顶部可切换显示器，点击“释放输入”或按 Ctrl+Alt+Shift 退出控制，点击“断开”结束会话。
-
-同机浏览器测试时选择“本机回环测试”，勾选浏览器访问并打开复制的链接即可。浏览器只支持访问所选接口的准确地址，请使用软件复制的链接，不要改成其他主机名，也不要遗漏 `#` 后的访问码。页面载入后会移除地址栏中的访问码；需要给另一台设备分享时应重新从 Brioche 复制链接。
-
-浏览器页及所有脚本样式随软件提供，无外部 CDN，不需要云服务器或 Tailscale。防火墙需允许所选的 HTTPS 端口（默认 TCP 47996）；被控电脑必须保持开启并运行共享。
-
-浏览器默认采用 HTTPS + WebSocket + H.264 / WebCodecs，与原生客户端共用 H.264 采集编码模块，支持 720p/1080p/2K，帧率可选 30/60 FPS。网页会探测解码能力；不支持 H.264 或实际解码失败时，自动回退独立 JPEG 帧（最高 30 FPS），也可以手动选择模式。帧率上限不代表实际达到；90/144 FPS 高刷目标仍属于原生客户端。Chrome 已做真实浏览器测试，Edge/Firefox/Safari 与移动设备尚需分别验证。
-
-访问码与原生连接码分别生成，停止共享后失效。HTTPS 使用本机证书，不会自动向操作系统安装受信根证书。网页默认要求主动启用控制；只读共享不能通过修改网页提升为可控制。切屏、页面失焦和断开会释放按键。
-
-网页和原生客户端共用一次一个活动连接的限制，不支持多人同时查看。浏览器入口当前仅在局域网和回环模式提供；Tailscale 外网继续使用原生客户端。网页首版未实现音频、文件传输、剪贴板、输入法组合输入、相对鼠标或全部系统快捷键。
+首页只保留账号、设备列表和共享开关。设置提供均衡 2K60、高刷 2K90、极致 2K144 三档，默认2K60；编码器、端口和自定义画质收进“高级设置”。保留旧版连接码入口用于兼容。
 
 ## 多显示器
 
@@ -72,113 +39,58 @@
 - 无法打开新屏幕时保留原画面；显示器插拔后请停止并重新开启共享以刷新列表。
 - 不支持多个远程屏幕同时拼接显示，也没有虚拟显示驱动。
 
-## 简洁设置
+## 局域网浏览器控制
 
-默认只显示连接方式、连接码和画质预设：均衡 2K60、高刷 2K90、极致 2K144。
+在设置中勾选“允许局域网浏览器访问”，再开启局域网共享，点击“复制浏览器链接”，将完整链接发给可信的局域网设备。访问默认 `https://本机IP:47996/#访问码`，首次使用本机自签名证书；软件显示的证书 SHA256 可与浏览器证书详情核对。网页点击“开始远程”，需要操作时点击“启用控制”。
 
-分辨率、帧率、码率、端口和编码器位于“高级设置”。远程工具栏的“性能”按钮展开详细统计；Ctrl+Alt+Shift 释放键鼠，F11 切换全屏。
+浏览器默认 H.264 / WebCodecs，支持最高2K、30/60 FPS；不支持或解码失败时回退独立 JPEG，最高30 FPS。实际帧率取决于设备和网络。页面、脚本及样式随包提供，不使用外部 CDN。网页入口只用于局域网和回环，外网使用原生客户端。
 
-连接码包含访问令牌，仅通过可信渠道传递。停止共享会结束会话，再次开启会生成新令牌。软件仅监听所选网络地址，不默认同时开放所有网卡。
+链接包含独立的临时访问码，停止共享后失效。网页和原生端共用活动连接限制；只读共享不能由网页提升权限。失焦、切屏和断开会释放按键。复制链接中的地址和访问码均需保留。
 
-## GitHub 自动构建
+## 视频性能与当前边界
 
-仓库的 **Actions → Build Brioche** 会在云端 Windows 和 Ubuntu 分别测试、打包。
-成功运行的 **Artifacts** 中可下载 Windows EXE 便携 ZIP、Ubuntu DEB 和校验文件。
-Windows 必须解压完整目录后运行 `Brioche.exe`，不能只复制 EXE。
-操作步骤与测试边界见 [GitHub 构建说明](docs/GITHUB_BUILDS.md)。
+0.6 默认先用实际编码探针检测 NVIDIA NVENC，成功后使用独立 FFmpeg 采集、缩放及低延迟 H.264 编码，减少 Python 原始帧复制。不可用时回退 libx264 软件编码，并在流信息中报告实际后端及回退原因。软件解码使用切片线程；Qt 画布减少一次帧复制。
 
-## 启动与安装
+NVENC 队列有界，不任意丢弃参考帧；无 B 帧，短 GOP 用于丢帧后恢复。硬件后端统计中的“采集＋编码”含等待下一帧的时间，不能单独作为 GPU 编码耗时。目标帧率是上限，**不承诺2K60、90或144实际达标**。
 
-源码启动：
+Linux 硬件后端目前是 Xorg x11grab，Windows 是 gdigrab，仍有 CPU 采集和色彩转换；尚未实现 DXGI/D3D11 GPU 零拷贝和原生硬件解码。远程桌面流继续使用 TLS/TCP，弱网队头阻塞仍可能增加延迟。浏览器是否硬件解码由浏览器与设备决定。
 
-```bash
-cd Brioche
-./scripts/run.sh
-```
+Ubuntu 22.04 Xorg 已进行真实采集、TLS/H.264、切屏和输入测试。Windows 安装包经过自动构建和运行库测试，Windows 11 双机高刷仍需实机验收。内置 Tailscale v1.104.7 / Go1.27.4 最低 macOS13，**当前不支持 macOS12**；不能把原适配目标视为已经完成。
 
-已安装的用户级版本：
+未提供音频、文件传输、剪贴板、系统登录前控制、自动更新或签名发行。没有复制轻屏、RustDesk、Sunshine、Moonlight 的代码，也不与 Sunshine/Moonlight 协议互通。
 
-```bash
-~/.local/bin/brioche
-```
+## 下载与构建
 
-源码环境使用 Python 3.10–3.12：
+在 [Releases](https://github.com/BreadQ3166/Brioche/releases) 下载 Windows 便携 ZIP 或 Ubuntu DEB。Windows 解压后保留完整目录，双击 `Brioche.exe`；不能只复制 EXE。普通用户只需应用包与正常显卡驱动。Windows 包未签名。
+
+[GitHub 构建说明](docs/GITHUB_BUILDS.md) 包含 Actions 下载与验证范围。仓库推送后自动在 Windows 和 Ubuntu 构建；媒体组件在 Ubuntu 分别编译 Linux 与 Windows 版本，随包提供对应上游源码压缩包和构建参数。
+
+源码开发使用 Python3.10–3.12、Go1.27.4+：
 
 ```bash
 python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-```
-
-Ubuntu 22.04 系统依赖通常包括 `python3-venv libxcb-cursor0 libxcb-xinerama0 libxkbcommon-x11-0`。被控端从已登录的 Xorg 桌面启动，不能用 root 绕过桌面授权。
-
-Windows 使用 Python 3.11 创建 `.venv` 后，执行 `.venv\Scripts\python.exe -m pip install -e .` 和 `.venv\Scripts\python.exe -m brioche`。
-
-macOS 使用兼容 macOS 12 的 Python 3.11，按系统要求授予屏幕录制与辅助功能权限。Intel 与 Apple Silicon 尚需分别实机验证，锁定 Qt 版本不等于完成整个依赖链验收。
-
-构建产物已包含 Python、Qt、视频运行库和内置网络模块，普通启动不需要额外安装 Python、FFmpeg、Sunshine 或 Moonlight。硬件编码需要媒体库与显卡驱动共同支持，当前环境只有软件编码可用。
-
-## 开发与验证
-
-```bash
-.venv/bin/python -m unittest discover -s tests -v
-# 安装 xvfb 后，在隔离桌面运行输入、切屏、Qt 与打包程序测试
+.venv/bin/python -m pip install -e . pyinstaller==6.11.1
+.venv/bin/python scripts/build_network.py
+# Linux 需要 build-essential pkg-config nasm 与 libxcb 开发包
+.venv/bin/python scripts/build_media.py --platform linux --work-dir /dev/shm/brioche-media
+.venv/bin/python -m brioche
 .venv/bin/python scripts/check_linux.py --source-only
-# 开发环境可选：需安装 playwright，使用系统 Google Chrome，隔离桌面测试网页操作
-.venv/bin/python scripts/check_linux.py --browser-only
-.venv/bin/python scripts/build_network.py  # 开发机需要 Go 1.27.4+
 .venv/bin/python scripts/build.py
 .venv/bin/python scripts/check_linux.py
-# 真实物理显示器的只读切屏回环，不注入输入
-.venv/bin/python scripts/test_real_displays.py
 ```
 
-完整测试包含：网络模式绑定、Tailscale 缺失/未登录/用户态模式、状态解析、横竖屏切换、键鼠释放、旧坐标丢弃、失败回退、证书与令牌校验，以及原有 TLS/H.264 桌面链路。
+Windows 媒体组件通过 Linux MinGW 编译：`scripts/build_media.py --platform windows --work-dir ...`；应用本体仍由 Windows Python/PyInstaller 构建。普通应用启动不要求开发工具。
 
-```bash
-.venv/bin/python -m pip install pyinstaller==6.11.1
-.venv/bin/python scripts/build_network.py
-.venv/bin/python scripts/build.py
-.venv/bin/python scripts/package_linux.py
-.venv/bin/python scripts/package_source.py
-```
+磁盘紧张时可用 `scripts/build.py --output-dir /dev/shm/brioche-build/dist --work-dir /dev/shm/brioche-build/work`，然后 `scripts/install_user.py --bundle /dev/shm/brioche-build/dist/Brioche --reuse-libraries` 用户级安装；只复用字节完全相同的只读库，保留旧版本。启动入口为 `~/.local/bin/brioche`。
 
-在 Windows/macOS 上分别构建，不能从 Linux 交叉生成可用的签名安装包。
+## 模块
 
-用户级安装脚本先验证 releases/SHA256SUMS 中对应 DEB 的校验值，再安装到 `~/.local/opt/brioche/0.5.0` 并切换启动入口；保留旧版本目录用于回退：
+- `main_window.py`：设备目录与后台刷新；`device_store.py`：私有设备和设置存储。
+- `lan.py`：IP 查询、证书固定、首次确认和配对撤销。
+- `embedded_network.py` / `network-helper/`：内置 tsnet、同账号在线探测与流代理。
+- `session.py`：认证、共享会话互斥、显示器切换与输入清理。
+- `hardware_media.py` / `media.py`：NVENC 与软件 H.264 后端；`capture.py`：平台采集。
+- `ui.py`：远程画布、切屏与性能统计。
+- `web_gateway.py` / `web_video.py` / `web/`：网页适配、背压与关键帧恢复。
 
-```bash
-.venv/bin/python scripts/install_user.py
-```
-
-## 模块与边界
-
-- `network.py`：局域网接口、旧系统 Tailscale 状态解析（兼容工具）。
-- `embedded_network.py` / `network-helper/`：内置 tsnet、私有 IPC、登录、同账号设备发现和流转发。
-- `web_gateway.py` / `web/`：HTTPS/WebSocket 适配、临时网页访问码及浏览器客户端。
-- `main_window.py`：共享与连接流程、后台环境检查。
-- `ui.py`：远程画布、显示器切换和性能工具栏。
-- `session.py`：认证、会话、切屏、输入流序号与清理。
-- `protocol.py`：有界协议及版本化消息。
-- `capture.py` / `media.py` / `h264.py`：采集、统一 H.264 编码、封装与解码后端。
-- `web_video.py`：网页流控、解码代次和 IDR 恢复。
-- `platform_input.py` / `security.py`：平台输入与 TLS 身份。
-
-当前为 Python/Qt 开发原型，使用 TLS/TCP；CPU 帧转换和软件解码仍限制高刷表现。已有 0.1 本机短时软件编解码测试约 57–59 FPS，不能将 90/144 的设置上限视为实际性能保证。
-
-浏览器适配复用同一个 Host 的采集、编码、输入、权限与切屏，H.264 数据无需转成 JPEG。`h264.py` 统一 Annex B / AVCC 封装；`web_video.py` 管理浏览器帧确认与关键帧恢复；`web/video.js` 负责 WebCodecs 解码和兼容模式。H.264 最多四个未确认帧，拥塞跳过参考帧后等待完整 IDR 并重建解码器，避免花屏；JPEG 最多一个未确认帧。兼容模式直接从采集帧编码 JPEG，没有 H.264 二次转码。
-
-H.264 是当前兼容性、码率和实现复杂度的默认取舍，不代表所有场景最优。原生 TLS/TCP 与网页 WSS 仍分别适配传输和呈现，未引入 WebRTC；弱网络中的 TCP 队头阻塞仍可能增加延迟。浏览器是否实际使用硬件解码由设备和浏览器决定，不能仅凭 WebCodecs 可用就认定启用硬件加速。
-
-本机 0.4 短测结果和测量范围见 `artifacts/browser-performance-04.json`；这不替代动态画面、双机和长时间测试。
-
-命令行可通过明确地址开启浏览器入口（终端会输出含访问权限的链接，不要把它提交或放入共享日志）：
-
-```bash
-./scripts/run.sh host --bind 127.0.0.1 --web --web-port 47996
-```
-
-尚未实现音频、剪贴板、文件传输、网络断线自动重连、系统登录前控制、GPU 零拷贝、原生硬件解码、自动更新和签名发行。Tailscale 真实跨网尚未验证；状态解析测试不代替真实跨网测试。
-
-许可说明见 THIRD_PARTY.md。Brioche 没有复制 Sunshine/Moonlight 源码，也不与其桌面串流协议互通。0.5 新增链接 Tailscale 开源库，相关许可随内置网络模块提供。
-
-开发机磁盘紧张时，可用 `scripts/build.py --output-dir /dev/shm/brioche-build/dist --work-dir /dev/shm/brioche-build/work` 构建；测试后执行 `scripts/install_user.py --bundle /dev/shm/brioche-build/dist/Brioche --reuse-libraries`。该模式安装本地已验证构建，只复用上一版本字节完全相同的只读原生库；新代码和配置独立复制，不删除旧版本。状态始终写入用户数据目录。
+来源及依赖许可见 [THIRD_PARTY.md](THIRD_PARTY.md)。

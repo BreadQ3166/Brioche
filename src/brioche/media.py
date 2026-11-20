@@ -31,7 +31,7 @@ class DesktopEncoder:
             self.codec.bit_rate = config.bitrate_mbps * 1_000_000
             self.codec.gop_size = config.fps
             self.codec.max_b_frames = 0
-            self.interpolation = "FAST_BILINEAR" if config.fps >= 90 else "BILINEAR"
+            self.interpolation = "FAST_BILINEAR" if config.fps >= 60 else "BILINEAR"
             if encoder == "libx264":
                 self.codec.thread_count = min(8, os.cpu_count() or 1)
                 self.codec.options = {"preset": "ultrafast", "tune": "zerolatency",
@@ -72,7 +72,25 @@ class DesktopEncoder:
 class DesktopDecoder:
     def __init__(self):
         self.codec = av.CodecContext.create("h264", "r")
-        self.codec.thread_count = 1
+        self.codec.thread_count = min(4, os.cpu_count() or 1)
+        self.codec.thread_type = "SLICE"
 
     def decode(self, payload):
         return [frame.reformat(format="rgb24") for frame in self.codec.decode(av.Packet(payload))]
+
+
+def create_encoder(config, encoder="libx264", monitor_index=1):
+    if encoder in ("auto", "h264_nvenc"):
+        from .hardware_media import HardwareEncoder, executable, nvenc_available
+        path=executable()
+        if nvenc_available(path):
+            try:
+                return HardwareEncoder(config,monitor_index,path)
+            except (RuntimeError,ValueError,OSError):
+                if encoder=="h264_nvenc":raise
+        elif encoder=="h264_nvenc":
+            raise RuntimeError("当前媒体后端或驱动不支持 NVENC，请使用自动或软件编码")
+        media=DesktopEncoder(config,"libx264",monitor_index)
+        media.fallback_reason="硬件后端未就绪，使用软件 H.264"
+        return media
+    return DesktopEncoder(config,encoder,monitor_index)

@@ -34,6 +34,7 @@ type share struct {
 	Pin     string `json:"pin"`
 	Token   string `json:"token"`
 	Product string `json:"product"`
+	Busy    bool   `json:"busy"`
 }
 type request struct {
 	ID     int    `json:"id"`
@@ -71,7 +72,7 @@ func (b *bridge) authorized(ctx context.Context, address string) bool {
 }
 func (b *bridge) info(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	if r.Method != "GET" || r.URL.Path != "/info" {
+	if r.Method != "GET" || (r.URL.Path != "/info" && r.URL.Path != "/presence") {
 		http.NotFound(w, r)
 		return
 	}
@@ -84,6 +85,11 @@ func (b *bridge) info(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	s := b.shared
 	b.mu.Unlock()
+	if r.URL.Path == "/presence" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"product": "Brioche/0.6", "sharing": validShare(s), "busy": s.Busy})
+		return
+	}
 	if !validShare(s) {
 		http.Error(w, "not sharing", http.StatusConflict)
 		return
@@ -210,9 +216,58 @@ func (b *bridge) tunnel(ctx context.Context, ip string, port int) (map[string]an
 	}()
 	return map[string]any{"port": listener.Addr().(*net.TCPAddr).Port, "tunnel": id}, nil
 }
+
+// Probe the application, not just the coordination server's cached online flag.
+func (b *bridge) presence(parent context.Context, ip string) (bool, bool, bool) {
+	ctx, cancel := context.WithTimeout(parent, 1800*time.Millisecond)
+	defer cancel()
+	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+		return b.server.Dial(ctx, network, address)
+	}, DisableKeepAlives: true}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	for _, path := range []string{"/presence", "/info"} {
+		request, _ := http.NewRequestWithContext(ctx, "GET", "http://"+net.JoinHostPort(ip, discoveryPort)+path, nil)
+		response, err := client.Do(request)
+		if err != nil {
+			return false, false, false
+		}
+		if response.StatusCode == http.StatusNotFound {
+			response.Body.Close()
+			continue
+		}
+		if path == "/info" && response.StatusCode == http.StatusConflict {
+			response.Body.Close()
+			return true, false, false
+		}
+		if response.StatusCode != http.StatusOK {
+			response.Body.Close()
+			return false, false, false
+		}
+		if path == "/info" {
+			var info share
+			err = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&info)
+			response.Body.Close()
+			return err == nil && validShare(info), err == nil && validShare(info), info.Busy
+		}
+		var info struct {
+			Product string `json:"product"`
+			Sharing bool   `json:"sharing"`
+			Busy    bool   `json:"busy"`
+		}
+		err = json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&info)
+		response.Body.Close()
+		if err != nil || !strings.HasPrefix(info.Product, "Brioche/") {
+			return false, false, false
+		}
+		return true, info.Sharing, info.Busy
+	}
+	return false, false, false
+}
+
 func (b *bridge) command(ctx context.Context, r request) (any, error) {
 	switch r.Op {
-	case "status", "login":
+	case "status", "login", "devices":
 		if r.Op == "login" {
 			if err := b.client.StartLoginInteractive(ctx); err != nil {
 				return nil, errors.New("login_failed")
@@ -254,12 +309,32 @@ func (b *bridge) command(ctx context.Context, r request) (any, error) {
 				}
 			}
 		}
+		if r.Op == "devices" {
+			if len(peers) > 32 {
+				peers = peers[:32]
+			}
+			var wait sync.WaitGroup
+			limit := make(chan struct{}, 4)
+			for _, peer := range peers {
+				peer["reported_online"] = peer["online"]
+				peer["reachable"], peer["sharing"], peer["busy"] = false, false, false
+				wait.Add(1)
+				go func(entry map[string]any) {
+					defer wait.Done()
+					limit <- struct{}{}
+					defer func() { <-limit }()
+					reachable, sharing, busy := b.presence(ctx, entry["ip"].(string))
+					entry["reachable"], entry["sharing"], entry["busy"] = reachable, sharing, busy
+				}(peer)
+			}
+			wait.Wait()
+		}
 		return map[string]any{"state": status.BackendState, "ips": ips, "peers": peers, "auth_url": status.AuthURL}, nil
 	case "share":
 		if !validShare(r.Share) {
 			return nil, errors.New("invalid_share")
 		}
-		r.Share.Product = "Brioche/0.5"
+		r.Share.Product = "Brioche/0.6"
 		b.mu.Lock()
 		b.shared = r.Share
 		b.mu.Unlock()

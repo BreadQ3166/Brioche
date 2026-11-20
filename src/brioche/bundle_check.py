@@ -49,6 +49,12 @@ def run(output):
         process = subprocess.run([str(helper), '--help'], capture_output=True, timeout=15)
         assert process.returncode == 0
         result['embedded_network'] = 'native executable loads; account login not attempted'
+        from .hardware_media import executable
+        media = executable()
+        assert media
+        process = subprocess.run([media, '-hide_banner', '-encoders'], capture_output=True, timeout=15)
+        assert process.returncode == 0 and b'h264_nvenc' in process.stdout
+        result['media_backend'] = 'bundled FFmpeg loads with NVENC; GPU availability tested at connection time'
         if platform.system() == 'Windows':
             import pynput.keyboard
             import pynput.mouse

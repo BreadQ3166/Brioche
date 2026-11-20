@@ -34,6 +34,13 @@ QPushButton:disabled { color: #9d998f; background: #eeeae2; }
 QPushButton#primary { color: white; background: #bd713d; border: none; }
 QPushButton#primary:hover { background: #a65f31; }
 QPushButton#danger { color: #a44035; }
+QPushButton:checked { background: #e3d4c0; color: #8c4d2c; border-color: #cbb598; }
+QListWidget#deviceList { background: transparent; border: none; outline: none; }
+QListWidget#deviceList::item { background: #fffdf8; border: 1px solid #e4ded2; border-radius: 10px; padding: 12px 18px; }
+QListWidget#deviceList::item:hover { background: #f1e7d9; border-color: #c6a47d; }
+QListWidget#deviceList::item:selected { background: #ede0cd; color: #292823; }
+QCheckBox { padding: 8px 0; }
+QScrollArea { border: none; }
 """
 
 
@@ -52,7 +59,7 @@ class FrameMailbox:
     def publish(self, frame):
         plane = frame.planes[0]
         # A deep copy owns the pixels after PyAV releases the decoded frame.
-        image = QImage(bytes(plane), frame.width, frame.height, plane.line_size,
+        image = QImage(memoryview(plane), frame.width, frame.height, plane.line_size,
                        QImage.Format.Format_RGB888).copy()
         with self.lock:
             self.image = image
@@ -269,6 +276,7 @@ class RemoteWindow(QMainWindow):
             self.status_text.setText(info["message"])
         else:
             self.current_info = info
+            self.stats_text.setToolTip(info.get("encoder_fallback", "") or info.get("encoder", "H.264"))
             self.canvas.release_input()
             if info["type"] == "stream":
                 self.mailbox.clear()
@@ -334,7 +342,7 @@ class RemoteWindow(QMainWindow):
             self.presented, self.since = 0, now
             s = self.stats_values
             self.stats_text.setText(
-                f"界面提交 {self.presented_fps:.1f} FPS · 解码 {s.get('decoded_fps', '—')} FPS · "
+                f"{self.current_info.get('encoder', 'H.264')} · 界面提交 {self.presented_fps:.1f} FPS · 解码 {s.get('decoded_fps', '—')} FPS · "
                 f"编码 {s.get('encoded_fps', '—')} FPS · RTT {s.get('rtt_ms', '—')} ms · "
                 f"接收 {s.get('mbps', '—')} Mbps · 采集+编码 {s.get('capture_encode_ms', '—')} ms")
 

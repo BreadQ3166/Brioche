@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--seconds", type=int, default=8)
 parser.add_argument("--fps", type=int, default=90)
 parser.add_argument("--output")
+parser.add_argument("--encoder", choices=("auto", "libx264", "h264_nvenc"), default="libx264")
 parser.add_argument("--binary", type=Path, help="Use an installed host executable instead of source Host")
 args = parser.parse_args()
 frames, stats, info, errors = [], [], [], []
@@ -23,7 +24,7 @@ with tempfile.TemporaryDirectory() as folder:
     try:
         if args.binary:
             process = subprocess.Popen([str(args.binary), "host", "--port", "0", "--view-only",
-                                        "--state-dir", folder], stdout=subprocess.PIPE,
+                                        "--state-dir", folder, "--encoder", args.encoder], stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, text=True)
             def read_uri():
                 for line in process.stdout:
@@ -38,7 +39,7 @@ with tempfile.TemporaryDirectory() as folder:
                     process.terminate()
                     raise
         else:
-            host = Host(port=0, folder=folder, view_only=True)
+            host = Host(port=0, folder=folder, view_only=True, encoder=args.encoder)
             host.start()
             if not host.ready.wait(10) or host.error:
                 raise RuntimeError(host.error or "Host startup timed out")
@@ -66,7 +67,8 @@ with tempfile.TemporaryDirectory() as folder:
                 errors.append(f"Host exit {process.returncode}: {stderr[:1000]}")
 report = {
     "platform": platform.platform(), "requested": f"1440p / {args.fps} FPS",
-    "test": "same-machine loopback; actual screen capture; software H.264; no GUI presentation",
+    "test": "same-machine loopback; actual screen capture; H.264; no GUI presentation",
+    "requested_encoder": args.encoder,
     "host_binary": str(args.binary) if args.binary else "source",
     "duration_seconds": args.seconds,
     "decoded_frames": len(frames),

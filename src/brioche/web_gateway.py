@@ -100,6 +100,7 @@ class BrowserGateway:
         task = asyncio.current_task()
         self.tasks.add(task)
         writer = None
+        native_task = None
         children = []
         acquired = False
         try:
@@ -134,6 +135,7 @@ class BrowserGateway:
             if kind != CONTROL or info.get("type") != "welcome":
                 raise ProtocolError(info.get("message", "被控端未就绪") if kind == CONTROL else "无效响应")
             validate_stream_info(info)
+            native_task = self.host.connection_tasks.get(writer.get_extra_info('sockname'))
             if info.get("codec") != codec:
                 raise ProtocolError("被控端未提供请求的视频格式")
             await ws.send_json(info)
@@ -167,6 +169,15 @@ class BrowserGateway:
             if children:
                 await asyncio.gather(*children, return_exceptions=True)
             if writer:
+                # This gateway and Host run on the same loop. Own the exact
+                # native task, so WebSocket close waits for capture/input and
+                # SessionGate cleanup rather than relying on TLS EOF timing.
+                if native_task and not native_task.done():
+                    native_task.cancel()
+                    try:
+                        await asyncio.wait_for(asyncio.shield(native_task), 6)
+                    except (Exception, asyncio.CancelledError):
+                        pass
                 try:
                     await send(writer, pack_control({"type": "input", "event": "release"}))
                     await send(writer, pack_control({"type": "bye"}))

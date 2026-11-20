@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -58,7 +59,7 @@ func TestEmbeddedTransport(t *testing.T) {
 				go b.services()
 				return b
 			}
-			first, second := create("first"), create("second")
+			first, second := create("brioche-first"), create("brioche-second")
 			status, err := second.client.Status(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -74,6 +75,22 @@ func TestEmbeddedTransport(t *testing.T) {
 				case <-ctx.Done():
 					t.Fatal("peer map timeout")
 				case <-time.After(20 * time.Millisecond):
+				}
+			}
+			if same {
+				for {
+					reachable, sharing, _ := first.presence(ctx, ip)
+					if reachable {
+						if sharing {
+							t.Fatal("unshared node advertised credentials")
+						}
+						break
+					}
+					select {
+					case <-ctx.Done():
+						t.Fatal("presence timeout")
+					case <-time.After(20 * time.Millisecond):
+					}
 				}
 			}
 			if !same {
@@ -97,6 +114,18 @@ func TestEmbeddedTransport(t *testing.T) {
 			credentials := share{Port: echo.Addr().(*net.TCPAddr).Port, Pin: strings.Repeat("a", 64), Token: strings.Repeat("b", 43)}
 			if _, err := second.command(ctx, request{Op: "share", Share: credentials}); err != nil {
 				t.Fatal(err)
+			}
+			devices, err := first.command(ctx, request{Op: "devices"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			peers := devices.(map[string]any)["peers"].([]map[string]any)
+			if len(peers) != 1 || peers[0]["reachable"] != true || peers[0]["sharing"] != true {
+				t.Fatalf("bad application presence: %v", peers)
+			}
+			encoded, _ := json.Marshal(devices)
+			if strings.Contains(string(encoded), credentials.Token) || strings.Contains(string(encoded), credentials.Pin) {
+				t.Fatal("presence exposed share credentials")
 			}
 			var result any
 			for {

@@ -103,12 +103,12 @@ class EmbeddedNetwork:
                 self._terminate()
                 raise RuntimeError("内置网络响应超时或中断，请检查网络后重试") from exc
 
-    def status(self, peer_ip=None):
+    def status(self, peer_ip=None, probe=False):
         if not self.enabled:
             return {"ready": False, "state": "NeedsLogin", "ips": [], "peers": [],
                     "message": "点击“登录 Tailscale”，无需另外安装", "path": "待检测", "auth_url": ""}
         try:
-            raw = self.request("status")
+            raw = self.request("devices" if probe else "status")
             state = raw.get("state")
             ips = [ip for ip in raw.get("ips", []) if ipaddress.ip_address(ip).version == 4]
             ready = state == "Running" and bool(ips)
@@ -140,7 +140,8 @@ class EmbeddedNetwork:
         with self.lock:
             if host.stop_requested.is_set():
                 return
-            self.request("share", share={"port": host.port, "pin": host.pin, "token": host.token})
+            self.request("share", share={"port": host.port, "pin": host.pin, "token": host.token,
+                                         "busy": host.session_gate.active})
 
     def clear(self, token=""):
         if self.process and self.process.poll() is None:

@@ -9,6 +9,9 @@ root = Path(__file__).resolve().parents[1]
 helper = root / "runtime/network" / ("brioche-network.exe" if sys.platform == "win32" else "brioche-network")
 if not helper.is_file():
     raise SystemExit("Build the embedded network module first: scripts/build_network.py")
+media = root / "runtime/media" / ("ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
+if not media.is_file():
+    raise SystemExit("Build the media module first: scripts/build_media.py")
 parser = argparse.ArgumentParser()
 parser.add_argument("--output-dir", type=Path, default=root / "dist")
 parser.add_argument("--work-dir", type=Path, default=root / "build")
@@ -19,7 +22,10 @@ args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir
         "--collect-data", "brioche",
         "--add-data", f"{root / 'assets'}{os.pathsep}assets",
         "--copy-metadata", "brioche-desktop",
-        "--add-binary", f"{helper}{os.pathsep}network"]
+        "--add-binary", f"{helper}{os.pathsep}network",
+        "--add-binary", f"{media}{os.pathsep}media",
+        "--add-data", f"{media.parent / 'licenses'}{os.pathsep}media/licenses",
+        "--add-data", f"{media.parent / 'BUILD.json'}{os.pathsep}media"]
 if (helper.parent / "licenses").is_dir():
     args += ["--add-data", f"{helper.parent / 'licenses'}{os.pathsep}network/licenses",
              "--add-data", f"{helper.parent / 'DEPENDENCIES.txt'}{os.pathsep}network"]

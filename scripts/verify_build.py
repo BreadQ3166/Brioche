@@ -8,6 +8,7 @@ import time
 import argparse
 import asyncio
 import hashlib
+import os
 import ssl
 import struct
 from urllib.parse import urlsplit
@@ -196,7 +197,8 @@ from Xlib import X
 from Xlib.display import Display
 from Xlib.protocol.event import ClientMessage
 process = subprocess.Popen([str(args.binary)],
-                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                           env={**os.environ, 'XDG_DATA_HOME': str(Path(tempfile.gettempdir()) / ('brioche-ui-test-' + str(os.getpid())))})
 display = Display()
 window = None
 try:

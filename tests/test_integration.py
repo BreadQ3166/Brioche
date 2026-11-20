@@ -21,7 +21,7 @@ from brioche.session import Host, Viewer
 class DesktopIntegration(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
-        self.host = Host(port=0, folder=self.folder.name)
+        self.host = Host(port=0, folder=self.folder.name, lan_discovery=True)
         self.host.start()
         self.assertTrue(self.host.ready.wait(10))
         self.assertIsNone(self.host.error)
@@ -49,6 +49,55 @@ class DesktopIntegration(unittest.TestCase):
         self.viewers.append(viewer)
         viewer.start()
         return viewer, ready, frames, statuses, info
+
+    def test_auto_encoder_reports_actual_backend_and_delivers_h264(self):
+        self.host.encoder = "auto"
+        viewer, ready, frames, statuses, info = self.viewer(config=StreamConfig("720p", 60, 8))
+        self.assertTrue(ready.wait(15), statuses)
+        self.assertTrue(frames)
+        actual = info[0]["encoder"]
+        if actual == "libx264":
+            self.assertTrue(info[0].get("encoder_fallback"))
+        else:
+            self.assertIn("NVENC", actual)
+            self.assertTrue(info[0]["capture"].startswith("ffmpeg-"))
+
+    def test_paired_lan_device_streams_then_revocation_rejects_reconnect(self):
+        from brioche.lan import pair
+        self.host.on_pair = lambda request: request.answer(True)
+        grant = pair('127.0.0.1', self.host.port, self.host.pin, secrets.token_hex(16), 'controller')
+        uri = access_uri('127.0.0.1', self.host.port, self.host.pin, grant['token'])
+        viewer, ready, frames, statuses, _ = self.viewer(uri)
+        self.assertTrue(ready.wait(15), statuses)
+        viewer.stop(); viewer.join()
+        deadline = time.monotonic() + 3
+        while self.host.active and time.monotonic() < deadline:
+            time.sleep(.02)
+        self.host.pair_store.clear()
+        rejected, ready, frames, statuses, _ = self.viewer(uri)
+        rejected.join(5)
+        self.assertFalse(ready.is_set())
+        self.assertFalse(frames)
+        self.assertTrue(any('凭据' in status for status in statuses), statuses)
+
+    def test_lan_and_external_hosts_share_one_active_session(self):
+        from brioche.session import SessionGate
+        gate = SessionGate()
+        self.host.session_gate = gate
+        other = Host(port=0, folder=self.folder.name + '/external', session_gate=gate)
+        other.start()
+        self.assertTrue(other.ready.wait(5))
+        try:
+            viewer, ready, _, statuses, _ = self.viewer()
+            self.assertTrue(ready.wait(15), statuses)
+            uri = access_uri('127.0.0.1', other.port, other.pin, other.token)
+            rejected, second_ready, frames, statuses, _ = self.viewer(uri)
+            rejected.join(5)
+            self.assertFalse(second_ready.is_set())
+            self.assertFalse(frames)
+            self.assertTrue(any('连接' in status for status in statuses), statuses)
+        finally:
+            other.stop(); other.join(5)
 
     def test_real_capture_encode_tls_decode_and_mouse(self):
         viewer, ready, frames, statuses, info = self.viewer()

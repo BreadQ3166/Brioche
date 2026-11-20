@@ -25,7 +25,7 @@ backend.start()
 host = Host(port=0, folder=folder.name, view_only=True)
 host.start()
 assert host.ready.wait(10) and not host.error, host.error
-main = MainWindow()
+main = MainWindow(folder=Path(folder.name)/"ui")
 main.show()
 remote = RemoteWindow(access_uri("127.0.0.1", host.port, host.pin, host.token), StreamConfig("1440p", 90, 20))
 remote.show()
@@ -44,9 +44,18 @@ def inspect():
     if (remote.canvas.image is None or remote.canvas.image.height() != 1280) and time.monotonic() - started < 12:
         return
     result["ok"] = remote.canvas.image is not None and remote.canvas.image.height() == 1280
+    main.network_poll.stop()
+    main.apply_environment({"lan":[{"ip":"192.168.1.5","name":"Ethernet"}],
+        "monitors":MONITORS[:2],"tailscale":{"ready":True,"ips":["100.70.1.2"],"message":"同一账号 · 已连接",
+        "peers":[{"ip":"100.70.1.3","name":"Windows 工作电脑","reachable":True,"sharing":True},
+                 {"ip":"100.70.1.4","name":"家里的电脑","reachable":False,"reported_online":False}]}})
     main.grab().save(str(output / "brioche-running.png"))
+    main.store.upsert({"ip":"192.168.1.8","port":47995,"name":"办公室 Ubuntu"})
+    main.update_lan_list([{"ip":"192.168.1.8","port":47995,"name":"办公室 Ubuntu","online":True}])
+    main.navigate(1)
+    main.grab().save(str(output / "brioche-lan-06.png"))
     remote.grab().save(str(output / "brioche-live-session.png"))
-    main.pages.setCurrentIndex(1)
+    main.navigate(2)
     main.web_enabled.setChecked(True)
     app.processEvents()
     main.grab().save(str(output / "brioche-sharing.png"))

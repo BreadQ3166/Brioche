@@ -11,7 +11,7 @@ Ubuntu 22.04 x64 执行测试及打包，不要求本机安装 Windows。
 4. 解开下载的构建产物，再解开其中的 `Brioche-<版本>-windows-x64.zip`。
 5. 保留完整 `Brioche` 文件夹，双击 **Brioche.exe**。
 
-这是便携包，不是单文件安装器。`_internal` 包含 Qt、视频库和内置 Tailscale，
+这是便携包，不是单文件安装器。`_internal` 包含 Qt、视频库、FFmpeg 硬件编码组件和内置 Tailscale，
 不能只复制 EXE。最终用户不需要安装 Python、Go 或 Tailscale。
 当前构建未做 Windows 代码签名；构建成功不代表已完成真实桌面兼容验收。
 
@@ -46,8 +46,11 @@ macOS12 不包含在本工作流中；当前内置网络 SDK 不支持该系统�
 ```text
 python -m pip install -e . pyinstaller==6.11.1
 python scripts/build_network.py
+python scripts/build_media.py --platform linux --work-dir /tmp/brioche-media
 python scripts/build.py
 ```
 
 Windows：`python scripts/package_windows.py`；Ubuntu：
 `python scripts/package_linux.py`。构建配置位于 `.github/workflows/build.yml`。
+
+0.6 增加两个 Ubuntu 媒体构建任务：Linux 原生与 Windows MinGW 交叉编译。应用构建下载对应组件后打包；产物同时提供媒体上游源码 ZIP、配置及许可。Windows 自行构建时先在 Linux 编译 Windows 媒体组件，放入 runtime/media，再在 Windows 构建应用。

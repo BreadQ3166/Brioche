@@ -8,6 +8,7 @@ import secrets
 import ssl
 import sys
 import ipaddress
+import threading
 from urllib.parse import urlsplit
 
 
@@ -21,7 +22,14 @@ def data_dir():
     return root / "Brioche"
 
 
+_identity_lock = threading.RLock()
+
 def identity(folder=None, hosts=None):
+    with _identity_lock:
+        return _identity(folder, hosts)
+
+
+def _identity(folder=None, hosts=None):
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec

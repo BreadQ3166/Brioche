@@ -4,6 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 import queue
 import secrets
+import platform
+import socket as system_socket
 import socket
 import threading
 import time
@@ -32,7 +34,7 @@ def stream_info(media, monitors, selected, epoch, view_only, kind="welcome", req
         "source_width": media.monitor["width"], "source_height": media.monitor["height"],
         "source_left": media.monitor["left"], "source_top": media.monitor["top"],
         "fps_limit": int(media.codec.framerate), "encoder": media.encoder_name,
-        "capture": media.capture.backend, "input": not view_only,
+        "capture": media.capture.backend, "encoder_fallback": getattr(media,"fallback_reason",""), "input": not view_only,
         "monitors": monitors, "monitor": selected, "stream_id": epoch, "request": request,
     }
 
@@ -61,10 +63,35 @@ def validate_stream_info(info):
     return w, h
 
 
+class SessionGate:
+    """Share one active desktop session across LAN, browser and embedded-network hosts."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.owner = None
+
+    def acquire(self, owner):
+        with self.lock:
+            if self.owner is not None:
+                return False
+            self.owner = owner
+            return True
+
+    def release(self, owner):
+        with self.lock:
+            if self.owner is owner:
+                self.owner = None
+
+    @property
+    def active(self):
+        with self.lock:
+            return self.owner is not None
+
+
 class Host:
     def __init__(self, bind="127.0.0.1", port=47995, encoder="libx264", monitor=1,
                  status=lambda message: None, folder=None, view_only=False,
-                 web_enabled=False, web_port=47996):
+                 web_enabled=False, web_port=47996, lan_discovery=False,
+                 on_pair=lambda request: request.answer(False), session_gate=None, name=None):
         self.bind, self.port, self.encoder, self.monitor = bind, port, encoder, monitor
         self.status, self.folder, self.view_only = status, folder, view_only
         self.token = secrets.token_urlsafe(32)
@@ -75,8 +102,20 @@ class Host:
         self.ready = threading.Event()
         self.error = None
         self.active = False
+        self._media = None
+        self.session_gate = session_gate or SessionGate()
+        self.lan_discovery = lan_discovery
+        self.on_pair = on_pair
+        self.name = (name or system_socket.gethostname())[:64]
+        self._pair_pending = None
+        if lan_discovery:
+            from .lan import PairStore
+            self.pair_store = PairStore(folder)
+        else:
+            self.pair_store = None
         self._failures = []
         self.peer_tasks = set()
+        self.connection_tasks = {}
         self.session_tasks = set()
         self.stop_requested = threading.Event()
         self.web_enabled, self.web_port = web_enabled, web_port
@@ -134,6 +173,8 @@ class Host:
     async def _accept(self, reader, writer):
         task = asyncio.current_task()
         self.peer_tasks.add(task)
+        peer = writer.get_extra_info('peername')
+        self.connection_tasks[peer] = task
         acquired = False
         executor = None
         media = None
@@ -146,18 +187,22 @@ class Host:
             if len(self.peer_tasks) > 4 or len(self._failures) >= 20:
                 return
             kind, hello = await asyncio.wait_for(read_message(reader), 8)
+            if kind == CONTROL and hello.get("type") in ("discover", "pair"):
+                await self._lan_request(reader, writer, hello)
+                return
             if kind == CONTROL and hello.get("type") == "hello" and hello.get("version") != VERSION:
                 raise ProtocolError("两端 Brioche 版本不兼容，请都更新到 0.2 或更高版本")
             if (kind != CONTROL or hello.get("type") != "hello" or hello.get("version") != VERSION
                     or not isinstance(hello.get("token"), str)
-                    or not secrets.compare_digest(hello["token"], self.token)):
+                    or not (secrets.compare_digest(hello["token"], self.token)
+                            or (self.pair_store and self.pair_store.accepts(hello["token"])))):
                 self._failures.append(now)
                 raise ProtocolError("设备凭据或协议版本无效")
             config = StreamConfig.parse(hello.get("config"))
             codec = hello.get("codec", "h264")
             if codec not in ("h264", "mjpeg") or (codec == "mjpeg" and config.fps > 30):
                 raise ProtocolError("不支持的画面格式或浏览器帧率")
-            if self.active:
+            if not self.session_gate.acquire(task):
                 raise ProtocolError("被控端已有活动连接")
             self.active = acquired = True
             self.session_tasks.add(task)
@@ -167,6 +212,7 @@ class Host:
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="brioche-capture")
             monitors = await self.loop.run_in_executor(executor, list_monitors)
             media = await self._open_media(executor, config, self.monitor, codec)
+            self._media = media
             if not self.view_only:
                 sink = InputSink(media.monitor)
             state = {"stream_id": 0, "monitor": self.monitor, "pending": None,
@@ -191,6 +237,7 @@ class Host:
                                                         "message": "无法打开该显示器，已保留当前画面"}))
                     else:
                         previous, media = media, replacement
+                        self._media = media
                         await self.loop.run_in_executor(executor, previous.close)
                         state["monitor"] = selected
                         state["stream_id"] += 1
@@ -239,18 +286,56 @@ class Host:
                     pass
             if media and executor:
                 await self.loop.run_in_executor(executor, media.close)
+                if self._media is media:self._media = None
             if executor:
                 executor.shutdown(wait=True, cancel_futures=True)
             if acquired:
+                self.session_gate.release(task)
                 self.active = False
                 self.session_tasks.discard(task)
                 self.status("等待连接")
             await close_writer(writer)
             self.peer_tasks.discard(task)
+            self.connection_tasks.pop(peer, None)
+
+    async def _lan_request(self, reader, writer, message):
+        from .lan import CLIENT_ID, PairRequest, pairing_code, target
+        if not self.lan_discovery or message.get('version') != VERSION:
+            raise ProtocolError('请在被控端开启局域网共享，并更新两端到0.6或更高版本')
+        try:
+            target(writer.get_extra_info('peername')[0])
+        except ValueError as exc:
+            raise ProtocolError('局域网入口只接受局域网设备') from exc
+        if message['type'] == 'discover':
+            await send(writer, pack_control({'type':'device', 'product':'Brioche', 'version':VERSION,
+                'name':self.name, 'platform':platform.system(), 'busy':self.session_gate.active}))
+            return
+        client_id, nonce, name = message.get('client_id'), message.get('nonce'), message.get('name')
+        if (not isinstance(client_id, str) or not CLIENT_ID.fullmatch(client_id)
+                or not isinstance(nonce, str) or not CLIENT_ID.fullmatch(nonce)
+                or not isinstance(name, str) or not 1 <= len(name) <= 64):
+            raise ProtocolError('无效配对请求')
+        if self._pair_pending:
+            raise ProtocolError('已有设备正在等待配对，请稍后重试')
+        name = ''.join(c for c in name if c.isprintable()) or '局域网设备'
+        request = PairRequest(name, writer.get_extra_info('peername')[0], pairing_code(self.pin, nonce, client_id))
+        self._pair_pending = request
+        try:
+            self.on_pair(request)
+            end = time.monotonic() + 30
+            while not request.done.is_set() and time.monotonic() < end and not reader.at_eof() and not self.stop_requested.is_set():
+                await asyncio.sleep(.1)
+            if not request.done.is_set() or not request.allowed or reader.at_eof() or self.stop_requested.is_set():
+                raise ProtocolError('配对未被允许、已取消或确认超时')
+            token = self.pair_store.grant(client_id, name)
+            await send(writer, pack_control({'type':'paired', 'token':token}))
+        finally:
+            request.answer(False)
+            self._pair_pending = None
 
     async def _open_media(self, executor, config, monitor, codec="h264"):
-        from .media import DesktopEncoder
-        opening = self.loop.run_in_executor(executor, DesktopEncoder, config,
+        from .media import create_encoder
+        opening = self.loop.run_in_executor(executor, create_encoder, config,
                                             "mjpeg" if codec == "mjpeg" else self.encoder, monitor)
         try:
             return await asyncio.shield(opening)
@@ -318,6 +403,8 @@ class Host:
 
     def stop(self):
         self.stop_requested.set()
+        interrupt = getattr(self._media, "interrupt", None)
+        if interrupt:interrupt()
         if self.loop and self.stop_event and self.loop.is_running():
             self.loop.call_soon_threadsafe(self.stop_event.set)
 
