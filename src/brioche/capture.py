@@ -13,6 +13,9 @@ def list_monitors():
 
 class DesktopCapture:
     def __init__(self, monitor_index, fps):
+        if sys.platform == 'darwin':
+            from .mac_permissions import require_screen
+            require_screen()
         self.mss = mss.mss()
         self.container = None
         self.frames = None

@@ -37,7 +37,7 @@ Linux 在隔离 Xvfb 桌面运行现有远程桌面测试，并验证打包后�
 这些检查不会将云端构建机当作无人值守被控电脑，也不会登录用户的 Tailscale 账号。
 
 **Windows 11 真实桌面采集、鼠标键盘、显卡硬件编码和外网双机连接仍需实机测试。**
-macOS12 不包含在本工作流中；当前内置网络 SDK 不支持该系统。
+Mac12 增加Intel与Apple Silicon构建，使用12.0部署目标、Go1.26网络依赖和兼容Python，整包逐库检查；新版Mac运行器测试不是OS12真机验收。
 
 ## 在开发机自行构建
 
@@ -54,3 +54,5 @@ Windows：`python scripts/package_windows.py`；Ubuntu：
 `python scripts/package_linux.py`。构建配置位于 `.github/workflows/build.yml`。
 
 0.6 增加两个 Ubuntu 媒体构建任务：Linux 原生与 Windows MinGW 交叉编译。应用构建下载对应组件后打包；产物同时提供媒体上游源码 ZIP、配置及许可。Windows 自行构建时先在 Linux 编译 Windows 媒体组件，放入 runtime/media，再在 Windows 构建应用。
+
+Mac构建使用Go1.26.11与network-helper/go.macos12.mod，不能自动升级1.27。scripts/check_macos.py对每个原生库检查最低系统版本，package_macos.py在检查通过后生成.app ZIP；预发布包未经Apple公证。

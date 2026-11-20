@@ -38,6 +38,9 @@ def validate_event(event):
 
 class InputSink:
     def __init__(self, monitor):
+        if sys.platform == 'darwin':
+            from .mac_permissions import require_input
+            require_input()
         if sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") == "wayland":
             raise RuntimeError("此版本被控输入需要 Xorg 会话；Wayland 尚未实现")
         self.display = None

@@ -28,3 +28,5 @@ Playwright 和系统 Google Chrome 仅用于开发时的浏览器自动化验证
 内置网络源码及 go.mod/go.sum 随源码包提供。官方云服务的账号与服务条款独立于开源客户端许可；本软件没有内置账号、共享 auth key 或第三方 OAuth secret。
 
 0.6 独立 FFmpeg 组件固定使用 FFmpeg9.0.2（LGPL 构建，未启用 GPL/nonfree）和 nv-codec-headers n12.1.14.1。完整配置、源地址、SHA256 和编译器写入 `media/BUILD.json`，许可随 `media/licenses` 提供。发布时同时提供 `Brioche-media-sources-linux.zip` 与 `Brioche-media-sources-windows.zip`，包含原始上游压缩包、构建脚本和准确配置；可重编译并替换独立的 ffmpeg 可执行文件。显卡驱动由系统提供。该组件与 PyAV wheel 中的 FFmpeg 是两个独立构建，不能混用许可结论。
+
+0.8 的Mac12网络使用Tailscale v1.102.5及Go1.26.11，独立锁定于network-helper/go.macos12.mod及.sum。Mac Python来自Astral python-build-standalone 20261110的CPython3.11.18，校验值固定在scripts/setup_macos_python.py；PyObjC锁定10.3.2。实际依赖许可随包收集。UI矢量绘制与文件互传独立实现，没有增加文件中转服务器。

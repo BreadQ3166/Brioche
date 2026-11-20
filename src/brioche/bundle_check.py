@@ -50,12 +50,15 @@ def run(output):
         assert process.returncode == 0
         result['embedded_network'] = 'native executable loads; account login not attempted'
         from .hardware_media import executable
-        media = executable()
-        assert media
-        process = subprocess.run([media, '-hide_banner', '-encoders'], capture_output=True, timeout=15)
-        assert process.returncode == 0 and b'h264_nvenc' in process.stdout
-        result['media_backend'] = 'bundled FFmpeg loads with NVENC; GPU availability tested at connection time'
-        if platform.system() == 'Windows':
+        if platform.system() != 'Darwin':
+            media = executable()
+            assert media
+            process = subprocess.run([media, '-hide_banner', '-encoders'], capture_output=True, timeout=15)
+            assert process.returncode == 0 and b'h264_nvenc' in process.stdout
+            result['media_backend'] = 'bundled FFmpeg loads with NVENC; GPU availability tested at connection time'
+        else:
+            result['media_backend'] = 'PyAV H.264 initialized; VideoToolbox capability tested at connection time'
+        if platform.system() in ('Windows','Darwin'):
             import pynput.keyboard
             import pynput.mouse
             result['input_modules'] = 'imported; input not injected'

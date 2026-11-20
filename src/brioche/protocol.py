@@ -5,7 +5,8 @@ import struct
 from dataclasses import dataclass
 
 VERSION = 2
-CONTROL, VIDEO = 1, 2
+CONTROL, VIDEO, FILE = 1, 2, 3
+MAX_FILE_CHUNK = 64 * 1024
 HEADER = struct.Struct("!BI")
 MAX_CONTROL = 16 * 1024
 MAX_VIDEO = 8 * 1024 * 1024
@@ -64,12 +65,19 @@ def pack_video(payload):
     return HEADER.pack(VIDEO, len(payload)) + payload
 
 
+def pack_file(payload):
+    if not 0 < len(payload) <= MAX_FILE_CHUNK:
+        raise ProtocolError('无效文件分块')
+    return HEADER.pack(FILE, len(payload)) + payload
+
+
 async def read_message(reader):
     kind, size = HEADER.unpack(await reader.readexactly(HEADER.size))
-    if kind not in (CONTROL, VIDEO) or not 0 < size <= (MAX_CONTROL if kind == CONTROL else MAX_VIDEO):
+    limit = {CONTROL: MAX_CONTROL, VIDEO: MAX_VIDEO, FILE: MAX_FILE_CHUNK}.get(kind, 0)
+    if not 0 < size <= limit:
         raise ProtocolError("无效消息类型或长度")
     payload = await reader.readexactly(size)
-    if kind == VIDEO:
+    if kind in (VIDEO, FILE):
         return kind, payload
     try:
         value = json.loads(payload)

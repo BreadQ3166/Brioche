@@ -62,6 +62,26 @@ class DesktopIntegration(unittest.TestCase):
             self.assertIn("NVENC", actual)
             self.assertTrue(info[0]["capture"].startswith("ffmpeg-"))
 
+    def test_file_channel_transfers_while_real_video_continues(self):
+        from pathlib import Path
+        from brioche.file_transfer import TransferJob
+        self.host.files_enabled=True
+        destination=Path(self.folder.name)/'received';destination.mkdir()
+        source=Path(self.folder.name)/'payload.bin';source.write_bytes(secrets.token_bytes(350000))
+        self.host.on_transfer=lambda request:request.respond(str(destination))
+        viewer,ready,frames,statuses,info=self.viewer()
+        self.assertTrue(ready.wait(15),statuses)
+        self.assertTrue(info[0]['files'])
+        count=len(frames)
+        job=TransferJob(self.uri(),'upload',[str(source)])
+        job.start()
+        try:
+            self.assertTrue(job.finished.wait(10))
+            self.assertEqual((destination/source.name).read_bytes(),source.read_bytes())
+            self.assertGreater(len(frames),count+2)
+            self.assertFalse(viewer.finished.is_set())
+        finally:job.stop()
+
     def test_matching_is_released_after_native_viewer_disconnect(self):
         from unittest.mock import patch
         with patch('brioche.display_mode.DisplayLease') as lease:

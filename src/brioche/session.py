@@ -27,15 +27,18 @@ async def close_writer(writer):
         await asyncio.sleep(0)
 
 
-def stream_info(media, monitors, selected, epoch, view_only, kind="welcome", request=0):
+def stream_info(media, monitors, selected, epoch, view_only, kind="welcome", request=0, files=False):
     return {
         "type": kind, "version": VERSION, "codec": media.codec_name,
         "width": media.width, "height": media.height,
         "source_width": media.monitor["width"], "source_height": media.monitor["height"],
+        'capture_width':getattr(media,'capture_width',media.monitor['width']),
+        'capture_height':getattr(media,'capture_height',media.monitor['height']),
         "source_left": media.monitor["left"], "source_top": media.monitor["top"],
         "fps_limit": int(media.codec.framerate), "encoder": media.encoder_name,
         "capture": media.capture.backend, "encoder_fallback": getattr(media,"fallback_reason",""), "input": not view_only,
         "timing_scope": "packet_wait" if getattr(media, "paced", False) else "capture_encode",
+        'files':bool(files and not view_only),
         "monitors": monitors, "monitor": selected, "stream_id": epoch, "request": request,
     }
 
@@ -92,7 +95,9 @@ class Host:
     def __init__(self, bind="127.0.0.1", port=47995, encoder="libx264", monitor=1,
                  status=lambda message: None, folder=None, view_only=False,
                  web_enabled=False, web_port=47996, lan_discovery=False,
-                 on_pair=lambda request: request.answer(False), session_gate=None, name=None):
+                 on_pair=lambda request: request.answer(False), session_gate=None, name=None,
+                 files_enabled=False, on_transfer=lambda request: request.respond(),
+                 on_transfer_progress=lambda value: None, file_gate=None):
         self.bind, self.port, self.encoder, self.monitor = bind, port, encoder, monitor
         self.status, self.folder, self.view_only = status, folder, view_only
         self.token = secrets.token_urlsafe(32)
@@ -105,6 +110,10 @@ class Host:
         self.active = False
         self._media = None
         self.session_gate = session_gate or SessionGate()
+        self.file_gate = file_gate or SessionGate()
+        self.files_enabled, self.on_transfer = files_enabled, on_transfer
+        self.on_transfer_progress = on_transfer_progress
+        self.transfer_requests = set()
         self.lan_discovery = lan_discovery
         self.on_pair = on_pair
         self.name = (name or system_socket.gethostname())[:64]
@@ -192,6 +201,15 @@ class Host:
             if kind == CONTROL and hello.get("type") in ("discover", "pair"):
                 await self._lan_request(reader, writer, hello)
                 return
+            if kind == CONTROL and hello.get('type') == 'file_transfer':
+                if (hello.get('version') != VERSION or not isinstance(hello.get('token'), str)
+                        or not hello['token'].isascii() or not (secrets.compare_digest(hello['token'], self.token)
+                        or (self.pair_store and self.pair_store.accepts(hello['token'])))):
+                    raise ProtocolError('文件连接认证失败')
+                if self.view_only or not self.files_enabled:
+                    raise ProtocolError('被控端未允许文件互传，或当前是仅查看共享')
+                await self._file_session(reader, writer, hello)
+                return
             if kind == CONTROL and hello.get("type") == "hello" and hello.get("version") != VERSION:
                 raise ProtocolError("两端 Brioche 版本不兼容，请都更新到 0.2 或更高版本")
             if (kind != CONTROL or hello.get("type") != "hello" or hello.get("version") != VERSION
@@ -223,7 +241,7 @@ class Host:
                 sink = InputSink(media.monitor)
             state = {"stream_id": 0, "monitor": self.monitor, "pending": None,
                      "switching": False, "last_switch": 0.0, "monitors": monitors}
-            await send(writer, pack_control(stream_info(media, monitors, self.monitor, 0, self.view_only)))
+            await send(writer, pack_control(stream_info(media, monitors, self.monitor, 0, self.view_only,files=self.files_enabled)))
             self.status(f"正在共享 · {media.width}×{media.height} · 上限 {config.fps} FPS")
             receiver = asyncio.create_task(self._receive_input(reader, writer, sink, state))
             interval = 1 / config.fps
@@ -255,7 +273,7 @@ class Host:
                         if sink:
                             sink.monitor = media.monitor
                         await send(writer, pack_control(stream_info(
-                            media, monitors, selected, state["stream_id"], self.view_only, "stream", request)))
+                            media, monitors, selected, state["stream_id"], self.view_only, "stream", request,files=self.files_enabled)))
                         self.status(f"正在共享显示器 {selected} · {media.width}×{media.height}")
                         frames, process_ms, report_at = 0, 0.0, time.monotonic()
                         send_ms = 0.0
@@ -338,6 +356,52 @@ class Host:
             await close_writer(writer)
             self.peer_tasks.discard(task)
             self.connection_tasks.pop(peer, None)
+
+    async def _file_session(self, reader, writer, hello):
+        from .file_transfer import FileConsent, TransferError, validate_manifest, sources, send_files, receive_files
+        task = asyncio.current_task()
+        if not self.file_gate.acquire(task):
+            raise ProtocolError('已有文件正在传输，请等待完成')
+        request = None
+        last_progress = 0.0
+        try:
+            direction = hello.get('direction')
+            if direction not in ('upload', 'download'):
+                raise TransferError('无效文件传输方向')
+            items = validate_manifest(hello.get('files')) if direction == 'upload' else []
+            request = FileConsent('receive' if direction == 'upload' else 'send', writer.get_extra_info('peername')[0], items)
+            self.transfer_requests.add(request)
+            self.on_transfer(request)
+            selection = await request.wait(reader, self.stop_requested)
+            def progress(completed, total, name):
+                nonlocal last_progress
+                now = time.monotonic()
+                if now - last_progress >= .1 or name == '完成':
+                    last_progress = now
+                    self.on_transfer_progress({'id': request.id, 'completed': completed, 'total': total,
+                                               'name': name, 'status': '传输中'})
+            if direction == 'upload':
+                await receive_files(reader, writer, selection, items, progress)
+            else:
+                paths, items = await asyncio.to_thread(sources, selection)
+                await send(writer, pack_control({'type': 'file_offer', 'files': items}))
+                await send_files(reader, writer, paths, items, progress)
+            self.on_transfer_progress({'id': request.id, 'finished': True, 'status': '已完成 · SHA256 校验通过'})
+        except asyncio.CancelledError:
+            if request:self.on_transfer_progress({'id': request.id, 'finished': True, 'status': '已取消'})
+            raise
+        except Exception as exc:
+            message = str(exc)[:200] if isinstance(exc, TransferError) else '文件传输中断，请检查连接、权限或磁盘空间'
+            try:await send(writer, pack_control({'type': 'file_error', 'message': message}))
+            except Exception:pass
+            if request:self.on_transfer_progress({'id': request.id, 'finished': True, 'status': message})
+        finally:
+            if request:
+                request.respond();self.transfer_requests.discard(request)
+            self.file_gate.release(task)
+
+    def cancel_transfers(self):
+        for request in tuple(self.transfer_requests):request.cancel()
 
     async def _lan_request(self, reader, writer, message):
         from .lan import CLIENT_ID, PairRequest, pairing_code, target

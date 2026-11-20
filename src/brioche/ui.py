@@ -14,6 +14,8 @@ from .protocol import StreamConfig, FRAME_RATES, ENCODERS
 from .security import access_uri, parse_uri
 from .session import Host, Viewer
 from .network import address_mode, tailscale_status
+from .ui_components import RoundedComboBox
+QComboBox = RoundedComboBox
 
 STYLE = """
 QWidget { background: #f7f5f0; color: #292823; font-size: 14px; }
@@ -24,10 +26,10 @@ QLabel#muted { color: #6e6a61; }
 QFrame#sidebar { background: #eeeae2; border-radius: 12px; }
 QFrame#sidebar QLabel { background: transparent; }
 QLineEdit, QSpinBox, QComboBox, QTextEdit {
- background: #fffdf8; border: 1px solid #d6cfc1; border-radius: 7px; padding: 9px;
+ background: #fffdf8; border: 1px solid #dfd9ce; border-radius: 10px; padding: 10px;
  selection-background-color: #bd713d;
 }
-QPushButton { background: #ece6dc; border: 1px solid #d6cfc1; border-radius: 7px;
+QPushButton { background: #eee9e0; border: 1px solid #ded7cb; border-radius: 10px;
  padding: 11px 18px; }
 QPushButton:hover { background: #e3d7c8; }
 QPushButton:disabled { color: #9d998f; background: #eeeae2; }
@@ -36,9 +38,15 @@ QPushButton#primary:hover { background: #a65f31; }
 QPushButton#danger { color: #a44035; }
 QPushButton:checked { background: #e3d4c0; color: #8c4d2c; border-color: #cbb598; }
 QListWidget#deviceList { background: transparent; border: none; outline: none; }
-QListWidget#deviceList::item { background: #fffdf8; border: 1px solid #e4ded2; border-radius: 10px; padding: 12px 18px; }
-QListWidget#deviceList::item:hover { background: #f1e7d9; border-color: #c6a47d; }
-QListWidget#deviceList::item:selected { background: #ede0cd; color: #292823; }
+QListWidget#deviceList::item { background: transparent; border: none; padding: 0; }
+QPushButton#navButton { text-align: left; padding-left: 22px; border: none; background: transparent; }
+QPushButton#navButton:hover { background: #e5dfd3; }
+QPushButton#navButton:checked { background: #fffaf0; color: #9b5e31; }
+QWidget#transferCard { background: #fffdf9; border: 1px solid #e4ddd2; border-radius: 14px; }
+QWidget#transferCard QLabel { background: transparent; border: none; }
+QLabel#transferTitle { font-weight: 600; background: transparent; border: none; }
+QProgressBar { background: #eae5db; border: none; border-radius: 4px; max-height: 7px; min-height: 7px; }
+QProgressBar::chunk { background: #bb835b; border-radius: 4px; }
 QCheckBox { padding: 8px 0; }
 QScrollArea { border: none; }
 """
@@ -201,6 +209,8 @@ class RemoteCanvas(QWidget):
 
 class RemoteWindow(QMainWindow):
     closed = Signal()
+    transfer_started = Signal(str,str,object)
+    transfer_updated = Signal(dict)
 
     def __init__(self, uri, config, network_mode=None, path_status=None):
         super().__init__()
@@ -212,6 +222,7 @@ class RemoteWindow(QMainWindow):
         self.path_status = path_status
         self.network_mode = network_mode or address_mode(parse_uri(uri)[0])
         self.current_info = {}
+        self._uri, self._transfer_dialog = uri, None
         self.mailbox = FrameMailbox()
         self.viewer = Viewer(uri, config, self.mailbox.publish, self.bridge.status.emit,
                              self.bridge.info.emit, self.bridge.stats.emit)
@@ -242,10 +253,13 @@ class RemoteWindow(QMainWindow):
         disconnect = QPushButton("断开")
         disconnect.clicked.connect(self.close)
         metrics = QPushButton("性能")
+        self.file_button = QPushButton('文件互传')
+        self.file_button.setEnabled(False)
+        self.file_button.clicked.connect(self.open_files)
         metrics.setCheckable(True)
         metrics.toggled.connect(self.stats_text.setVisible)
         self.stats_text.hide()
-        for button in (metrics, release, full, disconnect):
+        for button in (self.file_button,metrics, release, full, disconnect):
             bar.addWidget(button)
         layout.addLayout(bar)
         layout.addWidget(self.canvas, 1)
@@ -291,6 +305,8 @@ class RemoteWindow(QMainWindow):
             self.status_text.setText(info["message"])
         else:
             self.current_info = info
+            self.file_button.setEnabled(bool(info.get('files')))
+            self.file_button.setToolTip('通过独立连接发送或接收文件' if info.get('files') else '对方需更新 Brioche 并允许文件互传，且不能是仅查看共享')
             self.stats_text.setToolTip(info.get("encoder_fallback", "") or info.get("encoder", "H.264"))
             self.canvas.release_input()
             if info["type"] == "stream":
@@ -363,7 +379,7 @@ class RemoteWindow(QMainWindow):
             source = self.current_info
             timing_label = "取帧等待" if source.get("timing_scope") == "packet_wait" else "采集+编码"
             self.stats_text.setText(
-                f"源 {source.get('source_width', '—')}×{source.get('source_height', '—')} → "
+                f"源 {source.get('capture_width', source.get('source_width', '—'))}×{source.get('capture_height', source.get('source_height', '—'))} → "
                 f"{source.get('width', '—')}×{source.get('height', '—')} · {source.get('capture', '—')}\n"
                 f"{self.current_info.get('encoder', 'H.264')} · 绘制 {painted_fps:.1f} FPS · 界面提交 {self.presented_fps:.1f} FPS · 解码 {s.get('decoded_fps', '—')} FPS · "
                 f"编码 {s.get('encoded_fps', '—')} FPS · RTT {s.get('rtt_ms', '—')} ms · "
@@ -375,6 +391,7 @@ class RemoteWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._closed = True
+        if self._transfer_dialog:self._transfer_dialog.stop_jobs();self._transfer_dialog.close()
         self.path_timer.stop()
         self.timer.stop()
         self.canvas.release_input()
@@ -382,6 +399,14 @@ class RemoteWindow(QMainWindow):
         self.viewer.join(2)
         self.closed.emit()
         super().closeEvent(event)
+
+    def open_files(self):
+        from .transfer_ui import TransferDialog
+        if self._transfer_dialog is None:
+            self._transfer_dialog=TransferDialog(self._uri,self)
+            self._transfer_dialog.started.connect(self.transfer_started.emit)
+            self._transfer_dialog.updated.connect(self.transfer_updated.emit)
+        self._transfer_dialog.show();self._transfer_dialog.raise_()
 
 
 from .main_window import MainWindow

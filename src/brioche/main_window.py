@@ -35,6 +35,9 @@ from .network import lan_addresses
 from .protocol import FRAME_RATES, StreamConfig
 from .security import access_uri, parse_uri
 from .session import Host, SessionGate
+from .ui_components import DeviceList, RoundedComboBox, PageTransition
+from .transfer_ui import TransferBoard, downloads
+QComboBox = RoundedComboBox
 
 
 def text(value, heading=False):
@@ -54,6 +57,8 @@ class EnvironmentBridge(QObject):
     pair_request = Signal(object)
     pair_code = Signal(str)
     host_status = Signal(str, str)
+    transfer_request = Signal(object)
+    transfer_progress = Signal(dict)
 
 
 class MainWindow(QMainWindow):
@@ -65,6 +70,8 @@ class MainWindow(QMainWindow):
         self.store = DeviceStore(folder)
         self.network = network or EmbeddedNetwork(self.store.folder / "network")
         self.gate = SessionGate()
+        self.file_gate = SessionGate()
+        self._transfer_dialogs = {}
         self.hosts = {"lan": None, "tailscale": None}
         self.remote = None
         self._alive, self._busy, self._lan_busy, self._connecting = (
@@ -95,6 +102,8 @@ class MainWindow(QMainWindow):
         self.bridge.pair_request.connect(self.confirm_pair)
         self.bridge.pair_code.connect(self.show_pair_code)
         self.bridge.host_status.connect(self.host_status)
+        self.bridge.transfer_request.connect(self.confirm_transfer)
+        self.bridge.transfer_progress.connect(self.transfer_progress)
         root = QWidget()
         row = QHBoxLayout(root)
         row.setContentsMargins(16, 16, 16, 16)
@@ -112,10 +121,15 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self.internet_page())
         self.pages.addWidget(self.lan_page())
         self.pages.addWidget(self.settings_page())
+        transfer_page, transfer_layout = self.page('文件传输', '连接设备后，在远程窗口点击“文件互传”。接收前确认保存位置。')
+        self.transfer_board = TransferBoard();transfer_layout.addWidget(self.transfer_board,1)
+        self.pages.addWidget(transfer_page)
+        self.transitions = PageTransition(self.pages)
         self.nav_buttons = []
-        for index, title in enumerate(("外网设备", "局域网设备", "设置")):
+        for index, title in enumerate(("外网设备", "局域网设备", "设置", "文件传输")):
             button = QPushButton(title)
             button.setCheckable(True)
+            button.setObjectName('navButton')
             button.clicked.connect(lambda checked=False, i=index: self.navigate(i))
             self.nav_buttons.append(button)
             nav.addWidget(button)
@@ -130,6 +144,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.pages, 1)
         self.setCentralWidget(root)
         self.navigate(0)
+        self.apply_motion()
         self.poll = QTimer(self)
         self.poll.setInterval(300)
         self.poll.timeout.connect(self.poll_hosts)
@@ -149,7 +164,7 @@ class MainWindow(QMainWindow):
         self.work("display_recovery", lambda: recover(self.store.folder))
 
     def navigate(self, index):
-        self.pages.setCurrentIndex(index)
+        self.transitions.show(index, not self.store.setting('reduced_motion', False))
         for i, button in enumerate(self.nav_buttons):
             button.setChecked(i == index)
 
@@ -175,9 +190,7 @@ class MainWindow(QMainWindow):
         account.addWidget(self.account_status, 1)
         account.addWidget(self.login_button)
         layout.addLayout(account)
-        self.internet_list = QListWidget()
-        self.internet_list.setObjectName("deviceList")
-        self.internet_list.setSpacing(8)
+        self.internet_list = DeviceList()
         self.internet_list.itemClicked.connect(self.internet_clicked)
         self.internet_list.itemActivated.connect(self.internet_clicked)
         layout.addWidget(self.internet_list, 1)
@@ -208,9 +221,7 @@ class MainWindow(QMainWindow):
         search.addWidget(self.lan_ip, 1)
         search.addWidget(self.find_button)
         layout.addLayout(search)
-        self.lan_list = QListWidget()
-        self.lan_list.setObjectName("deviceList")
-        self.lan_list.setSpacing(8)
+        self.lan_list = DeviceList()
         self.lan_list.itemClicked.connect(self.lan_clicked)
         self.lan_list.itemActivated.connect(self.lan_clicked)
         layout.addWidget(self.lan_list, 1)
@@ -258,6 +269,22 @@ class MainWindow(QMainWindow):
         self.web_enabled = QCheckBox("允许局域网浏览器访问")
         self.web_enabled.setChecked(bool(self.store.setting("web_enabled", False)))
         layout.addWidget(self.web_enabled)
+        self.file_enabled = QCheckBox('允许文件互传（接收前确认）')
+        self.file_enabled.setChecked(bool(self.store.setting('files_enabled', True)))
+        self.file_enabled.toggled.connect(self.save_settings)
+        layout.addWidget(self.file_enabled)
+        self.reduced_motion = QCheckBox('减少动态效果')
+        self.reduced_motion.setChecked(bool(self.store.setting('reduced_motion', False)))
+        self.reduced_motion.toggled.connect(self.apply_motion)
+        layout.addWidget(self.reduced_motion)
+        if platform.system() == 'Darwin':
+            permissions = QHBoxLayout()
+            capture_permission=QPushButton('屏幕录制权限')
+            capture_permission.clicked.connect(lambda:self.mac_permission('screen'))
+            input_permission=QPushButton('辅助功能权限')
+            input_permission.clicked.connect(lambda:self.mac_permission('input'))
+            permissions.addWidget(capture_permission);permissions.addWidget(input_permission)
+            layout.addLayout(permissions)
         browser = QPushButton("复制浏览器链接")
         browser.clicked.connect(self.copy_browser)
         layout.addWidget(browser)
@@ -408,7 +435,22 @@ class MainWindow(QMainWindow):
             fps=self.fps.currentData(),
             bitrate=self.bitrate.value(),
             match_display=self.match_display.isChecked(),
+            files_enabled=self.file_enabled.isChecked(),
         )
+        for host in self.hosts.values():
+            if host:
+                host.files_enabled = self.file_enabled.isChecked() and not host.view_only
+                if not host.files_enabled:host.cancel_transfers()
+
+    def apply_motion(self):
+        enabled = not self.reduced_motion.isChecked()
+        self.store.configure(reduced_motion=not enabled)
+        for widget in (self.internet_list,self.lan_list):widget.set_animations(enabled)
+
+    def mac_permission(self, kind):
+        from .mac_permissions import screen_allowed,input_allowed
+        allowed=(screen_allowed if kind=='screen' else input_allowed)(request=True)
+        self.settings_note.setText('权限已开启' if allowed else '请在系统偏好设置 → 安全性与隐私中授权；屏幕录制授权后需重新打开 Brioche。')
 
     def share_preference(self):
         self.store.configure(
@@ -561,9 +603,11 @@ class MainWindow(QMainWindow):
             item = existing.get(key)
             if item is None:
                 item = QListWidgetItem(widget)
-                item.setSizeHint(QSize(0, 84))
+                size=widget.gridSize() if isinstance(widget,DeviceList) and widget.gridSize().width()>0 else QSize(260,220)
+                item.setSizeHint(size)
+                if isinstance(widget,DeviceList):widget.new_entry(key)
             item.setText(f'{name}\n{status}    ·    {data.get("ip", "")}')
-            item.setData(Qt.ItemDataRole.UserRole, {**data, "key": key})
+            item.setData(Qt.ItemDataRole.UserRole, {**data, "key": key,'display_name':name,'status_text':status})
             item.setToolTip(status)
             item.setForeground(
                 QColor(
@@ -754,6 +798,8 @@ class MainWindow(QMainWindow):
             path_status=callback,
         )
         self.remote.closed.connect(self.remote_closed)
+        self.remote.transfer_started.connect(self.transfer_board.add)
+        self.remote.transfer_updated.connect(self.transfer_board.update_task)
         self.remote.show()
 
     def remote_closed(self):
@@ -836,10 +882,17 @@ class MainWindow(QMainWindow):
                 on_pair=self.bridge.pair_request.emit,
                 session_gate=self.gate,
                 name=self.store.name,
+                files_enabled=self.file_enabled.isChecked() and not self.mode.currentData(),
+                on_transfer=self.bridge.transfer_request.emit,
+                on_transfer_progress=self.bridge.transfer_progress.emit,
+                file_gate=self.file_gate,
             )
             self.hosts[mode].start()
 
     def poll_hosts(self):
+        for task_id,(request,dialog) in list(self._transfer_dialogs.items()):
+            if request.done.is_set():
+                dialog.reject();self._transfer_dialogs.pop(task_id,None)
         for mode, host in list(self.hosts.items()):
             if host is None:
                 continue
@@ -879,6 +932,28 @@ class MainWindow(QMainWindow):
                 + " · "
                 + message
             )
+
+    def confirm_transfer(self, request):
+        from PySide6.QtWidgets import QFileDialog
+        if not self._alive:
+            request.respond();return
+        receiving=request.direction=='receive'
+        count=len(request.items)
+        names='、'.join(item['name'] for item in request.items[:3])[:140]
+        title=f'接收 {names}（{count}个文件），选择保存目录' if receiving else '对方请求文件：选择要发送的文件（最多32个）'
+        self.transfer_board.add(request.id,title,request.cancel)
+        self.navigate(3)
+        dialog=QFileDialog(self,title,downloads())
+        dialog.setFileMode(QFileDialog.FileMode.Directory if receiving else QFileDialog.FileMode.ExistingFiles)
+        if receiving:dialog.setOption(QFileDialog.Option.ShowDirsOnly,True)
+        dialog.filesSelected.connect(lambda paths:request.respond(paths[0] if receiving and paths else paths))
+        dialog.rejected.connect(lambda:request.respond())
+        dialog.finished.connect(lambda result:self._transfer_dialogs.pop(request.id,None))
+        self._transfer_dialogs[request.id]=(request,dialog)
+        dialog.open()
+
+    def transfer_progress(self, value):
+        self.transfer_board.update_task(value)
 
     def account_action(self):
         if self.environment["tailscale"]["ready"]:
@@ -984,6 +1059,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._alive = False
         self._pair_cancel.set()
+        self.transfer_board.stop_all()
+        for request,dialog in list(self._transfer_dialogs.values()):request.cancel();dialog.reject()
         self.poll.stop()
         self.network_poll.stop()
         self.lan_poll.stop()

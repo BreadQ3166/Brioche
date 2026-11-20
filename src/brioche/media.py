@@ -1,6 +1,7 @@
 """Replaceable H.264 CPU-frame backend; owned by one dedicated worker thread."""
 from fractions import Fraction
 import os
+import sys
 import time
 import av
 from .capture import DesktopCapture
@@ -15,12 +16,16 @@ class DesktopEncoder:
         self.capture = DesktopCapture(monitor_index, config.fps)
         try:
             self.monitor = self.capture.monitor
+            self.initial_image = self.capture.grab() if sys.platform == 'darwin' else None
+            # Retina pixels differ from the logical coordinates used by input.
+            self.capture_width = self.initial_image.width if self.initial_image is not None else self.monitor['width']
+            self.capture_height = self.initial_image.height if self.initial_image is not None else self.monitor['height']
             max_w, max_h = RESOLUTIONS[config.resolution]
-            if self.monitor["height"] > self.monitor["width"]:
+            if self.capture_height > self.capture_width:
                 max_w, max_h = max_h, max_w
-            scale = min(max_w / self.monitor["width"], max_h / self.monitor["height"], 1.0)
-            self.width = max(2, int(self.monitor["width"] * scale) // 2 * 2)
-            self.height = max(2, int(self.monitor["height"] * scale) // 2 * 2)
+            scale = min(max_w / self.capture_width, max_h / self.capture_height, 1.0)
+            self.width = max(2, int(self.capture_width * scale) // 2 * 2)
+            self.height = max(2, int(self.capture_height * scale) // 2 * 2)
             self.encoder_name = encoder
             self.codec_name = "mjpeg" if encoder == "mjpeg" else "h264"
             self.codec = av.CodecContext.create(encoder, "w")
@@ -52,7 +57,9 @@ class DesktopEncoder:
 
     def frame(self, force_keyframe=False):
         start = time.perf_counter()
-        image = self.capture.grab()
+        image = self.initial_image
+        self.initial_image = None
+        if image is None:image = self.capture.grab()
         image = image.reformat(width=self.width, height=self.height, format=self.codec.pix_fmt,
                                interpolation=self.interpolation)
         image.pts = self.pts
@@ -89,6 +96,13 @@ class DesktopDecoder:
 
 
 def create_encoder(config, encoder="libx264", monitor_index=1):
+    if encoder == 'auto' and sys.platform == 'darwin':
+        try:
+            return DesktopEncoder(config,'h264_videotoolbox',monitor_index)
+        except Exception:
+            media=DesktopEncoder(config,'libx264',monitor_index)
+            media.fallback_reason='VideoToolbox 不可用，使用软件 H.264'
+            return media
     if encoder in ("auto", "h264_nvenc"):
         from .hardware_media import HardwareEncoder, executable, nvenc_available
         path=executable()

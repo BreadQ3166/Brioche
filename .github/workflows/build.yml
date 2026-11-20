@@ -17,6 +17,78 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  macos:
+    name: macOS 12 ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-15
+            arch: arm64
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+      GOTOOLCHAIN: local
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Install pinned macOS-compatible Python
+        run: python3 scripts/setup_macos_python.py --arch ${{ matrix.arch }} --directory "$RUNNER_TEMP/compat-python"
+      - name: Isolate Python environment
+        run: |
+          python3 -c "import sys; assert sys.version_info[:3] == (3, 11, 18), sys.version"
+          python3 -m venv "$RUNNER_TEMP/brioche-python"
+          echo "$RUNNER_TEMP/brioche-python/bin" >> "$GITHUB_PATH"
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version: '1.26.11'
+          cache-dependency-path: network-helper/go.macos12.sum
+      - name: Install application dependencies
+        run: |
+          python3 -m pip install --upgrade pip setuptools wheel packaging
+          python3 scripts/install_macos_deps.py --wheelhouse "$RUNNER_TEMP/macos12-wheels"
+      - name: Test and build compatible network module
+        run: python3 scripts/build_network.py
+      - name: Test portable source and file transfer
+        run: python3 -m unittest discover -s tests -v
+      - name: Build native application bundle
+        run: python3 scripts/build.py
+      - name: Audit every native binary against macOS 12
+        run: python3 scripts/check_macos.py dist/Brioche.app --arch ${{ matrix.arch }} --output artifacts/macos12-audit.json
+      - name: Check bundled runtime without screen or input permission prompts
+        run: |
+          dist/Brioche.app/Contents/MacOS/Brioche self-test --output artifacts/bundle-runtime.json
+          python3 -c "import json; r=json.load(open('artifacts/bundle-runtime.json')); print(r); assert r['pass']"
+      - name: Package app, notices and checksums
+        run: |
+          python3 scripts/package_macos.py
+          python3 scripts/package_source.py
+          python3 scripts/checksums.py releases
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Brioche-macOS12-${{ matrix.arch }}
+          path: |
+            releases/*.zip
+            releases/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload compatibility report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: Reports-macOS12-${{ matrix.arch }}
+          path: |
+            artifacts/macos12-audit.json
+            artifacts/bundle-runtime.json
+          if-no-files-found: ignore
+
   media:
     name: Media ${{ matrix.platform }}
     runs-on: ubuntu-22.04

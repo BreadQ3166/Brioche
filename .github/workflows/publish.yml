@@ -52,9 +52,10 @@ jobs:
           tag = 'v' + version
           output = Path(os.environ['RUNNER_TEMP']) / 'publish'
           output.mkdir()
-          for platform in ('Windows', 'Ubuntu'):
+          for platform in ('Windows', 'Ubuntu', 'macOS12-x86_64', 'macOS12-arm64'):
               folder = Path(os.environ['RUNNER_TEMP']) / platform
-              gh('run', 'download', run_id, '-n', f'Brioche-{platform}-x64', '-D', str(folder))
+              artifact = f'Brioche-{platform}-x64' if platform in ('Windows','Ubuntu') else f'Brioche-{platform}'
+              gh('run', 'download', run_id, '-n', artifact, '-D', str(folder))
               verified = set()
               for line in (folder / 'SHA256SUMS').read_text().splitlines():
                   digest, name = line.split(maxsplit=1)
@@ -62,9 +63,11 @@ jobs:
                   path = folder / name
                   assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
                   verified.add(name)
-              name = f'Brioche-{version}-windows-x64.zip' if platform == 'Windows' else f'brioche_{version}_amd64.deb'
+              name = (f'Brioche-{version}-windows-x64.zip' if platform == 'Windows' else
+                      f'brioche_{version}_amd64.deb' if platform == 'Ubuntu' else f'Brioche-{version}-{platform}.zip')
               media = 'Brioche-media-sources-' + ('windows' if platform == 'Windows' else 'linux') + '.zip'
-              for item in (name, media):
+              chosen = (name,media) if platform in ('Windows','Ubuntu') else (name,)
+              for item in chosen:
                   assert item in verified
                   if item.endswith('.zip'):
                       with zipfile.ZipFile(folder / item) as archive:
