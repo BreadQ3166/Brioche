@@ -108,13 +108,13 @@ if env.get("BRIOCHE_MEDIA_CFLAGS"):
 if env.get("BRIOCHE_MEDIA_LDFLAGS") and args.platform == "linux":
     flags += ["--extra-ldflags=" + env["BRIOCHE_MEDIA_LDFLAGS"]]
 subprocess.run([str(source / "configure"), *flags], cwd=build, env=env, check=True)
+name = "ffmpeg.exe" if args.platform == "windows" else "ffmpeg"
 subprocess.run(
-    ["make", "-j", str(min(4, os.cpu_count() or 1)), "ffmpeg"],
+    ["make", "-j", str(min(4, os.cpu_count() or 1)), name],
     cwd=build,
     env=env,
     check=True,
 )
-name = "ffmpeg.exe" if args.platform == "windows" else "ffmpeg"
 shutil.copy2(build / name, out / name)
 notices = out / "licenses"
 notices.mkdir(exist_ok=True)
