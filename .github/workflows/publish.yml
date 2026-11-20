@@ -73,7 +73,7 @@ jobs:
           source = output / f'brioche-{version}-source.zip'
           subprocess.run(['git', 'archive', '--format=zip', '--prefix=Brioche/', '--output=' + str(source), sha], check=True)
           subprocess.run(['python3', 'scripts/checksums.py', str(output)], check=True)
-          notes = Path('docs/releases') / (version + '.md')
+          notes = Path('docs/release-notes') / (version + '.md')
           assert notes.is_file()
           gh('release', 'create', tag, '--target', sha, '--draft', '--prerelease', '--title', 'Brioche ' + version,
              '--notes-file', str(notes))
