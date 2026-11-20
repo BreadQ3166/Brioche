@@ -62,6 +62,21 @@ class DesktopIntegration(unittest.TestCase):
             self.assertIn("NVENC", actual)
             self.assertTrue(info[0]["capture"].startswith("ffmpeg-"))
 
+    def test_mac_permission_error_reaches_viewer_without_waiting_for_media(self):
+        from unittest.mock import patch
+        with patch('brioche.session.platform.system', return_value='Darwin'), patch('brioche.mac_permissions.require_host', side_effect=RuntimeError('请允许屏幕录制')):
+            viewer, ready, frames, statuses, info = self.viewer()
+            self.assertTrue(viewer.finished.wait(5), statuses)
+            self.assertTrue(any('屏幕录制' in status for status in statuses), statuses)
+            self.assertEqual(frames, [])
+
+    def test_stable_capture_bypasses_x11grab_and_hardware(self):
+        self.host.encoder = 'stable'
+        viewer, ready, frames, statuses, info = self.viewer()
+        self.assertTrue(ready.wait(15), statuses)
+        self.assertEqual(info[0]['capture'], 'mss')
+        self.assertEqual(info[0]['encoder'], 'libx264')
+
     def test_file_channel_transfers_while_real_video_continues(self):
         from pathlib import Path
         from brioche.file_transfer import TransferJob

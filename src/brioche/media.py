@@ -10,10 +10,11 @@ from .h264 import annexb_access_unit
 
 
 class DesktopEncoder:
-    def __init__(self, config, encoder="libx264", monitor_index=1):
+    def __init__(self, config, encoder="libx264", monitor_index=1, capture_backend='auto'):
         if encoder not in ENCODERS + ("mjpeg",):
             raise ValueError("编码器不在允许列表中")
-        self.capture = DesktopCapture(monitor_index, config.fps)
+        self.capture = (DesktopCapture(monitor_index, config.fps) if capture_backend == 'auto'
+                        else DesktopCapture(monitor_index, config.fps, backend=capture_backend))
         try:
             self.monitor = self.capture.monitor
             self.initial_image = self.capture.grab() if sys.platform == 'darwin' else None
@@ -56,6 +57,10 @@ class DesktopEncoder:
             raise
 
     def frame(self, force_keyframe=False):
+        primed = getattr(self, '_primed', None)
+        if primed is not None:
+            self._primed = None
+            return primed
         start = time.perf_counter()
         image = self.initial_image
         self.initial_image = None
@@ -96,10 +101,22 @@ class DesktopDecoder:
 
 
 def create_encoder(config, encoder="libx264", monitor_index=1):
+    if encoder == 'stable':
+        media = DesktopEncoder(config, 'libx264', monitor_index, capture_backend='mss')
+        media.fallback_reason = '兼容采集：MSS + 软件 H.264，适合排查频闪，性能可能较低'
+        return media
     if encoder == 'auto' and sys.platform == 'darwin':
+        hardware = None
         try:
-            return DesktopEncoder(config,'h264_videotoolbox',monitor_index)
+            hardware = DesktopEncoder(config,'h264_videotoolbox',monitor_index)
+            first = hardware.frame()
+            if not first[0]:
+                raise RuntimeError('VideoToolbox 未及时输出首帧')
+            hardware._primed = first
+            return hardware
         except Exception:
+            if hardware is not None:
+                hardware.close()
             media=DesktopEncoder(config,'libx264',monitor_index)
             media.fallback_reason='VideoToolbox 不可用，使用软件 H.264'
             return media

@@ -226,6 +226,9 @@ class Host:
                 raise ProtocolError("被控端已有活动连接")
             self.active = acquired = True
             self.session_tasks.add(task)
+            if platform.system() == 'Darwin':
+                from .mac_permissions import require_host
+                require_host(self.view_only)
             from .media import DesktopEncoder
             from .capture import list_monitors
             from .platform_input import InputSink
@@ -579,6 +582,9 @@ class Viewer:
             asyncio.run(self._connect())
         except asyncio.CancelledError:
             pass
+        except (TimeoutError, asyncio.TimeoutError):
+            if not self.stopped.is_set():
+                self.on_status('连接失败：等待被控端画面超时；请检查对方屏幕录制权限、编码器和共享状态')
         except Exception as exc:
             if not self.stopped.is_set():
                 self.on_status(f"连接失败：{exc}")

@@ -192,7 +192,7 @@ with tempfile.TemporaryDirectory() as state:
             print(errors)
         assert process.returncode == 0, f"Bundled host exit {process.returncode}"
 
-# Also boot the bundled Qt/X11 UI and request a normal window-manager close.
+# A window-manager close must preserve the bundled application's background service.
 from Xlib import X
 from Xlib.display import Display
 from Xlib.protocol.event import ClientMessage
@@ -220,9 +220,9 @@ try:
                                     data=(32, [display.intern_atom("WM_DELETE_WINDOW"),
                                                X.CurrentTime, 0, 0, 0])))
     display.flush()
-    process.wait(timeout=5)
-    assert process.returncode == 0, process.stderr.read()
-    print("Bundled Qt/X11 UI: opened and closed normally")
+    time.sleep(1)
+    assert process.poll() is None, "Closing the main window terminated background sharing"
+    print("Bundled Qt/X11 UI: opened; close preserved background process")
 finally:
     if process.poll() is None:
         process.terminate()

@@ -61,6 +61,7 @@ class SimpleFlowTests(unittest.TestCase):
         self.window.apply_environment(self.environment)
 
     def tearDown(self):
+        self.window.shutdown()
         self.window.close()
         self.app.processEvents()
         self.temp.cleanup()
@@ -239,4 +240,25 @@ class SimpleFlowTests(unittest.TestCase):
                 self.assertEqual(host.call_count, 2)
             finally:
                 reopened.hosts = {"lan": None, "tailscale": None}
+                reopened.shutdown()
                 reopened.close()
+
+    def test_close_keeps_share_running_and_restore_opens_window(self):
+        self.window.show()
+        with patch('brioche.main_window.QSystemTrayIcon.isSystemTrayAvailable', return_value=True):
+            self.window.close()
+        self.assertFalse(self.window.isVisible())
+        self.assertTrue(self.window._alive)
+        self.assertTrue(self.window.poll.isActive())
+        self.window.restore_window()
+        self.assertTrue(self.window.isVisible())
+
+    def test_close_without_tray_minimizes_and_shutdown_is_explicit(self):
+        self.window.show()
+        with patch('brioche.main_window.QSystemTrayIcon.isSystemTrayAvailable', return_value=False):
+            self.window.close()
+        self.assertTrue(self.window.isMinimized())
+        self.assertTrue(self.window._alive)
+        self.window.shutdown()
+        self.assertFalse(self.window._alive)
+        self.assertFalse(self.window.poll.isActive())

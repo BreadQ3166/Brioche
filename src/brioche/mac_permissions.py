@@ -26,3 +26,9 @@ def require_screen():
 def require_input():
     if not input_allowed():
         raise RuntimeError('请在系统偏好设置 → 安全性与隐私 → 辅助功能中允许 Brioche，或改为仅查看共享')
+
+
+def require_host(view_only=False):
+    require_screen()
+    if not view_only:
+        require_input()

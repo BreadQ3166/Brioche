@@ -25,6 +25,8 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QVBoxLayout,
     QWidget,
+    QSystemTrayIcon,
+    QMenu,
 )
 from . import __version__
 from .capture import list_monitors
@@ -64,6 +66,8 @@ class EnvironmentBridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self, folder=None, network=None):
         super().__init__()
+        self._quitting = False
+        self._shutdown = False
         self.setWindowTitle("Brioche")
         self.resize(1020, 730)
         self.setMinimumSize(830, 620)
@@ -162,6 +166,16 @@ class MainWindow(QMainWindow):
         from .display_mode import recover
 
         self.work("display_recovery", lambda: recover(self.store.folder))
+        self.tray = QSystemTrayIcon(QApplication.instance().windowIcon(), self)
+        self.tray.setToolTip('Brioche · 后台共享')
+        menu = QMenu(self)
+        menu.addAction('打开 Brioche', self.restore_window)
+        menu.addSeparator()
+        menu.addAction('退出 Brioche', self.quit_application)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self.tray_activated)
+        self.tray.show()
+        QApplication.instance().aboutToQuit.connect(self.shutdown)
 
     def navigate(self, index):
         self.transitions.show(index, not self.store.setting('reduced_motion', False))
@@ -278,6 +292,8 @@ class MainWindow(QMainWindow):
         self.reduced_motion.toggled.connect(self.apply_motion)
         layout.addWidget(self.reduced_motion)
         if platform.system() == 'Darwin':
+            self.mac_permission_status = text('正在检查 Mac 共享权限…')
+            layout.addWidget(self.mac_permission_status)
             permissions = QHBoxLayout()
             capture_permission=QPushButton('屏幕录制权限')
             capture_permission.clicked.connect(lambda:self.mac_permission('screen'))
@@ -303,6 +319,8 @@ class MainWindow(QMainWindow):
         self.encoder = QComboBox()
         self.encoder.addItem("自动 · 优先可用硬件编码", "auto")
         self.encoder.addItem("兼容 · 软件 H.264", "libx264")
+        if platform.system() == 'Linux':
+            self.encoder.addItem('防频闪对照 · 兼容采集＋软件 H.264', 'stable')
         self.encoder.setCurrentIndex(
             max(0, self.encoder.findData(self.store.setting("encoder", "auto")))
         )
@@ -351,6 +369,10 @@ class MainWindow(QMainWindow):
         clear = QPushButton("撤销本机所有局域网配对")
         clear.clicked.connect(self.clear_pairs)
         advanced_form.addRow(clear)
+        exit_button = QPushButton('退出 Brioche')
+        exit_button.clicked.connect(self.quit_application)
+        layout.addWidget(text('关闭主窗口会收起到托盘；没有托盘时最小化。共享与文件传输继续运行。'))
+        layout.addWidget(exit_button)
         self.advanced_toggle = QPushButton("高级设置 ▸")
         self.advanced_toggle.setCheckable(True)
         self.advanced_toggle.toggled.connect(advanced.setVisible)
@@ -454,6 +476,19 @@ class MainWindow(QMainWindow):
         from .mac_permissions import screen_allowed,input_allowed
         allowed=(screen_allowed if kind=='screen' else input_allowed)(request=True)
         self.settings_note.setText('权限已开启' if allowed else '请在系统偏好设置 → 安全性与隐私中授权；屏幕录制授权后需重新打开 Brioche。')
+        self.refresh_mac_permissions()
+
+    def refresh_mac_permissions(self):
+        if not hasattr(self, 'mac_permission_status'):
+            return
+        from .mac_permissions import screen_allowed,input_allowed
+        try:
+            screen, inputs = screen_allowed(), input_allowed()
+            self.mac_permission_status.setText(
+                f'屏幕录制：{"已允许" if screen else "未允许，无法共享画面"}　'
+                f'辅助功能：{"已允许" if inputs else "未允许，无法远程操作"}')
+        except Exception:
+            self.mac_permission_status.setText('无法检查 Mac 权限，请在系统偏好设置中确认')
 
     def share_preference(self):
         self.store.configure(
@@ -505,6 +540,7 @@ class MainWindow(QMainWindow):
         self.work("environment", check)
 
     def apply_environment(self, result):
+        self.refresh_mac_permissions()
         self.environment = result
         status = result["tailscale"]
         self.account_status.setText(status["message"])
@@ -1060,7 +1096,37 @@ class MainWindow(QMainWindow):
         elif operation == "display_recovery" and error:
             self.settings_note.setText("临时分辨率恢复：" + error)
 
+    def restore_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+            self.restore_window()
+
+    def quit_application(self):
+        self._quitting = True
+        self.close()
+        QApplication.instance().quit()
+
     def closeEvent(self, event):
+        if not self._quitting:
+            event.ignore()
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                self.hide()
+            else:
+                self.showMinimized()
+            return
+        self.shutdown()
+        super().closeEvent(event)
+
+    def shutdown(self):
+        if self._shutdown:
+            return
+        self._quitting = self._shutdown = True
+        if hasattr(self, 'tray'):
+            self.tray.hide()
         self._alive = False
         self._pair_cancel.set()
         self.transfer_board.stop_all()
@@ -1079,4 +1145,3 @@ class MainWindow(QMainWindow):
             if host:
                 host.join(5)
         self.network.close()
-        super().closeEvent(event)

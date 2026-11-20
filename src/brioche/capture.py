@@ -12,11 +12,15 @@ def list_monitors():
 
 
 class DesktopCapture:
-    def __init__(self, monitor_index, fps):
+    def __init__(self, monitor_index, fps, backend='auto'):
         if sys.platform == 'darwin':
             from .mac_permissions import require_screen
             require_screen()
-        self.mss = mss.mss()
+        if sys.platform == 'darwin':
+            from .mac_capture import create
+            self.mss = create()
+        else:
+            self.mss = mss.mss()
         self.container = None
         self.frames = None
         self.backend = "mss"
@@ -24,7 +28,7 @@ class DesktopCapture:
             if not 1 <= monitor_index < len(self.mss.monitors):
                 raise ValueError("显示器不存在")
             self.monitor = dict(self.mss.monitors[monitor_index])
-            if (sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") != "wayland"
+            if (backend != 'mss' and sys.platform.startswith("linux") and os.environ.get("XDG_SESSION_TYPE") != "wayland"
                     and "x11grab" in av.formats_available):
                 m = self.monitor
                 address = f"{os.environ.get('DISPLAY', ':0')}+{m['left']},{m['top']}"

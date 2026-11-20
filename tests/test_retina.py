@@ -3,6 +3,8 @@ from unittest.mock import patch
 import av
 from brioche.media import DesktopEncoder
 from brioche.protocol import StreamConfig
+from brioche.media import create_encoder
+from unittest.mock import Mock
 
 
 class RetinaCapture:
@@ -17,6 +19,22 @@ class RetinaCapture:
 
 
 class RetinaCoordinatesTests(unittest.TestCase):
+    def test_mac_hardware_without_first_packet_closes_and_falls_back(self):
+        hardware, software = Mock(), Mock()
+        hardware.frame.return_value = ([], 1.0)
+        with patch('brioche.media.sys.platform', 'darwin'), patch('brioche.media.DesktopEncoder', side_effect=[hardware, software]):
+            self.assertIs(create_encoder(StreamConfig('720p',30,4), 'auto'), software)
+            hardware.close.assert_called_once()
+            self.assertIn('VideoToolbox', software.fallback_reason)
+
+    def test_mac_hardware_first_packet_is_kept_for_viewer(self):
+        hardware = Mock()
+        hardware.frame.return_value = ([b'first-idr'], 1.0)
+        with patch('brioche.media.sys.platform', 'darwin'), patch('brioche.media.DesktopEncoder', return_value=hardware):
+            self.assertIs(create_encoder(StreamConfig('720p',30,4), 'auto'), hardware)
+            self.assertEqual(hardware._primed, ([b'first-idr'], 1.0))
+            hardware.close.assert_not_called()
+
     def test_video_pixels_are_not_confused_with_input_points(self):
         with patch('brioche.media.DesktopCapture',RetinaCapture),patch('brioche.media.sys.platform','darwin'):
             encoder=DesktopEncoder(StreamConfig('1440p',30,8))

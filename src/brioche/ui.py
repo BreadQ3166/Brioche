@@ -119,6 +119,7 @@ class RemoteCanvas(QWidget):
         self.painted = 0
         self.paint_ms = 0.0
         self._painted_key = None
+        self.message = '正在等待远程画面…'
         self.setMinimumSize(480, 270)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -138,7 +139,7 @@ class RemoteCanvas(QWidget):
             painter.drawImage(self.image_rect(), self.image)
         else:
             painter.setPen(QColor("#d8d2c6"))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "正在等待远程画面…")
+            painter.drawText(self.rect().adjusted(32,32,-32,-32), Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.message)
         painter.end()
         if self.image is not None and self.image.cacheKey() != self._painted_key:
             self._painted_key = self.image.cacheKey()
@@ -271,7 +272,7 @@ class RemoteWindow(QMainWindow):
         layout.addWidget(self.status_text)
         layout.addWidget(self.stats_text)
         self.setCentralWidget(root)
-        self.bridge.status.connect(self.status_text.setText)
+        self.bridge.status.connect(self.set_status)
         self.bridge.info.connect(self.info)
         self.bridge.stats.connect(self.stats_values.update)
         self.bridge.network.connect(self.path_result)
@@ -293,8 +294,18 @@ class RemoteWindow(QMainWindow):
     def toggle_fullscreen(self):
         self.showNormal() if self.isFullScreen() else self.showFullScreen()
 
+    def set_status(self, message):
+        self.status_text.setText(message)
+        self.canvas.message = message
+        if self.canvas.image is None:
+            self.canvas.update()
+
     def info(self, info):
         if info.get("disconnected"):
+            self.file_button.setEnabled(False)
+            if self.canvas.image is None:
+                self.canvas.message = self.status_text.text() or '连接已结束，请关闭此窗口后重试'
+                self.canvas.update()
             self.canvas.allowed = False
             self.canvas.release_input()
             self.stats_text.setText("连接已结束；关闭此窗口后可重新连接。")
@@ -425,6 +436,7 @@ def run():
     app.setWindowIcon(QIcon(str(assets_root / "assets/brioche.svg")))
     app.setStyle("Fusion")
     app.setStyleSheet(STYLE)
+    app.setQuitOnLastWindowClosed(False)
     window = MainWindow()
     window.show()
     return app.exec()

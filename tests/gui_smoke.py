@@ -70,6 +70,7 @@ def inspect():
     main.navigate(3);QTest.qWait(220)
     main.grab().save(str(output/'brioche-files-08.png'))
     remote.close()
+    main.shutdown()
     main.close()
     host.stop()
     host.join()
