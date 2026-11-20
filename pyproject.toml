@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brioche-desktop"
+version = "0.5.0"
+description = "Modular encrypted remote desktop prototype"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+  "PySide6-Essentials==6.7.3",
+  "av==13.1.0",
+  "mss==9.0.2",
+  "pynput==1.7.7; sys_platform != 'linux'",
+  "python-xlib==0.33; sys_platform == 'linux'",
+  "cryptography>=44.0.1,<47",
+  "aiohttp==3.14.5",
+]
+
+[project.scripts]
+brioche = "brioche.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+brioche = ["web/*.html", "web/*.js", "web/*.css"]

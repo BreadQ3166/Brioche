@@ -1,0 +1,373 @@
+// Brioche's private stdin/stdout bridge. No HTTP management port or system VPN.
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/netip"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"tailscale.com/client/local"
+	"tailscale.com/tsnet"
+)
+
+const discoveryPort = "47994"
+const streamPort = "47995"
+
+var pinPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
+
+type share struct {
+	Port    int    `json:"port"`
+	Pin     string `json:"pin"`
+	Token   string `json:"token"`
+	Product string `json:"product"`
+}
+type request struct {
+	ID     int    `json:"id"`
+	Op     string `json:"op"`
+	IP     string `json:"ip"`
+	Port   int    `json:"port"`
+	Tunnel string `json:"tunnel"`
+	Share  share  `json:"share"`
+}
+type bridge struct {
+	server      *tsnet.Server
+	client      *local.Client
+	mu          sync.Mutex
+	shared      share
+	tunnels     map[string]net.Listener
+	connections map[net.Conn]bool
+	serial      int
+}
+
+func validIP(value string) bool {
+	ip, err := netip.ParseAddr(value)
+	return err == nil && ip.Is4() && netip.MustParsePrefix("100.64.0.0/10").Contains(ip)
+}
+func validShare(s share) bool {
+	return s.Port > 0 && s.Port < 65536 && pinPattern.MatchString(s.Pin) && tokenPattern.MatchString(s.Token)
+}
+func sameOwner(own, other int64, tagged bool) bool { return own > 0 && own == other && !tagged }
+func (b *bridge) authorized(ctx context.Context, address string) bool {
+	status, err := b.client.StatusWithoutPeers(ctx)
+	if err != nil || status.Self == nil {
+		return false
+	}
+	who, err := b.client.WhoIs(ctx, address)
+	return err == nil && who.Node != nil && who.UserProfile != nil && sameOwner(int64(status.Self.UserID), int64(who.UserProfile.ID), len(who.Node.Tags) > 0 || (status.Self.Tags != nil && status.Self.Tags.Len() > 0))
+}
+func (b *bridge) info(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != "GET" || r.URL.Path != "/info" {
+		http.NotFound(w, r)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 4*time.Second)
+	defer cancel()
+	if !b.authorized(ctx, r.RemoteAddr) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	b.mu.Lock()
+	s := b.shared
+	b.mu.Unlock()
+	if !validShare(s) {
+		http.Error(w, "not sharing", http.StatusConflict)
+		return
+	}
+	s.Port = 47995 // Native host stays private on loopback; this is its tailnet endpoint.
+	json.NewEncoder(w).Encode(s)
+}
+func (b *bridge) copyConnection(a, c net.Conn, inbound bool) {
+	b.mu.Lock()
+	b.connections[a] = inbound
+	b.connections[c] = inbound
+	b.mu.Unlock()
+	defer func() {
+		a.Close()
+		c.Close()
+		b.mu.Lock()
+		delete(b.connections, a)
+		delete(b.connections, c)
+		b.mu.Unlock()
+	}()
+	done := make(chan struct{}, 2)
+	go func() { io.Copy(a, c); done <- struct{}{} }()
+	go func() { io.Copy(c, a); done <- struct{}{} }()
+	<-done
+}
+func (b *bridge) acceptStreams(listener net.Listener) {
+	for {
+		incoming, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+			defer cancel()
+			if !b.authorized(ctx, incoming.RemoteAddr().String()) {
+				incoming.Close()
+				return
+			}
+			b.mu.Lock()
+			s := b.shared
+			b.mu.Unlock()
+			if !validShare(s) {
+				incoming.Close()
+				return
+			}
+			target, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(s.Port)), 4*time.Second)
+			if err != nil {
+				incoming.Close()
+				return
+			}
+			b.copyConnection(incoming, target, true)
+		}()
+	}
+}
+func (b *bridge) services() {
+	listener, err := b.server.Listen("tcp", ":"+discoveryPort)
+	if err != nil {
+		return
+	}
+	defer listener.Close()
+	go (&http.Server{Handler: http.HandlerFunc(b.info), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 8 * time.Second, WriteTimeout: 8 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 8192}).Serve(listener)
+	streams, err := b.server.Listen("tcp", ":"+streamPort)
+	if err != nil {
+		return
+	}
+	defer streams.Close()
+	b.acceptStreams(streams)
+}
+func (b *bridge) unpublish() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.shared = share{}
+	for connection, inbound := range b.connections {
+		if inbound {
+			connection.Close()
+		}
+	}
+}
+func (b *bridge) clear() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.shared = share{}
+	for _, listener := range b.tunnels {
+		listener.Close()
+	}
+	b.tunnels = map[string]net.Listener{}
+	for connection := range b.connections {
+		connection.Close()
+	}
+}
+func (b *bridge) tunnel(ctx context.Context, ip string, port int) (map[string]any, error) {
+	if !validIP(ip) || port != 47995 {
+		return nil, errors.New("invalid_endpoint")
+	}
+	// Validate peer ownership on outgoing paths too, not just the advertised list.
+	if !b.authorized(ctx, net.JoinHostPort(ip, fmt.Sprint(port))) {
+		return nil, errors.New("different_account")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, errors.New("local_listener_failed")
+	}
+	b.mu.Lock()
+	b.serial++
+	id := fmt.Sprint(b.serial)
+	b.tunnels[id] = listener
+	b.mu.Unlock()
+	go func() {
+		defer func() { listener.Close(); b.mu.Lock(); delete(b.tunnels, id); b.mu.Unlock() }()
+		listener.(*net.TCPListener).SetDeadline(time.Now().Add(30 * time.Second))
+		incoming, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		listener.Close()
+		dialCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		target, err := b.server.Dial(dialCtx, "tcp", net.JoinHostPort(ip, fmt.Sprint(port)))
+		if err != nil {
+			incoming.Close()
+			return
+		}
+		b.copyConnection(incoming, target, false)
+	}()
+	return map[string]any{"port": listener.Addr().(*net.TCPAddr).Port, "tunnel": id}, nil
+}
+func (b *bridge) command(ctx context.Context, r request) (any, error) {
+	switch r.Op {
+	case "status", "login":
+		if r.Op == "login" {
+			if err := b.client.StartLoginInteractive(ctx); err != nil {
+				return nil, errors.New("login_failed")
+			}
+		}
+		status, err := b.client.Status(ctx)
+		if err != nil {
+			return nil, errors.New("status_unavailable")
+		}
+		peers := []map[string]any{}
+		ips := []string{}
+		if status.Self != nil {
+			for _, ip := range status.TailscaleIPs {
+				if ip.Is4() {
+					ips = append(ips, ip.String())
+				}
+			}
+			for _, peer := range status.Peer {
+				if !strings.HasPrefix(peer.HostName, "brioche-") {
+					continue
+				}
+				if !sameOwner(int64(status.Self.UserID), int64(peer.UserID), (peer.Tags != nil && peer.Tags.Len() > 0) || (status.Self.Tags != nil && status.Self.Tags.Len() > 0)) {
+					continue
+				}
+				for _, ip := range peer.TailscaleIPs {
+					if ip.Is4() {
+						path := "待检测"
+						if peer.Active {
+							if peer.PeerRelay != "" {
+								path = "节点中继"
+							} else if peer.CurAddr != "" {
+								path = "直连"
+							} else if peer.Relay != "" {
+								path = "DERP 中继"
+							}
+						}
+						peers = append(peers, map[string]any{"ip": ip.String(), "name": strings.TrimPrefix(strings.TrimSuffix(peer.HostName, "."), "brioche-"), "online": peer.Online, "path": path})
+					}
+				}
+			}
+		}
+		return map[string]any{"state": status.BackendState, "ips": ips, "peers": peers, "auth_url": status.AuthURL}, nil
+	case "share":
+		if !validShare(r.Share) {
+			return nil, errors.New("invalid_share")
+		}
+		r.Share.Product = "Brioche/0.5"
+		b.mu.Lock()
+		b.shared = r.Share
+		b.mu.Unlock()
+		return map[string]bool{"ok": true}, nil
+	case "clear":
+		b.mu.Lock()
+		matches := r.Share.Token == "" || r.Share.Token == b.shared.Token
+		b.mu.Unlock()
+		if matches {
+			b.unpublish()
+		}
+		return map[string]bool{"ok": true}, nil
+	case "logout":
+		b.clear()
+		if err := b.client.Logout(ctx); err != nil {
+			return nil, errors.New("logout_failed")
+		}
+		return map[string]bool{"ok": true}, nil
+	case "close_tunnel":
+		b.mu.Lock()
+		listener := b.tunnels[r.Tunnel]
+		b.mu.Unlock()
+		if listener != nil {
+			listener.Close()
+		}
+		return map[string]bool{"ok": true}, nil
+	case "connect":
+		if !validIP(r.IP) {
+			return nil, errors.New("invalid_endpoint")
+		}
+		if !b.authorized(ctx, net.JoinHostPort(r.IP, discoveryPort)) {
+			return nil, errors.New("different_account")
+		}
+		transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return b.server.Dial(ctx, network, address)
+		}, DisableKeepAlives: true}
+		defer transport.CloseIdleConnections()
+		client := &http.Client{Transport: transport, Timeout: 8 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+		req, _ := http.NewRequestWithContext(ctx, "GET", "http://"+net.JoinHostPort(r.IP, discoveryPort)+"/info", nil)
+		response, err := client.Do(req)
+		if err != nil {
+			return nil, errors.New("peer_unavailable")
+		}
+		defer response.Body.Close()
+		if response.StatusCode != 200 {
+			return nil, errors.New("peer_not_sharing")
+		}
+		var s share
+		if json.NewDecoder(io.LimitReader(response.Body, 4096)).Decode(&s) != nil || !validShare(s) || !strings.HasPrefix(s.Product, "Brioche/") {
+			return nil, errors.New("invalid_peer")
+		}
+		result, err := b.tunnel(ctx, r.IP, 47995)
+		if err != nil {
+			return nil, err
+		}
+		result["pin"] = s.Pin
+		result["token"] = s.Token
+		return result, nil
+	case "tunnel":
+		return b.tunnel(ctx, r.IP, r.Port)
+	}
+	return nil, errors.New("unknown_command")
+}
+func main() {
+	state := flag.String("state-dir", "", "private node state")
+	flag.Parse()
+	if *state == "" {
+		os.Exit(2)
+	}
+	if err := os.MkdirAll(*state, 0700); err != nil {
+		os.Exit(2)
+	}
+	os.Chmod(*state, 0700)
+	name, _ := os.Hostname()
+	server := &tsnet.Server{Dir: *state, Hostname: "brioche-" + name, Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
+	log.SetOutput(io.Discard)
+	if err := server.Start(); err != nil {
+		os.Exit(3)
+	}
+	defer server.Close()
+	localClient, err := server.LocalClient()
+	if err != nil {
+		os.Exit(3)
+	}
+	b := &bridge{server: server, client: localClient, tunnels: map[string]net.Listener{}, connections: map[net.Conn]bool{}}
+	defer b.clear()
+	go b.services()
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 4096), 16384)
+	output := json.NewEncoder(os.Stdout)
+	for scanner.Scan() {
+		var r request
+		if json.Unmarshal(scanner.Bytes(), &r) != nil {
+			break
+		}
+		if r.Op == "shutdown" {
+			output.Encode(map[string]any{"id": r.ID, "result": map[string]bool{"ok": true}})
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		result, err := b.command(ctx, r)
+		cancel()
+		response := map[string]any{"id": r.ID, "result": result}
+		if err != nil {
+			response["error"] = err.Error()
+		}
+		if output.Encode(response) != nil {
+			return
+		}
+	}
+}

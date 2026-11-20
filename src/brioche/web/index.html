@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Brioche · 浏览器远程桌面</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/video.js" defer></script>
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header>
+    <a class="brand" href="/" aria-label="Brioche 首页"><span class="loaf" aria-hidden="true"><i></i><i></i><i></i></span>Brioche</a>
+    <span class="tag">局域网浏览器远程</span>
+  </header>
+  <main>
+    <section id="welcome" class="card">
+      <p class="eyebrow">无需安装控制端</p>
+      <h1>你的电脑，就在浏览器里。</h1>
+      <p class="muted">在被控电脑开启共享，复制浏览器链接到这里打开。</p>
+      <label for="token">访问码</label>
+      <input id="token" type="password" autocomplete="off" spellcheck="false" maxlength="43" placeholder="完整链接会自动填写访问码">
+      <label for="quality">画面大小</label>
+      <select id="quality">
+        <option value="720p">流畅 · 720p</option>
+        <option value="1080p" selected>均衡 · 1080p</option>
+        <option value="1440p">清晰 · 2K</option>
+      </select>
+      <div class="video-options">
+        <div><label for="codec">视频模式</label><select id="codec"><option value="auto">自动 · H.264 优先</option><option value="h264">H.264 视频</option><option value="mjpeg">JPEG 兼容模式</option></select></div>
+        <div><label for="fps">帧率上限</label><select id="fps"><option value="30">30 FPS</option><option value="60" selected>60 FPS</option></select></div>
+      </div>
+      <button id="connect" class="primary">开始远程 →</button>
+      <p class="hint">优先使用与客户端相同的 H.264 编码，最高 60 FPS；不支持时自动回退到 30 FPS 兼容模式。实际帧率取决于设备与网络。</p>
+    </section>
+    <section id="session" hidden>
+      <div class="toolbar">
+        <label class="sr-only" for="monitors">远端显示器</label>
+        <select id="monitors" disabled><option>正在读取显示器…</option></select>
+        <span id="permission" class="muted">仅查看</span>
+        <div class="spacer"></div>
+        <button id="control" disabled>启用控制</button>
+        <button id="release">释放输入</button>
+        <button id="fullscreen">全屏</button>
+        <button id="disconnect" class="danger">断开</button>
+      </div>
+      <div id="stage"><canvas id="desktop" tabindex="0" aria-label="远程桌面，启用控制后点击操作"></canvas><div id="overlay">正在等待画面…</div></div>
+      <div class="session-footer"><span id="metrics">等待画面</span><span>Ctrl + Alt + Shift 释放输入</span></div>
+    </section>
+    <p id="status" role="status" aria-live="polite">使用被控端提供的链接，准备好后点击“开始远程”。</p>
+  </main>
+  <footer>只在开启共享期间可访问 · 支持切屏、鼠标、键盘与滚轮</footer>
+</body>
+</html>

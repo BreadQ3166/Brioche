@@ -1,0 +1,34 @@
+# Local environments and generated builds
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+releases/
+runtime/
+artifacts/
+*.spec
+*.log
+.pytest_cache/
+.coverage
+
+# Credentials and machine-specific state
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+identity.crt
+tailscaled.state
+hosts.yml
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Generated design preview
+ui-concept.png
