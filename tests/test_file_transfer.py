@@ -85,6 +85,20 @@ class FileSafetyTests(unittest.TestCase):
             self.assertEqual(existing.read_bytes(), b"original")
             self.assertEqual((folder / saved).read_bytes(), b"new")
 
+    def test_incoming_name_cannot_follow_existing_symlink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);folder=root/'received';folder.mkdir()
+            original=root/'outside.txt';original.write_bytes(b'original')
+            try:(folder/'document.txt').symlink_to(original)
+            except OSError:self.skipTest('symlinks are unavailable for this Windows user')
+            file=IncomingFile(folder,{'name':'document.txt','size':3})
+            try:
+                file.write(b'new');name=file.finish(hashlib.sha256(b'new').hexdigest())
+            finally:file.close()
+            self.assertEqual(original.read_bytes(),b'original')
+            self.assertTrue((folder/'document.txt').is_symlink())
+            self.assertEqual((folder/name).read_bytes(),b'new')
+
 
 class FileTLSIntegration(unittest.TestCase):
     def setUp(self):
@@ -190,6 +204,16 @@ class FileTLSIntegration(unittest.TestCase):
         self.assertTrue(job.finished.wait(5))
         self.assertTrue(until(lambda: not self.host.file_gate.active))
         self.assertEqual(list(self.output.iterdir()), [])
+
+    def test_revoking_lan_connection_also_cancels_file_consent(self):
+        self.host.on_transfer=self.requests.append
+        file=self.input/'x';file.write_bytes(b'x')
+        job=self.job('upload',[str(file)])
+        self.assertTrue(until(lambda:len(self.requests)==1))
+        self.host.disconnect_viewer()
+        self.assertTrue(job.finished.wait(5))
+        self.assertTrue(until(lambda:not self.host.file_gate.active))
+        self.assertEqual(list(self.output.iterdir()),[])
 
     def test_cancel_in_flight_removes_partial_file(self):
         file = self.input / "large.bin"

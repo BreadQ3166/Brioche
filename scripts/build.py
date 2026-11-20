@@ -18,11 +18,15 @@ parser.add_argument("--work-dir", type=Path, default=root / "build")
 options = parser.parse_args()
 args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir",
         "--name", "Brioche", "--distpath", str(options.output_dir), "--workpath", str(options.work_dir), "--paths", str(root / "src"),
-        "--collect-all", "av", "--collect-all", "mss",
+        "--collect-all", "av",
         "--collect-data", "brioche",
         "--add-data", f"{root / 'assets'}{os.pathsep}assets",
         "--copy-metadata", "brioche-desktop",
         "--add-binary", f"{helper}{os.pathsep}network"]
+if sys.platform == 'darwin':
+    args += ['--additional-hooks-dir',str(root/'scripts/macos_hooks')]
+else:
+    args += ['--collect-all','mss']
 if sys.platform != 'darwin':
     args += ["--add-binary", f"{media}{os.pathsep}media",
              "--add-data", f"{media.parent / 'licenses'}{os.pathsep}media/licenses",
@@ -36,7 +40,8 @@ if sys.platform.startswith("linux"):
         args += ["--add-binary", f"{library}:."]
     args += ["--hidden-import", "Xlib.ext.xtest"]
 else:
-    args += ["--windowed", "--collect-submodules", "pynput"]
+    args += ["--windowed"]
+    if sys.platform == 'win32':args += ['--collect-submodules','pynput']
 if sys.platform == 'darwin':
     args += ['--osx-bundle-identifier','com.brioche.desktop','--codesign-identity','-']
     from PySide6.QtSvg import QSvgRenderer
@@ -56,10 +61,12 @@ args += [str(root / "scripts/entrypoint.py")]
 subprocess.run(args, cwd=root, check=True)
 if sys.platform == 'darwin':
     import plistlib
+    from brioche import __version__
     app=options.output_dir/'Brioche.app'
     info=app/'Contents/Info.plist'
     value=plistlib.loads(info.read_bytes())
     value.update(LSMinimumSystemVersion='12.0',NSHighResolutionCapable=True,
+        CFBundleShortVersionString=__version__,CFBundleVersion=__version__,
         NSScreenCaptureUsageDescription='Brioche 需要屏幕录制权限来共享你选择的显示器。',
         NSDownloadsFolderUsageDescription='Brioche 将你确认接收的文件保存到所选目录。',
         NSDocumentsFolderUsageDescription='Brioche 仅传输你选择或确认的文件。',

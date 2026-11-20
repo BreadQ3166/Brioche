@@ -525,6 +525,7 @@ class Host:
                 raise ProtocolError("未知客户端消息")
 
     def disconnect_viewer(self):
+        self.cancel_transfers()
         if self.loop and self.loop.is_running():
             def cancel():
                 for task in tuple(self.session_tasks):

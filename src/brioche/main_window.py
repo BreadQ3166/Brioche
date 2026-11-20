@@ -285,6 +285,7 @@ class MainWindow(QMainWindow):
             input_permission.clicked.connect(lambda:self.mac_permission('input'))
             permissions.addWidget(capture_permission);permissions.addWidget(input_permission)
             layout.addLayout(permissions)
+            layout.addWidget(text('共享这台 Mac 需屏幕录制权限，远程操作另需辅助功能；授权后重新打开 Brioche。'))
         browser = QPushButton("复制浏览器链接")
         browser.clicked.connect(self.copy_browser)
         layout.addWidget(browser)
