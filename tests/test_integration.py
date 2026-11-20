@@ -62,6 +62,29 @@ class DesktopIntegration(unittest.TestCase):
             self.assertIn("NVENC", actual)
             self.assertTrue(info[0]["capture"].startswith("ffmpeg-"))
 
+    def test_matching_is_released_after_native_viewer_disconnect(self):
+        from unittest.mock import patch
+        with patch('brioche.display_mode.DisplayLease') as lease:
+            viewer, ready, _, statuses, _ = self.viewer(config=StreamConfig('720p', 30, 4, True))
+            self.assertTrue(ready.wait(15), statuses)
+            lease.return_value.apply.assert_called_once()
+            viewer.stop(); viewer.join()
+            deadline = time.monotonic() + 5
+            while self.host.active and time.monotonic() < deadline:time.sleep(.01)
+            lease.return_value.close.assert_called_once()
+            self.assertFalse(self.host.session_gate.active)
+
+    def test_read_only_sharing_rejects_source_mode_changes(self):
+        from unittest.mock import patch
+        self.host.view_only = True
+        with patch('brioche.display_mode.DisplayLease') as lease:
+            viewer, ready, frames, statuses, _ = self.viewer(config=StreamConfig('720p', 30, 4, True))
+            viewer.join(5)
+            self.assertFalse(ready.is_set())
+            self.assertFalse(frames)
+            lease.assert_not_called()
+            self.assertTrue(any('仅查看' in status for status in statuses), statuses)
+
     def test_paired_lan_device_streams_then_revocation_rejects_reconnect(self):
         from brioche.lan import pair
         self.host.on_pair = lambda request: request.answer(True)

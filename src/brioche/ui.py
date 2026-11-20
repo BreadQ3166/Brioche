@@ -369,6 +369,7 @@ class RemoteWindow(QMainWindow):
                 f"编码 {s.get('encoded_fps', '—')} FPS · RTT {s.get('rtt_ms', '—')} ms · "
                 f"接收 {s.get('mbps', '—')} Mbps · {timing_label} {s.get('capture_encode_ms', '—')} ms · "
                 f"发送等待 {s.get('send_ms', '—')} ms · "
+                f"主机帧龄 {s.get('capture_age_ms') if s.get('capture_age_ms') is not None else '—'} ms · "
                 f"解码 {s.get('decode_ms', '—')} ms · 颜色转换 {s.get('convert_ms', '—')} ms · "
                 f"画面提交 {s.get('submit_ms', '—')} ms · 绘制 {paint_ms:.2f} ms")
 

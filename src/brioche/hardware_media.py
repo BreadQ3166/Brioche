@@ -97,9 +97,10 @@ class HardwareEncoder:
             )
         )
         self.fallback_reason = ""
+        self.capture_age_ms = None
         self.closed = threading.Event()
         self.ready = threading.Event()
-        self.packets = queue.Queue(maxsize=2)
+        self.packets = queue.Queue(maxsize=1)
         self.error = None
         self.logs = deque(maxlen=8)
         self.container = None
@@ -109,6 +110,9 @@ class HardwareEncoder:
             "-loglevel",
             "error",
             "-nostdin",
+            "-copyts",
+            "-thread_queue_size",
+            "1",
             "-filter_threads",
             str(min(8, os.cpu_count() or 1)),
         ]
@@ -159,6 +163,12 @@ class HardwareEncoder:
             "ull",
             "-zerolatency",
             "1",
+            "-delay",
+            "0",
+            "-rc-lookahead",
+            "0",
+            "-slices",
+            "4",
             "-rc",
             "cbr",
             "-b:v",
@@ -173,6 +183,10 @@ class HardwareEncoder:
             str(max(1, config.fps // 4)),
             "-forced-idr",
             "1",
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            "demux",
             "-flush_packets",
             "1",
             "-f",
@@ -218,9 +232,16 @@ class HardwareEncoder:
                 data = annexb_access_unit(
                     bytes(packet), stream.codec_context.extradata, packet.is_keyframe
                 )
+                stamp = (
+                    float(packet.pts * packet.time_base)
+                    if packet.pts is not None and packet.time_base
+                    else None
+                )
+                if stamp is not None and abs(time.time() - stamp) > 3600:
+                    stamp = None
                 while not self.closed.is_set():
                     try:
-                        self.packets.put(data, timeout=0.1)
+                        self.packets.put((data, stamp), timeout=0.1)
                         self.ready.set()
                         break
                     except queue.Full:
@@ -236,17 +257,20 @@ class HardwareEncoder:
                 self.container.close()
 
     def frame(self, force_keyframe=False):
-        # The independent backend emits complete IDRs at most 250ms apart.
+        # Periodic IDRs use a quarter-second GOP at the requested frame rate.
         # Do not discard encoded references; bounded pipe/queue backpressure keeps the chain intact.
         start = time.perf_counter()
         if self.closed.is_set():
             raise RuntimeError("硬件编码已停止")
         try:
-            data = self.packets.get(timeout=4)
+            item = self.packets.get(timeout=4)
         except queue.Empty:
             raise RuntimeError(self.error or "硬件编码取帧超时")
-        if data is None:
+        if item is None:
             raise RuntimeError("硬件编码已停止")
+        data, stamp = item
+        age = time.time() - stamp if stamp is not None else None
+        self.capture_age_ms = age * 1000 if age is not None and 0 <= age < 60 else None
         return [data], (time.perf_counter() - start) * 1000
 
     def interrupt(self):

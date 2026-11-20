@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QLineEdit
 from brioche.main_window import MainWindow
 from brioche.security import access_uri
+from brioche.protocol import StreamConfig
 
 
 class FakeNetwork:
@@ -72,6 +73,23 @@ class SimpleFlowTests(unittest.TestCase):
         self.assertEqual(self.window.fps.currentData(), 60)
         self.assertFalse(self.window.external_allowed.isChecked())
         self.assertFalse(self.window.lan_allowed.isChecked())
+
+    def test_resolution_is_visible_shared_and_source_matching_is_opt_in(self):
+        self.window.show()
+        self.app.processEvents()
+        self.assertTrue(self.window.resolution.isVisible())
+        self.assertEqual(self.window.resolution.currentData(), "1440p")
+        self.assertFalse(self.window.stream_config().match_display)
+        self.window.resolution.setCurrentIndex(self.window.resolution.findData("1080p"))
+        self.window.match_display.setChecked(True)
+        self.assertEqual(
+            self.window.stream_config(), StreamConfig("1080p", 60, 16, True)
+        )
+        self.window.resolution.setCurrentIndex(
+            self.window.resolution.findData("native")
+        )
+        self.assertFalse(self.window.stream_config().match_display)
+        self.assertFalse(self.window.match_display.isEnabled())
 
     def test_online_and_offline_devices_remain_in_directory_without_flicker(self):
         self.environment["tailscale"]["peers"] = [

@@ -100,7 +100,7 @@ class MainWindow(QMainWindow):
         row.setContentsMargins(16, 16, 16, 16)
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(182)
+        sidebar.setFixedWidth(210)
         nav = QVBoxLayout(sidebar)
         nav.setContentsMargins(18, 24, 18, 18)
         brand = QLabel("Brioche")
@@ -120,6 +120,11 @@ class MainWindow(QMainWindow):
             self.nav_buttons.append(button)
             nav.addWidget(button)
         nav.addStretch()
+        nav.addWidget(text("远程分辨率"))
+        nav.addWidget(self.resolution)
+        nav.addWidget(self.match_display)
+        nav.addWidget(text("源屏匹配：断开后恢复\n目前支持 Ubuntu Xorg"))
+        nav.addSpacing(16)
         nav.addWidget(text(f"v{__version__}\n局域网 · 内置 Tailscale"))
         row.addWidget(sidebar)
         row.addWidget(self.pages, 1)
@@ -139,6 +144,9 @@ class MainWindow(QMainWindow):
         self.lan_poll.start()
         self.refresh_environment()
         self.refresh_lan()
+        from .display_mode import recover
+
+        self.work("display_recovery", lambda: recover(self.store.folder))
 
     def navigate(self, index):
         self.pages.setCurrentIndex(index)
@@ -275,21 +283,33 @@ class MainWindow(QMainWindow):
             ("2K 上限", "1440p"),
             ("1080p 上限", "1080p"),
             ("720p 上限", "720p"),
+            ("原生 · 最高4K", "native"),
         ):
             self.resolution.addItem(label, value)
+        self.resolution.setCurrentIndex(
+            max(0, self.resolution.findData(self.store.setting("resolution", "1440p")))
+        )
+        self.match_display = QCheckBox("源屏也匹配")
+        self.match_display.setChecked(bool(self.store.setting("match_display", False)))
+        self.match_display.setEnabled(self.resolution.currentData() != "native")
+        self.match_display.setToolTip(
+            "临时调整被控电脑的屏幕分辨率，正常断开后恢复。需要 Ubuntu Xorg 和允许键鼠控制；不勾选时只缩放视频。"
+        )
+        self.match_display.toggled.connect(self.save_settings)
         self.fps = QComboBox()
         for fps in FRAME_RATES:
             self.fps.addItem(f"{fps} FPS", fps)
-        self.fps.setCurrentIndex(self.fps.findData(60))
+        self.fps.setCurrentIndex(
+            max(0, self.fps.findData(self.store.setting("fps", 60)))
+        )
         self.bitrate = QSpinBox()
         self.bitrate.setRange(2, 80)
-        self.bitrate.setValue(16)
+        self.bitrate.setValue(int(self.store.setting("bitrate", 16)))
         self.bitrate.setSuffix(" Mbps")
         for title, widget in (
             ("共享端口", self.port),
             ("浏览器端口", self.web_port),
             ("编码策略", self.encoder),
-            ("分辨率", self.resolution),
             ("帧率上限", self.fps),
             ("目标码率", self.bitrate),
         ):
@@ -315,6 +335,17 @@ class MainWindow(QMainWindow):
         layout.addWidget(advanced)
         advanced.hide()
         self.connect_advanced = advanced
+        preset = next(
+            (
+                i
+                for i in range(3)
+                if self.resolution.currentData() == "1440p"
+                and self.profile.itemData(i)
+                == (self.fps.currentData(), self.bitrate.value())
+            ),
+            3,
+        )
+        self.profile.setCurrentIndex(preset)
         self.profile.currentIndexChanged.connect(self.apply_profile)
         for control in (self.resolution, self.fps):
             control.currentIndexChanged.connect(self.custom_profile)
@@ -341,13 +372,26 @@ class MainWindow(QMainWindow):
             self.bitrate.setValue(value[1])
             for control in (self.resolution, self.fps, self.bitrate):
                 control.blockSignals(False)
+            self.match_display.setEnabled(True)
         else:
             self.advanced_toggle.setChecked(True)
+        self.save_settings()
 
     def custom_profile(self):
         self.profile.blockSignals(True)
         self.profile.setCurrentIndex(3)
         self.profile.blockSignals(False)
+        self.match_display.setEnabled(self.resolution.currentData() != "native")
+        self.save_settings()
+
+    def stream_config(self):
+        return StreamConfig(
+            self.resolution.currentData(),
+            self.fps.currentData(),
+            self.bitrate.value(),
+            self.match_display.isChecked()
+            and self.resolution.currentData() != "native",
+        )
 
     def save_settings(self):
         if not hasattr(self, "address"):
@@ -360,6 +404,10 @@ class MainWindow(QMainWindow):
             encoder=self.encoder.currentData(),
             address=self.address.currentData(),
             monitor=self.monitor.currentData(),
+            resolution=self.resolution.currentData(),
+            fps=self.fps.currentData(),
+            bitrate=self.bitrate.value(),
+            match_display=self.match_display.isChecked(),
         )
 
     def share_preference(self):
@@ -623,9 +671,7 @@ class MainWindow(QMainWindow):
             return
         self._connecting = True
         self._pair_cancel.clear()
-        config = StreamConfig(
-            self.resolution.currentData(), self.fps.currentData(), self.bitrate.value()
-        )
+        config = self.stream_config()
 
         def connect():
             if mode == "tailscale":
@@ -672,11 +718,7 @@ class MainWindow(QMainWindow):
                 if self._connecting:
                     return
                 self._connecting = True
-                config = StreamConfig(
-                    self.resolution.currentData(),
-                    self.fps.currentData(),
-                    self.bitrate.value(),
-                )
+                config = self.stream_config()
                 self.work(
                     "connect",
                     lambda: {
@@ -690,11 +732,7 @@ class MainWindow(QMainWindow):
                 self.open_remote(
                     {
                         "uri": uri,
-                        "config": StreamConfig(
-                            self.resolution.currentData(),
-                            self.fps.currentData(),
-                            self.bitrate.value(),
-                        ),
+                        "config": self.stream_config(),
                         "mode": mode,
                     }
                 )
@@ -940,6 +978,8 @@ class MainWindow(QMainWindow):
         elif operation == "publish" and error:
             self._published_host = None
             self.external_note.setText(error)
+        elif operation == "display_recovery" and error:
+            self.settings_note.setText("临时分辨率恢复：" + error)
 
     def closeEvent(self, event):
         self._alive = False

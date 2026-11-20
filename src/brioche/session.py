@@ -43,7 +43,7 @@ def stream_info(media, monitors, selected, epoch, view_only, kind="welcome", req
 def validate_stream_info(info):
     w, h = info.get("width"), info.get("height")
     if (type(w) is not int or type(h) is not int or min(w, h) < 2
-            or max(w, h) > 2560 or min(w, h) > 1440):
+            or max(w, h) > 3840 or min(w, h) > 2160):
         raise ProtocolError("服务端画面尺寸超出限制")
     monitors = info.get("monitors")
     if not isinstance(monitors, list) or not 1 <= len(monitors) <= 32:
@@ -179,6 +179,7 @@ class Host:
         acquired = False
         executor = None
         media = None
+        display_lease = None
         sink = None
         receiver = None
         try:
@@ -211,6 +212,10 @@ class Host:
             from .capture import list_monitors
             from .platform_input import InputSink
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="brioche-capture")
+            if config.match_display and config.resolution != 'native':
+                if self.view_only:
+                    raise ProtocolError('仅查看共享不允许调整源屏，请取消源屏匹配')
+                display_lease = await self._match_display(executor, config, self.monitor)
             monitors = await self.loop.run_in_executor(executor, list_monitors)
             media = await self._open_media(executor, config, self.monitor, codec)
             self._media = media
@@ -224,6 +229,7 @@ class Host:
             interval = 1 / config.fps
             frames, process_ms, report_at = 0, 0.0, time.monotonic()
             send_ms = 0.0
+            age_ms, age_frames = 0.0, 0
             while not receiver.done():
                 started = time.monotonic()
                 if state["pending"] is not None:
@@ -233,6 +239,9 @@ class Host:
                     if sink:
                         sink.release_all()
                     try:
+                        if display_lease:
+                            await self._match_display(executor, config, selected, display_lease)
+                            state['monitors'] = monitors = await self.loop.run_in_executor(executor, list_monitors)
                         replacement = await self._open_media(executor, config, selected, codec)
                     except Exception:
                         await send(writer, pack_control({"type": "monitor_error", "request": request,
@@ -250,10 +259,15 @@ class Host:
                         self.status(f"正在共享显示器 {selected} · {media.width}×{media.height}")
                         frames, process_ms, report_at = 0, 0.0, time.monotonic()
                         send_ms = 0.0
+                        age_ms, age_frames = 0.0, 0
                     finally:
                         state["switching"] = False
                 packets, elapsed = await self.loop.run_in_executor(executor, media.frame, state.pop("force_keyframe", False))
                 sending = time.perf_counter()
+                age = getattr(media, 'capture_age_ms', None)
+                if age is not None:
+                    age_ms += age
+                    age_frames += 1
                 for packet in packets:
                     await send(writer, pack_video(packet))
                 send_ms += (time.perf_counter() - sending) * 1000
@@ -265,9 +279,11 @@ class Host:
                         "type": "stats", "encoded_fps": round(frames / (now - report_at), 1),
                         "capture_encode_ms": round(process_ms / max(frames, 1), 2),
                         "send_ms": round(send_ms / max(frames, 1), 2),
+                        "capture_age_ms": round(age_ms / age_frames, 2) if age_frames else None,
                     }))
                     frames, process_ms, report_at = 0, 0.0, now
                     send_ms = 0.0
+                    age_ms, age_frames = 0.0, 0
                 if not getattr(media, "paced", False):
                     await asyncio.sleep(max(0, interval - (time.monotonic() - started)))
             await receiver
@@ -286,22 +302,39 @@ class Host:
         finally:
             if receiver:
                 receiver.cancel()
-                await asyncio.gather(receiver, return_exceptions=True)
             if sink:
                 try:
                     sink.close()
                 except Exception:
                     pass
-            if media and executor:
-                await self.loop.run_in_executor(executor, media.close)
+            closing = None
+            if executor and (media or display_lease):
+                def cleanup():
+                    try:
+                        if media:media.close()
+                    finally:
+                        if display_lease:display_lease.close()
+                closing = self.loop.run_in_executor(executor, cleanup)
+            try:
+                try:
+                    if receiver:
+                        await asyncio.gather(receiver, return_exceptions=True)
+                    if closing:
+                        await asyncio.shield(closing)
+                except asyncio.CancelledError:
+                    if closing:
+                        await closing
+            except Exception as exc:
+                self.status(f'会话清理：{exc}')
+            finally:
                 if self._media is media:self._media = None
-            if executor:
-                executor.shutdown(wait=True, cancel_futures=True)
-            if acquired:
-                self.session_gate.release(task)
-                self.active = False
-                self.session_tasks.discard(task)
-                self.status("等待连接")
+                if executor:
+                    executor.shutdown(wait=True, cancel_futures=True)
+                if acquired:
+                    self.session_gate.release(task)
+                    self.active = False
+                    self.session_tasks.discard(task)
+                    self.status("等待连接")
             await close_writer(writer)
             self.peer_tasks.discard(task)
             self.connection_tasks.pop(peer, None)
@@ -340,6 +373,31 @@ class Host:
         finally:
             request.answer(False)
             self._pair_pending = None
+
+    async def _match_display(self, executor, config, monitor, lease=None):
+        from .display_mode import DisplayLease
+        from .capture import list_monitors
+        def prepare():
+            active = lease or DisplayLease(self.folder)
+            try:
+                displays = list_monitors()
+                if not 1 <= monitor <= len(displays):
+                    raise ValueError('显示器不存在')
+                active.apply(displays[monitor - 1], config.resolution, config.fps)
+                return active
+            except Exception:
+                if lease is None:active.close()
+                raise
+        opening = self.loop.run_in_executor(executor, prepare)
+        try:
+            return await asyncio.shield(opening)
+        except asyncio.CancelledError:
+            try:
+                orphan = await opening
+                await self.loop.run_in_executor(executor, orphan.close)
+            except Exception:
+                pass
+            raise
 
     async def _open_media(self, executor, config, monitor, codec="h264"):
         from .media import create_encoder
@@ -511,7 +569,7 @@ class Viewer:
             sock = writer.get_extra_info("socket")
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             await send(writer, pack_control({"type": "hello", "version": VERSION,
-                                            "token": token, "config": asdict(self.config)}))
+                                            "token": token, "config": self.config.to_wire()}))
             kind, info = await asyncio.wait_for(read_message(reader), 15)
             if kind != CONTROL or info["type"] != "welcome" or info.get("version") != VERSION:
                 raise ProtocolError(info.get("message", "服务端握手失败") if kind == CONTROL else "无效握手")
