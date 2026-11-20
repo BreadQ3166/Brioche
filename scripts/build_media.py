@@ -98,6 +98,7 @@ else:
         "--target-os=mingw32",
         "--arch=x86_64",
         "--cross-prefix=x86_64-w64-mingw32-",
+        "--pkg-config=pkg-config",
         "--enable-indev=gdigrab,lavfi",
         "--extra-ldflags=-static -static-libgcc",
     ]

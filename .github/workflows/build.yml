@@ -46,6 +46,13 @@ jobs:
             releases/Brioche-media-sources-*.zip
           if-no-files-found: error
           compression-level: 0
+      - name: Upload media configure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: media-config-${{ matrix.platform }}
+          path: ${{ runner.temp }}/media-build/build-${{ matrix.target }}/ffbuild/config.log
+          if-no-files-found: ignore
 
   build:
     needs: media
