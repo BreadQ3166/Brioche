@@ -107,6 +107,7 @@ class MainWindow(QMainWindow):
         self.hosts = {"lan": None, "tailscale": None}
         self.session_window = None
         self.detached_windows = []
+        self._v2_viewer_procs = []
         self._file_windows = []
         self._alive = True
         self._busy = False
@@ -1407,6 +1408,13 @@ class MainWindow(QMainWindow):
                     remembered["pin"],
                     remembered["token"],
                 )
+            v2_endpoint = None
+            engine_pref = self.store.setting("stream_engine", "auto")
+            if mode == "lan" and engine_pref != "v1_compat":
+                from .core_engine import find_core_binary, negotiate_v2_endpoint
+
+                if find_core_binary() is not None:
+                    v2_endpoint = negotiate_v2_endpoint(uri, timeout=3.0)
             return {
                 "uri": uri,
                 "config": config,
@@ -1414,6 +1422,7 @@ class MainWindow(QMainWindow):
                 "peer": data["ip"],
                 "device_key": session_key,
                 "display_name": display_name or data.get("name", data["ip"]),
+                "v2_endpoint": v2_endpoint,
             }
 
         self.work("connect", connect)
@@ -1460,6 +1469,26 @@ class MainWindow(QMainWindow):
                 result["mode"],
                 result.get("peer", ""),
             )
+        if result.get("v2_endpoint"):
+            from .core_engine import launch_core_viewer
+
+            host_ip, ep = result["v2_endpoint"]
+            cfg = result["config"]
+            proc = launch_core_viewer(
+                host=host_ip,
+                quic_port=ep.quic_port,
+                pin=ep.pin,
+                key=ep.key,
+                title=f"Brioche v2.0 · {result.get('display_name') or host_ip}",
+                fps=cfg.fps,
+                bitrate_kbps=cfg.bitrate_mbps * 1000,
+                chroma_444=bool(self.chroma_444.isChecked()),
+            )
+            self._v2_viewer_procs.append(proc)
+            self.dashboard_note.setText(
+                f"已通过 v2.0 原生 Rust UDP/GPU 引擎连接 {result.get('display_name') or host_ip}（F11 全屏 · Ctrl+Alt+1~9 切屏 · Ctrl+Alt+S 锐化）"
+            )
+            return
         callback = (
             (lambda: self.network.status(result["peer"]))
             if result["mode"] == "tailscale"
@@ -1606,6 +1635,7 @@ class MainWindow(QMainWindow):
                 on_clipboard=self.bridge.host_clipboard.emit,
                 audio_enabled=self.audio_enabled.isChecked(),
                 on_session_state=self.bridge.host_session_state.emit,
+                v2_core_enabled=(self.stream_engine.currentData() != "v1_compat"),
             )
             self.hosts[mode].start()
 
@@ -1881,6 +1911,13 @@ class MainWindow(QMainWindow):
         if self._shutdown:
             return
         self._quitting = self._shutdown = True
+        for proc in list(self._v2_viewer_procs):
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+            except OSError:
+                pass
+        self._v2_viewer_procs.clear()
         if hasattr(self, "tray"):
             self.tray.hide()
         self._alive = False

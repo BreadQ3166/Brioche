@@ -176,3 +176,56 @@ def launch_core_viewer(
         stdin=subprocess.DEVNULL,
         creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
+
+
+def negotiate_v2_endpoint(uri, timeout=4.0):
+    """Negotiate an authenticated v2.0 Rust QUIC+UDP endpoint over Brioche's pinned TLS control channel."""
+    import asyncio
+    from .protocol import CONTROL, VERSION, pack_control, read_message, send
+    from .security import client_context, parse_uri, verify_pin
+
+    try:
+        host, port, pin, token = parse_uri(uri)
+    except ValueError:
+        return None
+
+    async def _run():
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                host,
+                port,
+                ssl=client_context(),
+                server_hostname="brioche",
+                ssl_handshake_timeout=timeout,
+            ),
+            timeout,
+        )
+        try:
+            verify_pin(writer.get_extra_info("ssl_object"), pin)
+            await send(
+                writer,
+                pack_control({"type": "v2_negotiate", "version": VERSION, "token": token}),
+            )
+            kind, reply = await asyncio.wait_for(read_message(reader), timeout)
+            if kind == CONTROL and reply.get("type") == "v2_ready":
+                return (
+                    host,
+                    CoreHostEndpoint(
+                        quic_port=int(reply["quic_port"]),
+                        pin=str(reply["pin"]),
+                        key=str(reply["key"]),
+                        monitor=int(reply.get("monitor", 1)),
+                    ),
+                )
+            return None
+        finally:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), 0.5)
+            except Exception:
+                pass
+
+    try:
+        return asyncio.run(_run())
+    except Exception:
+        return None

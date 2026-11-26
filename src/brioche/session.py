@@ -129,7 +129,7 @@ class Host:
                  on_transfer_progress=lambda value: None, file_gate=None,
                  clipboard_enabled=True, on_clipboard=lambda text: None,
                  audio_enabled=True, on_session_state=lambda state: None,
-                 file_browser_enabled=True):
+                 file_browser_enabled=True, v2_core_enabled=False):
         self.bind, self.port, self.encoder, self.monitor = bind, port, encoder, monitor
         self.status, self.folder, self.view_only = status, folder, view_only
         self.token = secrets.token_urlsafe(32)
@@ -142,6 +142,9 @@ class Host:
         self.active = False
         self._media = None
         self._sink = None
+        self.v2_core_enabled = bool(v2_core_enabled)
+        self._core_host = None
+        self._core_lock = threading.Lock()
         self.session_gate = session_gate or SessionGate()
         self.file_gate = file_gate or SessionGate()
         self.files_enabled, self.on_transfer = files_enabled, on_transfer
@@ -211,6 +214,7 @@ class Host:
                 await self.stop_event.wait()
         finally:
             self.browser_url = ""
+            self._stop_core_host()
             if gateway:
                 await gateway.close()
             server.close()
@@ -260,6 +264,23 @@ class Host:
                 if self.view_only or not self.files_enabled or not self.file_browser_enabled:
                     raise ProtocolError('被控端未允许直接浏览目录，或当前是仅查看共享')
                 await self._file_browser_session(reader, writer)
+                return
+            if kind == CONTROL and hello.get('type') == 'v2_negotiate':
+                if (hello.get('version') != VERSION or not isinstance(hello.get('token'), str)
+                        or not hello['token'].isascii() or not (secrets.compare_digest(hello['token'], self.token)
+                        or (self.pair_store and self.pair_store.accepts(hello['token'])))):
+                    raise ProtocolError('v2 引擎认证失败')
+                ep = self._ensure_core_host()
+                if ep is None:
+                    await send(writer, pack_control({"type": "v2_unavailable", "reason": "v2_core_disabled_or_missing"}))
+                else:
+                    await send(writer, pack_control({
+                        "type": "v2_ready",
+                        "quic_port": ep.quic_port,
+                        "pin": ep.pin,
+                        "key": ep.key,
+                        "monitor": ep.monitor,
+                    }))
                 return
             if kind == CONTROL and hello.get("type") == "hello" and hello.get("version") != VERSION:
                 raise ProtocolError("两端 Brioche 版本不兼容，请都更新到 0.2 或更高版本")
@@ -705,6 +726,38 @@ class Host:
                 for task in tuple(self.session_tasks):
                     task.cancel()
             self.loop.call_soon_threadsafe(cancel)
+
+    def _ensure_core_host(self):
+        if not self.v2_core_enabled:
+            return None
+        with self._core_lock:
+            if self._core_host is not None and self._core_host.process is not None and self._core_host.process.poll() is None:
+                return self._core_host.endpoint
+            from .core_engine import CoreHostProcess, find_core_binary
+
+            exe = find_core_binary()
+            if exe is None:
+                return None
+            proc = CoreHostProcess(
+                bind=self.bind,
+                quic_port=0,
+                monitor=self.monitor,
+                view_only=self.view_only,
+                binary=exe,
+            )
+            try:
+                ep = proc.start()
+                self._core_host = proc
+                return ep
+            except Exception:
+                proc.stop()
+                return None
+
+    def _stop_core_host(self):
+        with self._core_lock:
+            proc, self._core_host = self._core_host, None
+        if proc is not None:
+            proc.stop()
 
     def stop(self):
         self.stop_requested.set()

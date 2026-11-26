@@ -113,6 +113,12 @@ impl UdpMediaSender {
         }
     }
 
+    pub fn set_stream_id(&mut self, stream_id: u16) {
+        self.stream_id = stream_id;
+        self.frame_id = 0;
+        self.nack_cache = NackCache::new();
+    }
+
     pub fn take_pli(&self) -> bool {
         self.pli_requested.swap(false, Ordering::AcqRel)
     }

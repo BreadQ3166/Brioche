@@ -294,13 +294,23 @@ pub struct StreamingEncoder {
 
 impl StreamingEncoder {
     pub fn start(ffmpeg: &Path, profile: &EncodeProfile, use_nvenc: bool) -> Result<Self, CodecError> {
-        let (encoder_name, pix_fmt, actual_codec) = match (use_nvenc, profile.codec, profile.chroma) {
-            (true, VideoCodec::Hevc, PixelChroma::Yuv444p) => ("hevc_nvenc", "yuv444p", VideoCodec::Hevc),
-            (true, VideoCodec::Hevc, PixelChroma::Yuv420p) => ("hevc_nvenc", "nv12", VideoCodec::Hevc),
-            (true, VideoCodec::H264, PixelChroma::Yuv444p) => ("h264_nvenc", "yuv444p", VideoCodec::H264),
-            (true, VideoCodec::H264, PixelChroma::Yuv420p) => ("h264_nvenc", "nv12", VideoCodec::H264),
-            (false, _, PixelChroma::Yuv444p) => ("libx264", "yuv444p", VideoCodec::H264),
-            (false, _, PixelChroma::Yuv420p) => ("libx264", "yuv420p", VideoCodec::H264),
+        let (encoder_name, pix_fmt, actual_codec) = if use_nvenc {
+            match (profile.codec, profile.chroma) {
+                (VideoCodec::Hevc, PixelChroma::Yuv444p) => ("hevc_nvenc", "yuv444p", VideoCodec::Hevc),
+                (VideoCodec::Hevc, PixelChroma::Yuv420p) => ("hevc_nvenc", "nv12", VideoCodec::Hevc),
+                (VideoCodec::H264, PixelChroma::Yuv444p) => ("h264_nvenc", "yuv444p", VideoCodec::H264),
+                (VideoCodec::H264, PixelChroma::Yuv420p) => ("h264_nvenc", "nv12", VideoCodec::H264),
+            }
+        } else if cfg!(target_os = "macos") {
+            match profile.codec {
+                VideoCodec::Hevc => ("hevc_videotoolbox", "nv12", VideoCodec::Hevc),
+                VideoCodec::H264 => ("h264_videotoolbox", "nv12", VideoCodec::H264),
+            }
+        } else {
+            match profile.chroma {
+                PixelChroma::Yuv444p => ("libx264", "yuv444p", VideoCodec::H264),
+                PixelChroma::Yuv420p => ("libx264", "yuv420p", VideoCodec::H264),
+            }
         };
 
         let vf = if profile.src_width == profile.dst_width && profile.src_height == profile.dst_height {

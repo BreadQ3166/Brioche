@@ -194,11 +194,7 @@ async fn run_host_cli(args: &[String]) {
             PixelChroma::Yuv420p
         };
 
-        #[cfg(target_os = "linux")]
-        let monitors = brioche_capture::linux_x11::list_monitors().unwrap_or_default();
-        #[cfg(not(target_os = "linux"))]
-        let monitors: Vec<brioche_capture::MonitorInfo> = Vec::new();
-
+        let monitors = brioche_capture::list_monitors().unwrap_or_default();
         let monitor_descs: Vec<MonitorDesc> = monitors
             .iter()
             .map(|m| MonitorDesc {
@@ -210,40 +206,29 @@ async fn run_host_cli(args: &[String]) {
             })
             .collect();
 
-        let active_mon = Arc::new(AtomicU32::new(monitor_id));
+        let requested_mon = Arc::new(AtomicU32::new(monitor_id));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let peer_udp = SocketAddr::new(peer_ip, udp_port);
         let udp_sock = bind_tuned_udp("0.0.0.0:0".parse().unwrap()).unwrap();
         let mut sender = UdpMediaSender::new(udp_sock, peer_udp, &key, 1);
 
-        // Open capturer on Linux X11 MIT-SHM + XFixes
-        #[cfg(target_os = "linux")]
-        let mut cap = match brioche_capture::linux_x11::X11ShmCapturer::open(monitor_id) {
+        let mut cap = match brioche_capture::open_capturer(monitor_id) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("capture open failed: {e}");
                 continue;
             }
         };
-        #[cfg(target_os = "linux")]
-        let mon = cap.monitor().clone();
-        #[cfg(not(target_os = "linux"))]
-        let mon = brioche_capture::MonitorInfo {
-            id: 1,
-            name: "Display 1".into(),
-            left: 0,
-            top: 0,
-            width: 1920,
-            height: 1080,
-            primary: true,
-        };
+        let mut current_mon_id = monitor_id;
+        let mut stream_id: u16 = 1;
+        let mut mon = cap.monitor().clone();
 
         let dst_w = mon.width.min(2560) / 2 * 2;
         let dst_h = mon.height.min(1440) / 2 * 2;
         let _ = send_control(
             &mut ctrl_send,
             &ControlMessage::StreamDescriptor {
-                stream_id: 1,
+                stream_id,
                 monitor_id: mon.id,
                 width: dst_w,
                 height: dst_h,
@@ -254,12 +239,12 @@ async fn run_host_cli(args: &[String]) {
                     "h264".into()
                 },
                 chroma_444: matches!(chroma, PixelChroma::Yuv444p),
-                monitors: monitor_descs,
+                monitors: monitor_descs.clone(),
             },
         )
         .await;
 
-        let mut injector = create_injector(
+        let injector = Arc::new(std::sync::Mutex::new(create_injector(
             MonitorRect {
                 left: mon.left,
                 top: mon.top,
@@ -267,26 +252,31 @@ async fn run_host_cli(args: &[String]) {
                 height: mon.height,
             },
             view_only,
-        );
+        )));
+        let injector_rx = injector.clone();
         let stop_rx = stop_flag.clone();
-        let active_mon_rx = active_mon.clone();
+        let requested_mon_rx = requested_mon.clone();
         let input_task = tokio::spawn(async move {
             while let Ok(msg) = recv_control(&mut ctrl_recv).await {
                 match msg {
                     ControlMessage::InputEvent { event } => {
-                        let _ = injector.apply(&event);
+                        if let Ok(mut inj) = injector_rx.lock() {
+                            let _ = inj.apply(&event);
+                        }
                     }
                     ControlMessage::SwitchMonitor { monitor_id, .. } => {
-                        active_mon_rx.store(monitor_id, Ordering::Release);
+                        requested_mon_rx.store(monitor_id, Ordering::Release);
                     }
                     _ => {}
                 }
             }
-            injector.release_all();
+            if let Ok(mut inj) = injector_rx.lock() {
+                inj.release_all();
+            }
             stop_rx.store(true, Ordering::Release);
         });
 
-        let profile = EncodeProfile {
+        let mut profile = EncodeProfile {
             src_width: mon.width,
             src_height: mon.height,
             dst_width: dst_w,
@@ -313,22 +303,63 @@ async fn run_host_cli(args: &[String]) {
             let tick = Instant::now();
             let _ = sender.poll_feedback().await;
 
-            #[cfg(target_os = "linux")]
+            // Atomic live monitor switch (zero window teardown / zero macOS crash)
+            let wanted_mon = requested_mon.load(Ordering::Acquire);
+            if wanted_mon != current_mon_id && wanted_mon >= 1 {
+                if let Ok(new_cap) = brioche_capture::open_capturer(wanted_mon) {
+                    let new_mon = new_cap.monitor().clone();
+                    let new_dst_w = new_mon.width.min(2560) / 2 * 2;
+                    let new_dst_h = new_mon.height.min(1440) / 2 * 2;
+                    let new_profile = EncodeProfile {
+                        src_width: new_mon.width,
+                        src_height: new_mon.height,
+                        dst_width: new_dst_w,
+                        dst_height: new_dst_h,
+                        ..profile.clone()
+                    };
+                    if let Ok(new_enc) = StreamingEncoder::start(&ffmpeg, &new_profile, use_nvenc) {
+                        cap = new_cap;
+                        mon = new_mon;
+                        profile = new_profile;
+                        encoder = new_enc;
+                        current_mon_id = wanted_mon;
+                        stream_id = stream_id.wrapping_add(1).max(1);
+                        sender.set_stream_id(stream_id);
+                        if let Ok(mut inj) = injector.lock() {
+                            inj.set_monitor(MonitorRect {
+                                left: mon.left,
+                                top: mon.top,
+                                width: mon.width,
+                                height: mon.height,
+                            });
+                        }
+                        let _ = send_control(
+                            &mut ctrl_send,
+                            &ControlMessage::StreamDescriptor {
+                                stream_id,
+                                monitor_id: mon.id,
+                                width: new_dst_w,
+                                height: new_dst_h,
+                                fps_limit: profile.fps,
+                                codec: if matches!(codec, VideoCodec::Hevc) {
+                                    "hevc".into()
+                                } else {
+                                    "h264".into()
+                                },
+                                chroma_444: matches!(chroma, PixelChroma::Yuv444p),
+                                monitors: monitor_descs.clone(),
+                            },
+                        )
+                        .await;
+                    }
+                } else {
+                    requested_mon.store(current_mon_id, Ordering::Release);
+                }
+            }
+
             let grabbed = cap.grab_frame();
-            #[cfg(not(target_os = "linux"))]
-            let grabbed: Result<brioche_capture::CapturedFrame, _> = Ok(
-                brioche_capture::CapturedFrame {
-                    width: mon.width,
-                    height: mon.height,
-                    stride: mon.width * 4,
-                    bgra: vec![0x30u8; (mon.width * mon.height * 4) as usize],
-                    dirty: true,
-                    capture_us: 0,
-                },
-            );
 
             // Separated hardware cursor sync over QUIC
-            #[cfg(target_os = "linux")]
             if let Ok((cur, shape_changed)) = cap.grab_cursor() {
                 if shape_changed && cur.width > 0 && cur.height > 0 {
                     let _ = send_control(

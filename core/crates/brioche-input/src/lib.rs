@@ -251,6 +251,11 @@ pub mod linux_xtest {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub mod macos_cgevent;
+#[cfg(target_os = "windows")]
+pub mod windows_sendinput;
+
 /// No-op fallback injector (for headless tests or read-only mode).
 pub struct NoopInjector;
 
@@ -272,5 +277,14 @@ pub fn create_injector(rect: MonitorRect, view_only: bool) -> Box<dyn InputInjec
             return Box::new(inj);
         }
     }
+    #[cfg(target_os = "windows")]
+    {
+        return Box::new(windows_sendinput::WinSendInputInjector::open(rect));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return Box::new(macos_cgevent::MacCgEventInjector::open(rect));
+    }
+    #[allow(unreachable_code)]
     Box::new(NoopInjector)
 }

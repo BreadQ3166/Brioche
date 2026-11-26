@@ -7,6 +7,10 @@ use thiserror::Error;
 
 #[cfg(target_os = "linux")]
 pub mod linux_x11;
+#[cfg(target_os = "macos")]
+pub mod macos_cg;
+#[cfg(target_os = "windows")]
+pub mod windows_dxgi;
 
 #[derive(Debug, Error)]
 pub enum CaptureError {
@@ -46,10 +50,84 @@ pub struct CapturedFrame {
     pub width: u32,
     pub height: u32,
     pub stride: u32,
-    /// BGRA8 pixels (on Linux X11 MIT-SHM / Win DXGI / Mac CoreGraphics).
     pub bgra: Vec<u8>,
     pub dirty: bool,
     pub capture_us: u64,
+}
+
+pub trait ScreenCapturer: Send {
+    fn monitor(&self) -> &MonitorInfo;
+    fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError>;
+    fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError>;
+}
+
+#[cfg(target_os = "linux")]
+impl ScreenCapturer for linux_x11::X11ShmCapturer {
+    fn monitor(&self) -> &MonitorInfo {
+        self.monitor()
+    }
+    fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        self.grab_frame()
+    }
+    fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError> {
+        self.grab_cursor()
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl ScreenCapturer for windows_dxgi::DxgiCapturer {
+    fn monitor(&self) -> &MonitorInfo {
+        self.monitor()
+    }
+    fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        self.grab_frame()
+    }
+    fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError> {
+        self.grab_cursor()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl ScreenCapturer for macos_cg::MacCgCapturer {
+    fn monitor(&self) -> &MonitorInfo {
+        self.monitor()
+    }
+    fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        self.grab_frame()
+    }
+    fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError> {
+        self.grab_cursor()
+    }
+}
+
+pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
+    #[cfg(target_os = "linux")]
+    {
+        linux_x11::list_monitors()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows_dxgi::list_monitors()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_cg::list_monitors()
+    }
+}
+
+pub fn open_capturer(monitor_id: u32) -> Result<Box<dyn ScreenCapturer>, CaptureError> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(linux_x11::X11ShmCapturer::open(monitor_id)?))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Box::new(windows_dxgi::DxgiCapturer::open(monitor_id)?))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Box::new(macos_cg::MacCgCapturer::open(monitor_id)?))
+    }
 }
 
 pub fn hash_rgba(rgba: &[u8]) -> String {
@@ -62,7 +140,6 @@ pub fn hash_rgba(rgba: &[u8]) -> String {
 }
 
 /// Fast sampled tile-grid hash detector for idle frame pacing.
-/// Scans every 16th row in 64-bit chunks so 4K BGRA dirty detection takes < 0.2 ms.
 #[derive(Default)]
 pub struct DirtyDetector {
     last_hash: Option<u64>,
@@ -78,7 +155,6 @@ impl DirtyDetector {
             let start = y * stride as usize;
             let end = (start + row_bytes).min(bgra.len());
             let row = &bgra[start..end];
-            // Sample every 64 bytes (16 pixels) for sub-millisecond change detection
             let mut x = 0usize;
             while x + 8 <= row.len() {
                 let word = u64::from_ne_bytes(row[x..x + 8].try_into().unwrap());
@@ -95,11 +171,11 @@ impl DirtyDetector {
 }
 
 pub fn probe_capabilities() -> serde_json::Value {
+    let monitors = list_monitors().unwrap_or_default();
     #[cfg(target_os = "linux")]
     {
         let pipewire_lib = std::path::Path::new("/lib/x86_64-linux-gnu/libpipewire-0.3.so.0").exists()
             || std::path::Path::new("/usr/lib/x86_64-linux-gnu/libpipewire-0.3.so.0").exists();
-        let monitors = linux_x11::list_monitors().unwrap_or_default();
         serde_json::json!({
             "active_backend": "x11-mit-shm+xfixes-cursor",
             "pipewire_dmabuf_ready": pipewire_lib,
@@ -110,14 +186,14 @@ pub fn probe_capabilities() -> serde_json::Value {
     {
         serde_json::json!({
             "active_backend": "dxgi-desktop-duplication",
-            "monitors": [],
+            "monitors": monitors,
         })
     }
     #[cfg(target_os = "macos")]
     {
         serde_json::json!({
-            "active_backend": "screencapturekit-iosurface",
-            "monitors": [],
+            "active_backend": "macos-coregraphics-direct",
+            "monitors": monitors,
         })
     }
 }
@@ -132,7 +208,6 @@ mod tests {
         let mut buf = vec![0x20u8; 640 * 360 * 4];
         assert!(det.check_bgra(&buf, 640, 360, 640 * 4));
         assert!(!det.check_bgra(&buf, 640, 360, 640 * 4));
-        // Mutate a sampled pixel
         buf[0] = 0xFF;
         assert!(det.check_bgra(&buf, 640, 360, 640 * 4));
     }

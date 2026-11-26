@@ -31,6 +31,9 @@ if sys.platform != 'darwin':
     args += ["--add-binary", f"{media}{os.pathsep}media",
              "--add-data", f"{media.parent / 'licenses'}{os.pathsep}media/licenses",
              "--add-data", f"{media.parent / 'BUILD.json'}{os.pathsep}media"]
+core_bin = root / "runtime/core" / ("brioche-core.exe" if sys.platform == "win32" else "brioche-core")
+if core_bin.is_file():
+    args += ["--add-binary", f"{core_bin}{os.pathsep}core"]
 if (helper.parent / "licenses").is_dir():
     args += ["--add-data", f"{helper.parent / 'licenses'}{os.pathsep}network/licenses",
              "--add-data", f"{helper.parent / 'DEPENDENCIES.txt'}{os.pathsep}network"]
