@@ -49,6 +49,12 @@ def run(output):
         process = subprocess.run([str(helper), '--help'], capture_output=True, timeout=15)
         assert process.returncode == 0
         result['embedded_network'] = 'native executable loads; account login not attempted'
+        from .core_engine import find_core_binary
+        core_bin = find_core_binary()
+        if core_bin and core_bin.is_file():
+            core_proc = subprocess.run([str(core_bin), 'info'], capture_output=True, timeout=15)
+            assert core_proc.returncode == 0 and b'brioche-udp-v3' in core_proc.stdout
+            result['core_engine'] = 'native Rust v2.0 UDP/QUIC/GPU streaming core loaded'
         from .hardware_media import executable
         if platform.system() != 'Darwin':
             media = executable()

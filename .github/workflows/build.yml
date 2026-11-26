@@ -56,6 +56,8 @@ jobs:
           python3 scripts/install_macos_deps.py --wheelhouse "$RUNNER_TEMP/macos12-wheels"
       - name: Test and build compatible network module
         run: python3 scripts/build_network.py
+      - name: Test and build native Rust streaming core
+        run: python3 scripts/build_core.py --test
       - name: Test portable source and file transfer
         run: python3 -m unittest discover -s tests -v
       - name: Build native application bundle
@@ -206,6 +208,8 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Test and build embedded Tailscale
         run: python scripts/build_network.py
+      - name: Test and build native Rust streaming core
+        run: python scripts/build_core.py --test
       - name: Build application
         run: python scripts/build.py
       - name: Check packaged runtime
