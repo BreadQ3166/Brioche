@@ -45,11 +45,11 @@ def tune_socket(writer):
         return
     try:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except OSError:
+    except (OSError, AttributeError):
         pass
     try:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-    except OSError:
+    except (OSError, AttributeError):
         return
     try:
         if hasattr(socket, "TCP_KEEPIDLE"):
@@ -60,9 +60,9 @@ def tune_socket(writer):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
         if hasattr(socket, "TCP_KEEPCNT"):
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
-        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+        if hasattr(socket, "SIO_KEEPALIVE_VALS") and hasattr(sock, "ioctl"):
             sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15_000, 5_000))
-    except OSError:
+    except (OSError, AttributeError, ValueError):
         pass
 
 

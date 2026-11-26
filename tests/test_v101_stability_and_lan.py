@@ -84,26 +84,30 @@ class ConnectionStabilityTests(unittest.TestCase):
         self.assertFalse(is_retryable_disconnect(ValueError("设备证书不匹配")))
 
     def test_tune_socket_sets_nodelay_and_keepalive(self):
-        s1, s2 = socket.socketpair()
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        cli = socket.create_connection(srv.getsockname(), timeout=2)
+        acc, _ = srv.accept()
         try:
-            # Verify TCP socket options on an actual AF_INET loopback pair
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.bind(("127.0.0.1", 0))
-            srv.listen(1)
-            cli = socket.create_connection(srv.getsockname(), timeout=2)
-            acc, _ = srv.accept()
-            try:
-                fake_writer = SimpleNamespace(get_extra_info=lambda k: cli if k == "socket" else None)
-                tune_socket(fake_writer)
-                self.assertEqual(cli.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
-                self.assertNotEqual(cli.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 0)
-            finally:
-                cli.close()
-                acc.close()
-                srv.close()
+            fake_writer = SimpleNamespace(get_extra_info=lambda k: cli if k == "socket" else None)
+            tune_socket(fake_writer)
+            self.assertNotEqual(cli.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 0)
+            self.assertNotEqual(cli.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE), 0)
+
+            # Verify asyncio TransportSocket-like wrappers without .ioctl() never crash on Windows
+            class TransportSocketWrapper:
+                def setsockopt(self, *args):
+                    cli.setsockopt(*args)
+
+            wrapped_writer = SimpleNamespace(
+                get_extra_info=lambda k: TransportSocketWrapper() if k == "socket" else None
+            )
+            tune_socket(wrapped_writer)
         finally:
-            s1.close()
-            s2.close()
+            cli.close()
+            acc.close()
+            srv.close()
 
     def test_send_with_lock_serializes_concurrent_writers(self):
         async def run():
