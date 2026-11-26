@@ -25,12 +25,14 @@ import (
 
 const discoveryPort = "47994"
 const streamPort = "47995"
+const udpStreamPort = "47997"
 
 var pinPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var tokenPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 
 type share struct {
 	Port    int    `json:"port"`
+	UdpPort int    `json:"udp_port,omitempty"`
 	Pin     string `json:"pin"`
 	Token   string `json:"token"`
 	Product string `json:"product"`
@@ -44,13 +46,19 @@ type request struct {
 	Tunnel string `json:"tunnel"`
 	Share  share  `json:"share"`
 }
+type udpAuthEntry struct {
+	ok      bool
+	expires time.Time
+}
 type bridge struct {
 	server      *tsnet.Server
 	client      *local.Client
 	mu          sync.Mutex
 	shared      share
 	tunnels     map[string]net.Listener
+	udpTunnels  map[string]io.Closer
 	connections map[net.Conn]bool
+	udpAuth     map[string]udpAuthEntry
 	serial      int
 }
 
@@ -144,6 +152,111 @@ func (b *bridge) acceptStreams(listener net.Listener) {
 		}()
 	}
 }
+func (b *bridge) authorizedCached(address string) bool {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	now := time.Now()
+	b.mu.Lock()
+	if entry, ok := b.udpAuth[host]; ok && now.Before(entry.expires) {
+		b.mu.Unlock()
+		return entry.ok
+	}
+	b.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	ok := b.authorized(ctx, address)
+	b.mu.Lock()
+	if b.udpAuth == nil {
+		b.udpAuth = map[string]udpAuthEntry{}
+	}
+	b.udpAuth[host] = udpAuthEntry{ok: ok, expires: now.Add(30 * time.Second)}
+	b.mu.Unlock()
+	return ok
+}
+
+// acceptUdpStreams bridges tailnet UDP datagrams on :47997 to local brioche-core UDP port.
+func (b *bridge) acceptUdpStreams(pc net.PacketConn) {
+	type udpPeer struct {
+		localConn *net.UDPConn
+		lastSeen  time.Time
+	}
+	var mu sync.Mutex
+	peers := map[string]*udpPeer{}
+	go func() {
+		ticker := time.NewTicker(15 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			cutoff := time.Now().Add(-45 * time.Second)
+			mu.Lock()
+			for k, p := range peers {
+				if p.lastSeen.Before(cutoff) {
+					p.localConn.Close()
+					delete(peers, k)
+				}
+			}
+			mu.Unlock()
+		}
+	}()
+	buf := make([]byte, 2048)
+	for {
+		n, remoteAddr, err := pc.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		if n <= 0 || !b.authorizedCached(remoteAddr.String()) {
+			continue
+		}
+		b.mu.Lock()
+		s := b.shared
+		b.mu.Unlock()
+		if !validShare(s) || s.UdpPort <= 0 || s.UdpPort >= 65536 {
+			continue
+		}
+		key := remoteAddr.String()
+		mu.Lock()
+		p, exists := peers[key]
+		if !exists {
+			raddr, derr := net.ResolveUDPAddr("udp", fmt.Sprintf("127.0.0.1:%d", s.UdpPort))
+			if derr != nil {
+				mu.Unlock()
+				continue
+			}
+			lc, derr := net.DialUDP("udp", nil, raddr)
+			if derr != nil {
+				mu.Unlock()
+				continue
+			}
+			p = &udpPeer{localConn: lc, lastSeen: time.Now()}
+			peers[key] = p
+			go func(peerKey string, rAddr net.Addr, local *net.UDPConn) {
+				defer func() {
+					local.Close()
+					mu.Lock()
+					delete(peers, peerKey)
+					mu.Unlock()
+				}()
+				rbuf := make([]byte, 2048)
+				for {
+					rn, rerr := local.Read(rbuf)
+					if rerr != nil {
+						return
+					}
+					if rn > 0 {
+						pc.WriteTo(rbuf[:rn], rAddr)
+					}
+				}
+			}(key, remoteAddr, lc)
+		} else {
+			p.lastSeen = time.Now()
+		}
+		localConn := p.localConn
+		mu.Unlock()
+		localConn.Write(buf[:n])
+	}
+}
+
 func (b *bridge) services() {
 	listener, err := b.server.Listen("tcp", ":"+discoveryPort)
 	if err != nil {
@@ -151,6 +264,10 @@ func (b *bridge) services() {
 	}
 	defer listener.Close()
 	go (&http.Server{Handler: http.HandlerFunc(b.info), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 8 * time.Second, WriteTimeout: 8 * time.Second, IdleTimeout: 10 * time.Second, MaxHeaderBytes: 8192}).Serve(listener)
+	if udpPC, uerr := b.server.ListenPacket("udp", ":"+udpStreamPort); uerr == nil {
+		defer udpPC.Close()
+		go b.acceptUdpStreams(udpPC)
+	}
 	streams, err := b.server.Listen("tcp", ":"+streamPort)
 	if err != nil {
 		return
@@ -176,9 +293,85 @@ func (b *bridge) clear() {
 		listener.Close()
 	}
 	b.tunnels = map[string]net.Listener{}
+	for _, closer := range b.udpTunnels {
+		closer.Close()
+	}
+	b.udpTunnels = map[string]io.Closer{}
 	for connection := range b.connections {
 		connection.Close()
 	}
+}
+
+// udpTunnel opens a local loopback UDP port bridged to the peer's tailnet :47997/udp endpoint.
+func (b *bridge) udpTunnel(ctx context.Context, ip string, port int) (map[string]any, error) {
+	if !validIP(ip) || port != 47997 {
+		return nil, errors.New("invalid_endpoint")
+	}
+	if !b.authorized(ctx, net.JoinHostPort(ip, fmt.Sprint(port))) {
+		return nil, errors.New("different_account")
+	}
+	localPC, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		return nil, errors.New("local_udp_listener_failed")
+	}
+	remoteConn, err := b.server.Dial(ctx, "udp", net.JoinHostPort(ip, fmt.Sprint(port)))
+	if err != nil {
+		localPC.Close()
+		return nil, errors.New("remote_udp_dial_failed")
+	}
+	b.mu.Lock()
+	b.serial++
+	id := "udp-" + fmt.Sprint(b.serial)
+	if b.udpTunnels == nil {
+		b.udpTunnels = map[string]io.Closer{}
+	}
+	b.udpTunnels[id] = localPC
+	b.mu.Unlock()
+
+	var clientAddrMu sync.Mutex
+	var clientAddr *net.UDPAddr
+
+	go func() {
+		defer func() {
+			localPC.Close()
+			remoteConn.Close()
+			b.mu.Lock()
+			delete(b.udpTunnels, id)
+			b.mu.Unlock()
+		}()
+		buf := make([]byte, 2048)
+		for {
+			n, addr, rerr := localPC.ReadFromUDP(buf)
+			if rerr != nil {
+				return
+			}
+			clientAddrMu.Lock()
+			clientAddr = addr
+			clientAddrMu.Unlock()
+			if n > 0 {
+				if _, werr := remoteConn.Write(buf[:n]); werr != nil {
+					return
+				}
+			}
+		}
+	}()
+	go func() {
+		defer localPC.Close()
+		buf := make([]byte, 2048)
+		for {
+			n, rerr := remoteConn.Read(buf)
+			if rerr != nil {
+				return
+			}
+			clientAddrMu.Lock()
+			dst := clientAddr
+			clientAddrMu.Unlock()
+			if n > 0 && dst != nil {
+				localPC.WriteToUDP(buf[:n], dst)
+			}
+		}
+	}()
+	return map[string]any{"port": localPC.LocalAddr().(*net.UDPAddr).Port, "tunnel": id}, nil
 }
 func (b *bridge) tunnel(ctx context.Context, ip string, port int) (map[string]any, error) {
 	if !validIP(ip) || port != 47995 {
@@ -356,9 +549,13 @@ func (b *bridge) command(ctx context.Context, r request) (any, error) {
 	case "close_tunnel":
 		b.mu.Lock()
 		listener := b.tunnels[r.Tunnel]
+		udpCloser := b.udpTunnels[r.Tunnel]
 		b.mu.Unlock()
 		if listener != nil {
 			listener.Close()
+		}
+		if udpCloser != nil {
+			udpCloser.Close()
 		}
 		return map[string]bool{"ok": true}, nil
 	case "connect":
@@ -395,6 +592,12 @@ func (b *bridge) command(ctx context.Context, r request) (any, error) {
 		return result, nil
 	case "tunnel":
 		return b.tunnel(ctx, r.IP, r.Port)
+	case "udp_tunnel":
+		port := r.Port
+		if port == 0 {
+			port = 47997
+		}
+		return b.udpTunnel(ctx, r.IP, port)
 	}
 	return nil, errors.New("unknown_command")
 }
@@ -419,7 +622,7 @@ func main() {
 	if err != nil {
 		os.Exit(3)
 	}
-	b := &bridge{server: server, client: localClient, tunnels: map[string]net.Listener{}, connections: map[net.Conn]bool{}}
+	b := &bridge{server: server, client: localClient, tunnels: map[string]net.Listener{}, udpTunnels: map[string]io.Closer{}, connections: map[net.Conn]bool{}, udpAuth: map[string]udpAuthEntry{}}
 	defer b.clear()
 	go b.services()
 	scanner := bufio.NewScanner(os.Stdin)

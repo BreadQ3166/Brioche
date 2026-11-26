@@ -28,10 +28,10 @@ pub const AEAD_TAG_LEN: usize = 16;
 pub const MAX_DATAGRAM_LEN: usize = 1400;
 pub const MAX_SHARD_PAYLOAD: usize = MAX_DATAGRAM_LEN - HEADER_LEN - AEAD_TAG_LEN;
 
-pub const FLAG_IDR: u16 = 1 << 0;
-pub const FLAG_HEVC: u16 = 1 << 1;
-pub const FLAG_AV1: u16 = 1 << 2;
-pub const FLAG_YUV444: u16 = 1 << 3;
+pub const FLAG_IDR: u8 = 1 << 0;
+pub const FLAG_HEVC: u8 = 1 << 1;
+pub const FLAG_AV1: u8 = 1 << 2;
+pub const FLAG_YUV444: u8 = 1 << 3;
 
 #[derive(Debug, Error)]
 pub enum ProtoError {
@@ -86,10 +86,12 @@ pub struct PacketHeader {
     pub kind: PacketKind,
     pub stream_id: u16,
     pub frame_id: u32,
-    pub shard_idx: u16,
+    pub stripe_idx: u8,
+    pub total_stripes: u8,
+    pub shard_idx: u8,
     pub data_shards: u8,
     pub fec_shards: u8,
-    pub flags: u16,
+    pub flags: u8,
     pub capture_ts_us: u64,
     pub seq_num: u64,
 }
@@ -101,10 +103,12 @@ impl PacketHeader {
         out[3] = self.kind as u8;
         out[4..6].copy_from_slice(&self.stream_id.to_be_bytes());
         out[6..10].copy_from_slice(&self.frame_id.to_be_bytes());
-        out[10..12].copy_from_slice(&self.shard_idx.to_be_bytes());
-        out[12] = self.data_shards;
-        out[13] = self.fec_shards;
-        out[14..16].copy_from_slice(&self.flags.to_be_bytes());
+        out[10] = self.stripe_idx;
+        out[11] = self.total_stripes;
+        out[12] = self.shard_idx;
+        out[13] = self.data_shards;
+        out[14] = self.fec_shards;
+        out[15] = self.flags;
         out[16..24].copy_from_slice(&self.capture_ts_us.to_be_bytes());
         out[24..32].copy_from_slice(&self.seq_num.to_be_bytes());
     }
@@ -119,15 +123,22 @@ impl PacketHeader {
         let kind = PacketKind::try_from(buf[3])?;
         let stream_id = u16::from_be_bytes([buf[4], buf[5]]);
         let frame_id = u32::from_be_bytes([buf[6], buf[7], buf[8], buf[9]]);
-        let shard_idx = u16::from_be_bytes([buf[10], buf[11]]);
-        let data_shards = buf[12];
-        let fec_shards = buf[13];
-        let flags = u16::from_be_bytes([buf[14], buf[15]]);
+        let stripe_idx = buf[10];
+        let total_stripes = buf[11];
+        let shard_idx = buf[12];
+        let data_shards = buf[13];
+        let fec_shards = buf[14];
+        let flags = buf[15];
         let capture_ts_us = u64::from_be_bytes(buf[16..24].try_into().unwrap());
         let seq_num = u64::from_be_bytes(buf[24..32].try_into().unwrap());
         if matches!(kind, PacketKind::VideoData | PacketKind::VideoFec) {
             let total = data_shards as u16 + fec_shards as u16;
-            if data_shards == 0 || total == 0 || shard_idx >= total {
+            if data_shards == 0
+                || total == 0
+                || (shard_idx as u16) >= total
+                || total_stripes == 0
+                || stripe_idx >= total_stripes
+            {
                 return Err(ProtoError::InvalidShardMeta);
             }
         }
@@ -135,6 +146,8 @@ impl PacketHeader {
             kind,
             stream_id,
             frame_id,
+            stripe_idx,
+            total_stripes,
             shard_idx,
             data_shards,
             fec_shards,
@@ -316,6 +329,8 @@ mod tests {
             kind: PacketKind::VideoData,
             stream_id: 2,
             frame_id: 99,
+            stripe_idx: 0,
+            total_stripes: 1,
             shard_idx: 1,
             data_shards: 4,
             fec_shards: 2,

@@ -1,4 +1,5 @@
-//! Zero-head-of-line-blocking video frame assembler with automatic RS-FEC reconstruction,
+//! Zero-head-of-line-blocking multi-stripe video frame assembler with automatic RS-FEC
+//! reconstruction (supports arbitrary 4K/8K YUV 4:4:4 IDR frames up to 22 MB),
 //! selective NACK suggestions, and PLI escalation on unrecoverable loss.
 
 use std::collections::BTreeMap;
@@ -12,7 +13,7 @@ use crate::fec::{join_shards_into_frame, reconstruct_data};
 pub struct AssembledFrame {
     pub stream_id: u16,
     pub frame_id: u32,
-    pub flags: u16,
+    pub flags: u8,
     pub capture_ts_us: u64,
     pub recovered_via_fec: bool,
     pub payload: Vec<u8>,
@@ -24,6 +25,7 @@ pub enum AssemblerEvent {
     RequestNack {
         stream_id: u16,
         frame_id: u32,
+        /// Encoded as (stripe_idx << 8) | shard_idx
         missing_shards: Vec<u16>,
     },
     RequestPli {
@@ -32,14 +34,21 @@ pub enum AssemblerEvent {
     },
 }
 
-struct PendingFrame {
-    stream_id: u16,
-    flags: u16,
-    capture_ts_us: u64,
+struct PendingStripe {
     data_shards: usize,
     fec_shards: usize,
     shards: Vec<Option<Vec<u8>>>,
     received_count: usize,
+    completed: Option<(Vec<u8>, bool)>,
+}
+
+struct PendingFrame {
+    stream_id: u16,
+    flags: u8,
+    capture_ts_us: u64,
+    total_stripes: usize,
+    stripes: Vec<Option<PendingStripe>>,
+    completed_stripes: usize,
     first_seen: Instant,
     nack_sent: bool,
 }
@@ -94,80 +103,108 @@ impl FrameAssembler {
         }
         if let Some(last) = self.last_emitted_frame {
             if header.frame_id <= last {
-                return events; // Late shard for already completed/skipped frame
+                return events;
             }
         }
 
+        let total_stripes = header.total_stripes as usize;
+        let stripe_idx = header.stripe_idx as usize;
         let k = header.data_shards as usize;
         let m = header.fec_shards as usize;
         let total = k + m;
         let shard_idx = header.shard_idx as usize;
-        if k == 0 || shard_idx >= total {
+        if total_stripes == 0 || stripe_idx >= total_stripes || k == 0 || shard_idx >= total {
             return events;
         }
 
-        let entry = self.pending.entry(header.frame_id).or_insert_with(|| PendingFrame {
+        let frame = self.pending.entry(header.frame_id).or_insert_with(|| PendingFrame {
             stream_id: header.stream_id,
             flags: header.flags,
             capture_ts_us: header.capture_ts_us,
-            data_shards: k,
-            fec_shards: m,
-            shards: vec![None; total],
-            received_count: 0,
+            total_stripes,
+            stripes: (0..total_stripes).map(|_| None).collect(),
+            completed_stripes: 0,
             first_seen: now,
             nack_sent: false,
         });
 
-        if entry.shards.len() == total && entry.shards[shard_idx].is_none() {
-            entry.shards[shard_idx] = Some(payload);
-            entry.received_count += 1;
+        if frame.total_stripes != total_stripes {
+            return events;
         }
 
-        if entry.received_count >= entry.data_shards {
-            let pending = self.pending.remove(&header.frame_id).unwrap();
-            let had_missing_data = pending.shards[..pending.data_shards]
-                .iter()
-                .any(|s| s.is_none());
-            if let Ok(data_shards) =
-                reconstruct_data(&pending.shards, pending.data_shards, pending.fec_shards)
-            {
-                if let Ok(frame_bytes) = join_shards_into_frame(&data_shards) {
-                    // Drop any older incomplete frames immediately (zero head-of-line blocking!)
-                    let stale: Vec<u32> = self
-                        .pending
-                        .keys()
-                        .copied()
-                        .filter(|&fid| fid < header.frame_id)
-                        .collect();
-                    for stale_id in stale {
-                        self.pending.remove(&stale_id);
-                        self.stats_frames_dropped += 1;
-                        if !header.is_idr() {
-                            events.push(AssemblerEvent::RequestPli {
-                                stream_id: self.stream_id,
-                                dropped_frame_id: stale_id,
-                            });
-                        }
-                    }
+        let stripe = frame.stripes[stripe_idx].get_or_insert_with(|| PendingStripe {
+            data_shards: k,
+            fec_shards: m,
+            shards: vec![None; total],
+            received_count: 0,
+            completed: None,
+        });
 
-                    self.last_emitted_frame = Some(header.frame_id);
-                    self.stats_frames_ok += 1;
-                    if had_missing_data {
-                        self.stats_frames_fec_recovered += 1;
+        if stripe.completed.is_none()
+            && stripe.shards.len() == total
+            && stripe.shards[shard_idx].is_none()
+        {
+            stripe.shards[shard_idx] = Some(payload);
+            stripe.received_count += 1;
+
+            if stripe.received_count >= stripe.data_shards {
+                let had_missing_data = stripe.shards[..stripe.data_shards]
+                    .iter()
+                    .any(|s| s.is_none());
+                if let Ok(data_shards) =
+                    reconstruct_data(&stripe.shards, stripe.data_shards, stripe.fec_shards)
+                {
+                    if let Ok(stripe_bytes) = join_shards_into_frame(&data_shards) {
+                        stripe.completed = Some((stripe_bytes, had_missing_data));
+                        frame.completed_stripes += 1;
                     }
-                    events.push(AssemblerEvent::FrameReady(AssembledFrame {
-                        stream_id: pending.stream_id,
-                        frame_id: header.frame_id,
-                        flags: pending.flags,
-                        capture_ts_us: pending.capture_ts_us,
-                        recovered_via_fec: had_missing_data,
-                        payload: frame_bytes,
-                    }));
                 }
             }
         }
 
-        // Bound pending map size
+        if frame.completed_stripes == frame.total_stripes {
+            let done = self.pending.remove(&header.frame_id).unwrap();
+            let mut full_payload = Vec::new();
+            let mut any_fec = false;
+            for st in done.stripes.into_iter().flatten() {
+                if let Some((bytes, used_fec)) = st.completed {
+                    full_payload.extend_from_slice(&bytes);
+                    any_fec |= used_fec;
+                }
+            }
+
+            let stale: Vec<u32> = self
+                .pending
+                .keys()
+                .copied()
+                .filter(|&fid| fid < header.frame_id)
+                .collect();
+            for stale_id in stale {
+                self.pending.remove(&stale_id);
+                self.stats_frames_dropped += 1;
+                if !header.is_idr() {
+                    events.push(AssemblerEvent::RequestPli {
+                        stream_id: self.stream_id,
+                        dropped_frame_id: stale_id,
+                    });
+                }
+            }
+
+            self.last_emitted_frame = Some(header.frame_id);
+            self.stats_frames_ok += 1;
+            if any_fec {
+                self.stats_frames_fec_recovered += 1;
+            }
+            events.push(AssemblerEvent::FrameReady(AssembledFrame {
+                stream_id: done.stream_id,
+                frame_id: header.frame_id,
+                flags: done.flags,
+                capture_ts_us: done.capture_ts_us,
+                recovered_via_fec: any_fec,
+                payload: full_payload,
+            }));
+        }
+
         while self.pending.len() > self.max_pending_frames {
             if let Some((&oldest_id, _)) = self.pending.iter().next() {
                 self.pending.remove(&oldest_id);
@@ -182,7 +219,6 @@ impl FrameAssembler {
         events
     }
 
-    /// Periodic maintenance: emit selective NACK for fresh incomplete frames or drop expired frames.
     pub fn poll_maintenance(&mut self, now: Instant, rtt_ms: f64) -> Vec<AssemblerEvent> {
         let mut events = Vec::new();
         let mut expired = Vec::new();
@@ -192,11 +228,18 @@ impl FrameAssembler {
             if age >= self.max_frame_wait {
                 expired.push(frame_id);
             } else if !pf.nack_sent && rtt_ms < 25.0 && age >= Duration::from_millis(6) {
-                let missing: Vec<u16> = pf.shards[..pf.data_shards]
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| if s.is_none() { Some(i as u16) } else { None })
-                    .collect();
+                let mut missing = Vec::new();
+                for (s_idx, st_opt) in pf.stripes.iter().enumerate() {
+                    if let Some(st) = st_opt {
+                        if st.completed.is_none() {
+                            for (i, s) in st.shards[..st.data_shards].iter().enumerate() {
+                                if s.is_none() {
+                                    missing.push(((s_idx as u16) << 8) | (i as u16));
+                                }
+                            }
+                        }
+                    }
+                }
                 if !missing.is_empty() {
                     pf.nack_sent = true;
                     events.push(AssemblerEvent::RequestNack {

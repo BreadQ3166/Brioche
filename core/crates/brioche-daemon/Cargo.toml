@@ -9,8 +9,12 @@ name = "brioche-core"
 path = "src/main.rs"
 
 [dependencies]
+brioche-capture = { path = "../brioche-capture" }
+brioche-codec = { path = "../brioche-codec" }
 brioche-proto = { path = "../brioche-proto" }
+brioche-render = { path = "../brioche-render" }
 brioche-transport = { path = "../brioche-transport" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+wgpu.workspace = true
