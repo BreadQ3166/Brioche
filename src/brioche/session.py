@@ -10,9 +10,34 @@ import socket
 import threading
 import time
 
-from .protocol import (CONTROL, VIDEO, VERSION, ProtocolError, StreamConfig,
-                       pack_control, pack_video, read_message, send)
+from .clipboard_sync import build_clipboard_message, validate_clipboard_payload
+from .protocol import (AUDIO, CONTROL, VIDEO, VERSION, ProtocolError, StreamConfig,
+                       pack_audio, pack_control, pack_video, read_message, send)
 from .security import client_context, identity, parse_uri, verify_pin
+
+NON_RETRYABLE_HINTS = (
+    "证书",
+    "凭据",
+    "配对",
+    "权限",
+    "屏幕录制",
+    "辅助功能",
+    "版本不兼容",
+    "已有活动连接",
+    "仅查看",
+    "不支持",
+)
+
+
+def is_retryable_disconnect(exc):
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError)):
+        return True
+    if isinstance(exc, (ProtocolError, ValueError)):
+        return False
+    msg = str(exc)
+    if any(hint in msg for hint in NON_RETRYABLE_HINTS):
+        return False
+    return isinstance(exc, OSError)
 
 
 async def close_writer(writer):
@@ -27,7 +52,7 @@ async def close_writer(writer):
         await asyncio.sleep(0)
 
 
-def stream_info(media, monitors, selected, epoch, view_only, kind="welcome", request=0, files=False):
+def stream_info(media, monitors, selected, epoch, view_only, kind="welcome", request=0, files=False, clipboard=False, audio=False):
     return {
         "type": kind, "version": VERSION, "codec": media.codec_name,
         "width": media.width, "height": media.height,
@@ -39,6 +64,10 @@ def stream_info(media, monitors, selected, epoch, view_only, kind="welcome", req
         "capture": media.capture.backend, "encoder_fallback": getattr(media,"fallback_reason",""), "input": not view_only,
         "timing_scope": "packet_wait" if getattr(media, "paced", False) else "capture_encode",
         'files':bool(files and not view_only),
+        "clipboard": bool(clipboard and not view_only),
+        "audio": bool(audio),
+        "audio_codec": "opus" if audio else "",
+        "platform": platform.system(),
         "monitors": monitors, "monitor": selected, "stream_id": epoch, "request": request,
     }
 
@@ -97,7 +126,10 @@ class Host:
                  web_enabled=False, web_port=47996, lan_discovery=False,
                  on_pair=lambda request: request.answer(False), session_gate=None, name=None,
                  files_enabled=False, on_transfer=lambda request: request.respond(),
-                 on_transfer_progress=lambda value: None, file_gate=None):
+                 on_transfer_progress=lambda value: None, file_gate=None,
+                 clipboard_enabled=True, on_clipboard=lambda text: None,
+                 audio_enabled=True, on_session_state=lambda state: None,
+                 file_browser_enabled=True):
         self.bind, self.port, self.encoder, self.monitor = bind, port, encoder, monitor
         self.status, self.folder, self.view_only = status, folder, view_only
         self.token = secrets.token_urlsafe(32)
@@ -109,10 +141,19 @@ class Host:
         self.error = None
         self.active = False
         self._media = None
+        self._sink = None
         self.session_gate = session_gate or SessionGate()
         self.file_gate = file_gate or SessionGate()
         self.files_enabled, self.on_transfer = files_enabled, on_transfer
         self.on_transfer_progress = on_transfer_progress
+        self.file_browser_enabled = bool(file_browser_enabled)
+        self.clipboard_enabled = clipboard_enabled and not view_only
+        self.on_clipboard = on_clipboard
+        self.audio_enabled = bool(audio_enabled)
+        self.on_session_state = on_session_state
+        self.input_paused = False
+        self._pending_clipboard = None
+        self._clipboard_lock = threading.Lock()
         self.transfer_requests = set()
         self.lan_discovery = lan_discovery
         self.on_pair = on_pair
@@ -191,6 +232,7 @@ class Host:
         display_lease = None
         sink = None
         receiver = None
+        audio_stream = None
         try:
             # Bound unauthenticated peers and brute-force attempts. Tokens are 256-bit.
             now = time.monotonic()
@@ -209,6 +251,15 @@ class Host:
                 if self.view_only or not self.files_enabled:
                     raise ProtocolError('被控端未允许文件互传，或当前是仅查看共享')
                 await self._file_session(reader, writer, hello)
+                return
+            if kind == CONTROL and hello.get('type') == 'file_browser':
+                if (hello.get('version') != VERSION or not isinstance(hello.get('token'), str)
+                        or not hello['token'].isascii() or not (secrets.compare_digest(hello['token'], self.token)
+                        or (self.pair_store and self.pair_store.accepts(hello['token'])))):
+                    raise ProtocolError('文件浏览认证失败')
+                if self.view_only or not self.files_enabled or not self.file_browser_enabled:
+                    raise ProtocolError('被控端未允许直接浏览目录，或当前是仅查看共享')
+                await self._file_browser_session(reader, writer)
                 return
             if kind == CONTROL and hello.get("type") == "hello" and hello.get("version") != VERSION:
                 raise ProtocolError("两端 Brioche 版本不兼容，请都更新到 0.2 或更高版本")
@@ -242,9 +293,25 @@ class Host:
             self._media = media
             if not self.view_only:
                 sink = InputSink(media.monitor)
+                self._sink = sink
+            self.input_paused = False
+            audio_ready = False
+            if self.audio_enabled and bool(hello.get("audio", False)):
+                from .audio import AudioCaptureStream
+                candidate = AudioCaptureStream()
+                if candidate.start():
+                    audio_stream = candidate
+                    audio_ready = True
             state = {"stream_id": 0, "monitor": self.monitor, "pending": None,
                      "switching": False, "last_switch": 0.0, "monitors": monitors}
-            await send(writer, pack_control(stream_info(media, monitors, self.monitor, 0, self.view_only,files=self.files_enabled)))
+            await send(writer, pack_control(stream_info(media, monitors, self.monitor, 0, self.view_only, files=self.files_enabled, clipboard=self.clipboard_enabled, audio=audio_ready)))
+            self.on_session_state({
+                "active": True,
+                "peer": str(peer[0]) if peer else "",
+                "view_only": self.view_only,
+                "audio": audio_ready,
+                "input_paused": self.input_paused,
+            })
             self.status(f"正在共享 · {media.width}×{media.height} · 上限 {config.fps} FPS")
             receiver = asyncio.create_task(self._receive_input(reader, writer, sink, state))
             interval = 1 / config.fps
@@ -276,13 +343,19 @@ class Host:
                         if sink:
                             sink.monitor = media.monitor
                         await send(writer, pack_control(stream_info(
-                            media, monitors, selected, state["stream_id"], self.view_only, "stream", request,files=self.files_enabled)))
+                            media, monitors, selected, state["stream_id"], self.view_only, "stream", request, files=self.files_enabled, clipboard=self.clipboard_enabled, audio=audio_ready)))
                         self.status(f"正在共享显示器 {selected} · {media.width}×{media.height}")
                         frames, process_ms, report_at = 0, 0.0, time.monotonic()
                         send_ms = 0.0
                         age_ms, age_frames = 0.0, 0
                     finally:
                         state["switching"] = False
+                pending_clip = self._take_pending_clipboard()
+                if pending_clip is not None and self.clipboard_enabled and not self.view_only:
+                    await send(writer, pack_control(pending_clip))
+                if audio_stream is not None and self.audio_enabled:
+                    for audio_pkt in audio_stream.drain_packets():
+                        await send(writer, pack_audio(audio_pkt))
                 packets, elapsed = await self.loop.run_in_executor(executor, media.frame, state.pop("force_keyframe", False))
                 sending = time.perf_counter()
                 age = getattr(media, 'capture_age_ms', None)
@@ -323,6 +396,13 @@ class Host:
         finally:
             if receiver:
                 receiver.cancel()
+            if audio_stream:
+                try:
+                    audio_stream.close()
+                except Exception:
+                    pass
+            if self._sink is sink:
+                self._sink = None
             if sink:
                 try:
                     sink.close()
@@ -354,34 +434,91 @@ class Host:
                 if acquired:
                     self.session_gate.release(task)
                     self.active = False
+                    self.input_paused = False
                     self.session_tasks.discard(task)
+                    self.on_session_state({"active": False})
                     self.status("等待连接")
             await close_writer(writer)
             self.peer_tasks.discard(task)
             self.connection_tasks.pop(peer, None)
 
+    async def _file_browser_session(self, reader, writer):
+        from pathlib import Path
+        from .file_browser import handle_browser_command, local_roots
+        from .file_transfer import TransferError
+
+        await send(
+            writer,
+            pack_control(
+                {
+                    "type": "fb_ready",
+                    "platform": platform.system(),
+                    "home": str(Path.home()),
+                    "roots": local_roots(),
+                }
+            ),
+        )
+        while not self.stop_requested.is_set():
+            try:
+                kind, message = await asyncio.wait_for(read_message(reader), 120)
+            except (asyncio.IncompleteReadError, ConnectionError, TimeoutError):
+                return
+            if kind != CONTROL:
+                raise ProtocolError("无效文件浏览请求")
+            if message.get("type") == "fb_bye":
+                return
+            if self.view_only or not self.files_enabled or not self.file_browser_enabled:
+                await send(writer, pack_control({"type": "fb_error", "message": "被控端已关闭直接文件浏览权限"}))
+                return
+            try:
+                reply = await asyncio.to_thread(handle_browser_command, message)
+            except TransferError as exc:
+                await send(writer, pack_control({"type": "fb_error", "message": str(exc)[:200]}))
+            except Exception:
+                await send(writer, pack_control({"type": "fb_error", "message": "远端目录操作失败"}))
+            else:
+                await send(writer, pack_control(reply))
+
     async def _file_session(self, reader, writer, hello):
         from .file_transfer import FileConsent, TransferError, validate_manifest, sources, send_files, receive_files
+        from .file_browser import _resolve_dir
         task = asyncio.current_task()
         if not self.file_gate.acquire(task):
             raise ProtocolError('已有文件正在传输，请等待完成')
         request = None
         last_progress = 0.0
+        task_id = secrets.token_hex(12)
         try:
             direction = hello.get('direction')
             if direction not in ('upload', 'download'):
                 raise TransferError('无效文件传输方向')
             items = validate_manifest(hello.get('files')) if direction == 'upload' else []
-            request = FileConsent('receive' if direction == 'upload' else 'send', writer.get_extra_info('peername')[0], items)
-            self.transfer_requests.add(request)
-            self.on_transfer(request)
-            selection = await request.wait(reader, self.stop_requested)
+            direct_target = hello.get('target_dir') if direction == 'upload' else None
+            direct_sources = hello.get('remote_paths') if direction == 'download' else None
+            unattended = bool(
+                self.file_browser_enabled
+                and not self.view_only
+                and (direct_target is not None or direct_sources is not None)
+            )
+            if unattended:
+                if direction == 'upload':
+                    selection = str(await asyncio.to_thread(_resolve_dir, direct_target))
+                else:
+                    if not isinstance(direct_sources, list) or not direct_sources or not all(isinstance(p, str) for p in direct_sources):
+                        raise TransferError('无效远端文件路径')
+                    selection = direct_sources
+            else:
+                request = FileConsent('receive' if direction == 'upload' else 'send', writer.get_extra_info('peername')[0], items)
+                task_id = request.id
+                self.transfer_requests.add(request)
+                self.on_transfer(request)
+                selection = await request.wait(reader, self.stop_requested)
             def progress(completed, total, name):
                 nonlocal last_progress
                 now = time.monotonic()
                 if now - last_progress >= .1 or name == '完成':
                     last_progress = now
-                    self.on_transfer_progress({'id': request.id, 'completed': completed, 'total': total,
+                    self.on_transfer_progress({'id': task_id, 'completed': completed, 'total': total,
                                                'name': name, 'status': '传输中'})
             if direction == 'upload':
                 await receive_files(reader, writer, selection, items, progress)
@@ -389,19 +526,48 @@ class Host:
                 paths, items = await asyncio.to_thread(sources, selection)
                 await send(writer, pack_control({'type': 'file_offer', 'files': items}))
                 await send_files(reader, writer, paths, items, progress)
-            self.on_transfer_progress({'id': request.id, 'finished': True, 'status': '已完成 · SHA256 校验通过'})
+            self.on_transfer_progress({'id': task_id, 'finished': True, 'status': '已完成 · SHA256 校验通过'})
         except asyncio.CancelledError:
-            if request:self.on_transfer_progress({'id': request.id, 'finished': True, 'status': '已取消'})
+            if request:self.on_transfer_progress({'id': task_id, 'finished': True, 'status': '已取消'})
             raise
         except Exception as exc:
             message = str(exc)[:200] if isinstance(exc, TransferError) else '文件传输中断，请检查连接、权限或磁盘空间'
             try:await send(writer, pack_control({'type': 'file_error', 'message': message}))
             except Exception:pass
-            if request:self.on_transfer_progress({'id': request.id, 'finished': True, 'status': message})
+            if request:self.on_transfer_progress({'id': task_id, 'finished': True, 'status': message})
         finally:
             if request:
                 request.respond();self.transfer_requests.discard(request)
             self.file_gate.release(task)
+
+    def set_input_paused(self, paused):
+        self.input_paused = bool(paused)
+        if self.input_paused and self._sink:
+            try:
+                self._sink.release_all()
+            except Exception:
+                pass
+        if self.active:
+            self.on_session_state({
+                "active": True,
+                "view_only": self.view_only,
+                "input_paused": self.input_paused,
+            })
+
+    def push_clipboard(self, text):
+        if not self.active or self.view_only or not self.clipboard_enabled:
+            return False
+        message = build_clipboard_message(text)
+        if not message:
+            return False
+        with self._clipboard_lock:
+            self._pending_clipboard = message
+        return True
+
+    def _take_pending_clipboard(self):
+        with self._clipboard_lock:
+            msg, self._pending_clipboard = self._pending_clipboard, None
+        return msg
 
     def cancel_transfers(self):
         for request in tuple(self.transfer_requests):request.cancel()
@@ -500,7 +666,8 @@ class Host:
                 await send(writer, pack_control({"type": "pong", "stamp": stamp}))
             elif message["type"] == "input":
                 if sink and (message.get("event") == "release" or (
-                        not state["switching"] and state["pending"] is None
+                        not self.input_paused
+                        and not state["switching"] and state["pending"] is None
                         and type(message.get("stream_id")) is int
                         and message["stream_id"] == state["stream_id"])):
                     sink.apply(message)
@@ -522,6 +689,10 @@ class Host:
                         and now - state.get("last_keyframe_request", 0.) >= .25):
                     state["force_keyframe"] = True
                     state["last_keyframe_request"] = now
+            elif message["type"] == "clipboard":
+                if self.clipboard_enabled and not self.view_only:
+                    text, _ = validate_clipboard_payload(message)
+                    self.on_clipboard(text)
             elif message["type"] == "bye":
                 return
             else:
@@ -550,14 +721,21 @@ class Host:
 class Viewer:
     """Callbacks run on the network thread. UI must use signals/a latest-frame mailbox."""
     def __init__(self, uri, config, on_frame, on_status=lambda message: None,
-                 on_info=lambda info: None, on_stats=lambda stats: None):
+                 on_info=lambda info: None, on_stats=lambda stats: None,
+                 on_clipboard=lambda text: None, audio_enabled=True,
+                 on_audio=lambda payload: None):
         self.address = parse_uri(uri)
         self.config = config
         self.on_frame, self.on_status = on_frame, on_status
         self.on_info, self.on_stats = on_info, on_stats
+        self.on_clipboard = on_clipboard
+        self.audio_enabled = bool(audio_enabled)
+        self.on_audio = on_audio
         self.commands = queue.Queue(maxsize=128)
         self._mouse = None
         self._mouse_lock = threading.Lock()
+        self._clipboard_out = None
+        self._clipboard_lock = threading.Lock()
         self._release = threading.Event()
         self.stopped = threading.Event()
         self.finished = threading.Event()
@@ -570,6 +748,7 @@ class Viewer:
         self._request_id = 0
         self._switch_started = 0.0
         self.monitors = []
+        self._connected_once = False
 
     def start(self):
         if self.thread:
@@ -578,20 +757,44 @@ class Viewer:
         self.thread.start()
 
     def _run(self):
+        retryable = False
+        reason = ""
         try:
             asyncio.run(self._connect())
+            if not self.stopped.is_set() and self._connected_once:
+                retryable = True
+                reason = "连接意外中断"
         except asyncio.CancelledError:
             pass
-        except (TimeoutError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.TimeoutError) as exc:
             if not self.stopped.is_set():
+                retryable = True
+                reason = "等待被控端响应超时"
                 self.on_status('连接失败：等待被控端画面超时；请检查对方屏幕录制权限、编码器和共享状态')
         except Exception as exc:
             if not self.stopped.is_set():
+                retryable = is_retryable_disconnect(exc)
+                reason = str(exc)[:200]
                 self.on_status(f"连接失败：{exc}")
         finally:
+            user_stopped = self.stopped.is_set()
             self.stopped.set()
             self.finished.set()
-            self.on_info({"disconnected": True})
+            self.on_info({
+                "disconnected": True,
+                "retryable": retryable and not user_stopped,
+                "reason": reason,
+            })
+
+    def send_clipboard(self, text):
+        if self.stopped.is_set():
+            return False
+        message = build_clipboard_message(text)
+        if not message:
+            return False
+        with self._clipboard_lock:
+            self._clipboard_out = message
+        return True
 
     def input(self, event):
         if self.stopped.is_set() or (self._switching.is_set() and event["event"] != "release"):
@@ -640,11 +843,13 @@ class Viewer:
             sock = writer.get_extra_info("socket")
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             await send(writer, pack_control({"type": "hello", "version": VERSION,
-                                            "token": token, "config": self.config.to_wire()}))
+                                            "token": token, "config": self.config.to_wire(),
+                                            "audio": self.audio_enabled}))
             kind, info = await asyncio.wait_for(read_message(reader), 15)
             if kind != CONTROL or info["type"] != "welcome" or info.get("version") != VERSION:
                 raise ProtocolError(info.get("message", "服务端握手失败") if kind == CONTROL else "无效握手")
             w, h = validate_stream_info(info)
+            self._connected_once = True
             self.monitors = info["monitors"]
             self._stream_id = info["stream_id"]
             self.on_info(info)
@@ -680,6 +885,9 @@ class Viewer:
                                        "submit_ms": round(submit_ms / max(1, frames), 2)})
                         frames, byte_count, since = 0, 0, now
                         decode_ms = convert_ms = submit_ms = 0.0
+                elif kind == AUDIO:
+                    if self.audio_enabled:
+                        self.on_audio(payload)
                 elif payload["type"] == "pong":
                     self.on_stats({"rtt_ms": round((time.monotonic() - payload["stamp"]) * 1000, 1)})
                 elif payload["type"] == "stats":
@@ -699,6 +907,9 @@ class Viewer:
                     if payload.get("request") == self._request_id:
                         self._switching.clear()
                         self.on_info({"monitor_error": True, "message": payload.get("message", "切换失败")})
+                elif payload["type"] == "clipboard":
+                    text, _ = validate_clipboard_payload(payload)
+                    self.on_clipboard(text)
                 elif payload["type"] == "error":
                     raise ProtocolError(payload.get("message", "服务端错误"))
                 if sender.done():
@@ -735,6 +946,10 @@ class Viewer:
                 monitor_request, self._monitor_request = self._monitor_request, None
             if monitor_request:
                 await send(writer, pack_control(monitor_request))
+            with self._clipboard_lock:
+                clip_msg, self._clipboard_out = self._clipboard_out, None
+            if clip_msg:
+                await send(writer, pack_control(clip_msg))
             if mouse:
                 await send(writer, pack_control(mouse))
             for _ in range(32):

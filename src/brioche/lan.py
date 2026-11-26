@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import secrets
 import threading
+import time
 from .device_store import private_json
 from .protocol import CONTROL, VERSION, ProtocolError, pack_control, read_message, send
 from .security import client_context, data_dir
@@ -65,9 +66,37 @@ class PairStore:
             if client_id not in self.pairs and len(self.pairs) >= 32:
                 raise ProtocolError("本机最多配对32台设备，请先清除旧配对")
             token = secrets.token_urlsafe(32)
-            self.pairs[client_id] = {"name": name, "token": token}
+            self.pairs[client_id] = {
+                "name": name,
+                "token": token,
+                "granted_at": int(time.time()),
+            }
             private_json(self.path, self.pairs)
             return token
+
+    def list_pairs(self):
+        with self.lock:
+            items = []
+            for client_id, entry in self.pairs.items():
+                if not isinstance(entry, dict):
+                    continue
+                items.append(
+                    {
+                        "client_id": client_id,
+                        "name": str(entry.get("name", "局域网设备"))[:64],
+                        "granted_at": entry.get("granted_at", 0),
+                    }
+                )
+            items.sort(key=lambda item: (-int(item.get("granted_at") or 0), item["name"].lower()))
+            return items
+
+    def revoke(self, client_id):
+        with self.lock:
+            if client_id in self.pairs:
+                del self.pairs[client_id]
+                private_json(self.path, self.pairs)
+                return True
+            return False
 
     def accepts(self, token):
         if not isinstance(token, str) or not TOKEN.fullmatch(token):

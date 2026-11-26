@@ -28,9 +28,17 @@ def validate_event(event):
             raise ValueError("无效键盘按键")
         if type(event.get("down")) is not bool:
             raise ValueError("无效按键状态")
+        if "repeat" in event and type(event["repeat"]) is not bool:
+            raise ValueError("无效重复按键标记")
     elif kind == "scroll":
-        if type(event.get("dy")) is not int or not -10 <= event["dy"] <= 10:
+        dx = event.get("dx", 0)
+        dy = event.get("dy", 0)
+        if "dx" not in event and "dy" not in event:
             raise ValueError("无效滚动量")
+        if type(dx) is not int or not -10 <= dx <= 10:
+            raise ValueError("无效水平滚动量")
+        if type(dy) is not int or not -10 <= dy <= 10:
+            raise ValueError("无效垂直滚动量")
     elif kind != "release":
         raise ValueError("未知输入事件")
     return event
@@ -68,12 +76,16 @@ class InputSink:
         elif kind == "key":
             name = event["key"]
             key = getattr(self.keyboard_module.Key, name) if name in KEY_NAMES else name
-            if event["down"]:
-                self.keyboard.press(key)
-                self.keys.add(key)
-            else:
-                self.keyboard.release(key)
-                self.keys.discard(key)
+            try:
+                if event["down"]:
+                    self.keyboard.press(key)
+                    self.keys.add(key)
+                else:
+                    self.keyboard.release(key)
+                    self.keys.discard(key)
+            except ValueError:
+                # Ignore unmappable single characters instead of tearing down the session.
+                pass
         elif kind == "button":
             button = getattr(self.mouse_module.Button, event["button"])
             if event["down"]:
@@ -83,7 +95,7 @@ class InputSink:
                 self.mouse.release(button)
                 self.buttons.discard(button)
         elif kind == "scroll":
-            self.mouse.scroll(0, event["dy"])
+            self.mouse.scroll(event.get("dx", 0), event.get("dy", 0))
         else:
             self.release_all()
 
@@ -167,5 +179,10 @@ class X11Mouse:
     def scroll(self, dx, dy):
         for _ in range(abs(dy)):
             button = 4 if dy > 0 else 5
+            self.press(button)
+            self.release(button)
+        for _ in range(abs(dx)):
+            # X11 horizontal wheel: 6 = left, 7 = right
+            button = 6 if dx < 0 else 7
             self.press(button)
             self.release(button)

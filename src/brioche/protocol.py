@@ -5,10 +5,12 @@ import struct
 from dataclasses import dataclass
 
 VERSION = 2
-CONTROL, VIDEO, FILE = 1, 2, 3
-MAX_FILE_CHUNK = 64 * 1024
+CONTROL, VIDEO, FILE, AUDIO = 1, 2, 3, 4
+MAX_FILE_CHUNK = 256 * 1024
 HEADER = struct.Struct("!BI")
-MAX_CONTROL = 16 * 1024
+MAX_CONTROL = 256 * 1024
+MAX_CLIPBOARD_BYTES = 128 * 1024
+MAX_AUDIO = 16 * 1024
 MAX_VIDEO = 8 * 1024 * 1024
 RESOLUTIONS = {"720p": (1280, 720), "1080p": (1920, 1080), "1440p": (2560, 1440), "native": (3840, 2160)}
 FRAME_RATES = (30, 60, 90, 120, 144)
@@ -71,13 +73,19 @@ def pack_file(payload):
     return HEADER.pack(FILE, len(payload)) + payload
 
 
+def pack_audio(payload):
+    if not 0 < len(payload) <= MAX_AUDIO:
+        raise ProtocolError('无效音频包')
+    return HEADER.pack(AUDIO, len(payload)) + payload
+
+
 async def read_message(reader):
     kind, size = HEADER.unpack(await reader.readexactly(HEADER.size))
-    limit = {CONTROL: MAX_CONTROL, VIDEO: MAX_VIDEO, FILE: MAX_FILE_CHUNK}.get(kind, 0)
+    limit = {CONTROL: MAX_CONTROL, VIDEO: MAX_VIDEO, FILE: MAX_FILE_CHUNK, AUDIO: MAX_AUDIO}.get(kind, 0)
     if not 0 < size <= limit:
         raise ProtocolError("无效消息类型或长度")
     payload = await reader.readexactly(size)
-    if kind in (VIDEO, FILE):
+    if kind in (VIDEO, FILE, AUDIO):
         return kind, payload
     try:
         value = json.loads(payload)

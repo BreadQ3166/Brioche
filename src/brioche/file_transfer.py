@@ -1,4 +1,4 @@
-"""Consent-based, bounded file batches on a separate authenticated TLS channel."""
+"""Consent-based, bounded file & folder batches on a separate authenticated TLS channel."""
 
 import asyncio
 import ctypes
@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import secrets
 import shutil
-import socket
 import stat
 import sys
 import threading
@@ -27,9 +26,16 @@ from .protocol import (
 )
 from .security import client_context, parse_uri, verify_pin
 
-MAX_FILES = 32
+MAX_FILES = 512
+MAX_DEPTH = 16
 MAX_BATCH_SIZE = 64 * 1024**3
-RATE_LIMIT = 1024 * 1024  # Keep bulk traffic below 1 MiB/s while using the desktop.
+RATE_LIMIT = 20 * 1024 * 1024  # 20 MiB/s default; user-configurable (0 = unlimited).
+RATE_PRESETS = (
+    ("极速 · 不限速", 0),
+    ("高速 · 20 MiB/s（推荐）", 20 * 1024 * 1024),
+    ("均衡 · 8 MiB/s", 8 * 1024 * 1024),
+    ("低干扰 · 2 MiB/s", 2 * 1024 * 1024),
+)
 
 
 class TransferError(ValueError):
@@ -56,9 +62,25 @@ def safe_name(name):
     return name
 
 
+def safe_relpath(relpath):
+    """Validate an optional forward-slash relative path for folder transfers."""
+    if not isinstance(relpath, str) or not relpath:
+        raise TransferError("无效相对路径")
+    if relpath.startswith(("/", "\\")) or "\\" in relpath:
+        raise TransferError("相对路径包含非法分隔符")
+    parts = relpath.split("/")
+    if len(parts) > MAX_DEPTH:
+        raise TransferError("文件夹层级过深（最多 16 层）")
+    clean_parts = [safe_name(part) for part in parts]
+    joined = "/".join(clean_parts)
+    if len(joined.encode("utf-8")) > 512:
+        raise TransferError("相对路径过长")
+    return joined
+
+
 def validate_manifest(items):
     if not isinstance(items, list) or not 1 <= len(items) <= MAX_FILES:
-        raise TransferError("每次请选择1至32个文件")
+        raise TransferError(f"每次请选择 1 至 {MAX_FILES} 个文件")
     clean = []
     for item in items:
         if (
@@ -67,23 +89,60 @@ def validate_manifest(items):
             or not 0 <= item["size"] <= MAX_BATCH_SIZE
         ):
             raise TransferError("无效文件大小")
-        clean.append({"name": safe_name(item.get("name")), "size": item["size"]})
+        entry = {"name": safe_name(item.get("name")), "size": item["size"]}
+        if "relpath" in item and item["relpath"] is not None:
+            rel = safe_relpath(item["relpath"])
+            if rel.split("/")[-1] != entry["name"]:
+                raise TransferError("文件相对路径与文件名不一致")
+            entry["relpath"] = rel
+        clean.append(entry)
     if sum(item["size"] for item in clean) > MAX_BATCH_SIZE:
-        raise TransferError("一次传输合计最多64 GiB")
+        raise TransferError("一次传输合计最多 64 GiB")
     return clean
 
 
+def _collect_dir(root_dir, resolved, items):
+    base_name = safe_name(root_dir.name)
+    for current, dirnames, filenames in os.walk(root_dir, followlinks=False):
+        current_path = Path(current)
+        rel_dir = current_path.relative_to(root_dir)
+        # Skip symlinked directories
+        dirnames[:] = sorted(
+            d for d in dirnames if not (current_path / d).is_symlink()
+        )
+        for fname in sorted(filenames):
+            fpath = current_path / fname
+            if fpath.is_symlink():
+                continue
+            info = fpath.stat()
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            rel_parts = [base_name] + list(rel_dir.parts) + [fname]
+            rel_str = safe_relpath("/".join(rel_parts))
+            resolved.append(fpath)
+            items.append({"name": safe_name(fname), "relpath": rel_str, "size": info.st_size})
+            if len(resolved) > MAX_FILES:
+                raise TransferError(f"文件夹内文件过多，单批最多 {MAX_FILES} 个文件")
+
+
 def sources(paths):
-    if not isinstance(paths, (list, tuple)) or not 1 <= len(paths) <= MAX_FILES:
-        raise TransferError("每次请选择1至32个文件")
+    if not isinstance(paths, (list, tuple)) or not paths:
+        raise TransferError("请至少选择一个文件或文件夹")
     resolved, items = [], []
     for value in paths:
         path = Path(value).resolve(strict=True)
         info = path.stat()
-        if not stat.S_ISREG(info.st_mode):
-            raise TransferError("请选择普通文件，文件夹请先压缩后发送")
-        resolved.append(path)
-        items.append({"name": path.name, "size": info.st_size})
+        if stat.S_ISDIR(info.st_mode):
+            _collect_dir(path, resolved, items)
+        elif stat.S_ISREG(info.st_mode):
+            resolved.append(path)
+            items.append({"name": safe_name(path.name), "size": info.st_size})
+        else:
+            raise TransferError("仅支持普通文件与文件夹")
+        if len(resolved) > MAX_FILES:
+            raise TransferError(f"每次最多传输 {MAX_FILES} 个文件")
+    if not resolved:
+        raise TransferError("所选文件夹内没有可发送的文件")
     return resolved, validate_manifest(items)
 
 
@@ -120,10 +179,31 @@ def commit_without_overwrite(source, target):
         raise OSError(code, os.strerror(code))
 
 
+def _safe_subdir(root_folder, relpath):
+    """Resolve and create subdirectory inside root_folder without crossing symlinks."""
+    rel_parts = safe_relpath(relpath).split("/")[:-1]
+    current = root_folder
+    for part in rel_parts:
+        nxt = current / part
+        if nxt.is_symlink():
+            raise TransferError("目标路径包含符号链接，已拒绝写入")
+        nxt.mkdir(exist_ok=True)
+        resolved_nxt = nxt.resolve(strict=True)
+        try:
+            resolved_nxt.relative_to(root_folder)
+        except ValueError as exc:
+            raise TransferError("目标路径超出保存目录") from exc
+        current = resolved_nxt
+    return current
+
+
 class IncomingFile:
     def __init__(self, folder, item):
-        self.folder = Path(folder).resolve(strict=True)
-        self.name, self.size = safe_name(item["name"]), item["size"]
+        self.root = Path(folder).resolve(strict=True)
+        self.name = safe_name(item["name"])
+        self.size = item["size"]
+        relpath = item.get("relpath")
+        self.folder = _safe_subdir(self.root, relpath) if relpath else self.root
         self.path = self.folder / (".brioche-" + secrets.token_hex(16) + ".part")
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         self.file = os.fdopen(os.open(self.path, flags, 0o600), "wb")
@@ -153,7 +233,7 @@ class IncomingFile:
             )
             try:
                 commit_without_overwrite(self.path, destination)
-                return destination.name
+                return str(destination.relative_to(self.root))
             except FileExistsError:
                 continue
         raise TransferError("同名文件过多，请选择其他保存目录")
@@ -236,9 +316,8 @@ async def send_files(reader, writer, paths, items, progress, rate=RATE_LIMIT):
                 await send(writer, pack_file(data))
                 count += len(data)
                 transferred += len(data)
-                progress(transferred, total, item["name"])
-                # Independent connection and bounded rate protect interactive video.
-                if rate:
+                progress(transferred, total, item.get("relpath") or item["name"])
+                if rate and rate > 0:
                     await asyncio.sleep(
                         max(0, transferred / rate - (time.monotonic() - started))
                     )
@@ -281,7 +360,7 @@ async def receive_files(reader, writer, folder, items, progress):
                     raise TransferError("文件提前结束或连接中断")
                 await asyncio.to_thread(incoming.write, data)
                 transferred += len(data)
-                progress(transferred, total, item["name"])
+                progress(transferred, total, item.get("relpath") or item["name"])
             ending = await control(reader, "file_end")
             finishing = asyncio.create_task(
                 asyncio.to_thread(incoming.finish, ending.get("sha256"))
@@ -302,24 +381,38 @@ async def receive_files(reader, writer, folder, items, progress):
 
 
 class TransferJob:
-    def __init__(self, uri, direction, selection, update=lambda value: None):
+    def __init__(
+        self,
+        uri,
+        direction,
+        selection,
+        update=lambda value: None,
+        rate=RATE_LIMIT,
+        target_dir=None,
+        remote_paths=None,
+    ):
         self.uri, self.direction, self.selection, self.update = (
             uri,
             direction,
             selection,
             update,
         )
+        self.rate = rate
+        self.target_dir = target_dir
+        self.remote_paths = list(remote_paths) if remote_paths else None
         self.loop = self.task = None
         self.finished = threading.Event()
         self.stopped = threading.Event()
         self.id = secrets.token_hex(12)
-        self._last_progress = 0
+        self._last_progress = 0.0
+        self._started_at = 0.0
 
     def start(self):
         threading.Thread(target=self._run, name="brioche-files", daemon=True).start()
 
     def stop(self):
-        if self.stopped.is_set():return
+        if self.stopped.is_set():
+            return
         self.stopped.set()
         if self.loop and self.task and self.loop.is_running():
             self.loop.call_soon_threadsafe(self.task.cancel)
@@ -328,18 +421,27 @@ class TransferJob:
         now = time.monotonic()
         if now - self._last_progress >= 0.1 or name == "完成":
             self._last_progress = now
+            elapsed = max(0.05, now - self._started_at) if self._started_at else 1.0
+            speed_bps = int(completed / elapsed) if completed else 0
             self.update(
                 {
                     "id": self.id,
                     "completed": completed,
                     "total": total,
                     "name": name,
+                    "speed_bps": speed_bps,
                     "status": "传输中",
                 }
             )
 
     def _run(self):
-        self.update({"id": self.id, "status": "等待对方确认…"})
+        self._started_at = time.monotonic()
+        initial_status = (
+            "正在连接远端目录…"
+            if (self.target_dir or self.remote_paths)
+            else "等待对方确认…"
+        )
+        self.update({"id": self.id, "status": initial_status})
         try:
             asyncio.run(self._connect())
             status = "已完成 · SHA256 校验通过"
@@ -384,9 +486,13 @@ class TransferJob:
             if self.direction == "upload":
                 paths, items = await asyncio.to_thread(sources, self.selection)
                 message["files"] = items
+                if self.target_dir:
+                    message["target_dir"] = self.target_dir
+            elif self.remote_paths:
+                message["remote_paths"] = self.remote_paths
             await send(writer, pack_control(message))
             if self.direction == "upload":
-                await send_files(reader, writer, paths, items, self.progress)
+                await send_files(reader, writer, paths, items, self.progress, rate=self.rate)
             else:
                 offer = await control(reader, "file_offer")
                 items = validate_manifest(offer.get("files"))

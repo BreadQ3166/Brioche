@@ -1,45 +1,55 @@
-"""Device-first desktop: account devices, remembered LAN devices, and quiet settings."""
+"""Modern unified device workspace: LAN + Tailscale aggregation, Light/Dark themes, and per-device inspector drawer."""
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import platform
 import threading
-import time
-from PySide6.QtCore import QObject, Signal, QTimer, QUrl, Qt, QSize
-from PySide6.QtGui import QDesktopServices, QColor
+from PySide6.QtCore import QObject, QSize, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
-    QFormLayout,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
-    QScrollArea,
-    QSpinBox,
     QStackedWidget,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
-    QSystemTrayIcon,
-    QMenu,
 )
 from . import __version__
 from .capture import list_monitors
+from .clipboard_sync import ClipboardGuard
+from .device_drawer import DeviceInspectorDrawer
+from .device_model import (
+    build_unified_devices,
+    effective_stream_config,
+    filter_devices,
+)
 from .device_store import DeviceStore
 from .embedded_network import EmbeddedNetwork, login_url
 from .lan import discover, pair, target
+from .lan_discovery import LanBeaconBroadcaster, LanBeaconListener
 from .network import lan_addresses
-from .protocol import FRAME_RATES, StreamConfig
+from .protocol import StreamConfig
+from .remote_overlays import HostSessionPill
 from .security import access_uri, parse_uri
 from .session import Host, SessionGate
-from .ui_components import DeviceList, RoundedComboBox, PageTransition
+from .settings_view import SettingsView
+from .theme import build_stylesheet, resolve_mode, tokens_for
 from .transfer_ui import TransferBoard, downloads
-QComboBox = RoundedComboBox
+from .ui_components import (
+    AddLanDeviceDialog,
+    DeviceList,
+    FilterPillBar,
+    PageTransition,
+)
 
 
 def text(value, heading=False):
@@ -53,42 +63,69 @@ def screen_label(monitor):
     return f"显示器 {monitor['id']} · {monitor['width']} × {monitor['height']}"
 
 
+def _format_recent_time(ts):
+    if not ts:
+        return "最近连接"
+    try:
+        return datetime.fromtimestamp(int(ts)).strftime("%m-%d %H:%M")
+    except (OSError, ValueError, TypeError):
+        return "最近连接"
+
+
 class EnvironmentBridge(QObject):
     ready = Signal(dict)
     result = Signal(dict)
     pair_request = Signal(object)
     pair_code = Signal(str)
     host_status = Signal(str, str)
+    host_clipboard = Signal(str)
+    host_session_state = Signal(dict)
+    nearby_lan = Signal(list)
     transfer_request = Signal(object)
     transfer_progress = Signal(dict)
 
 
 class MainWindow(QMainWindow):
+    PAGE_DEVICES = 0
+    PAGE_RECENTS = 1
+    PAGE_TRANSFERS = 2
+    PAGE_SETTINGS = 3
+
     def __init__(self, folder=None, network=None):
         super().__init__()
         self._quitting = False
         self._shutdown = False
         self.setWindowTitle("Brioche")
-        self.resize(1020, 730)
-        self.setMinimumSize(830, 620)
+        self.resize(1180, 760)
+        self.setMinimumSize(900, 620)
         self.store = DeviceStore(folder)
         self.network = network or EmbeddedNetwork(self.store.folder / "network")
         self.gate = SessionGate()
         self.file_gate = SessionGate()
         self._transfer_dialogs = {}
         self.hosts = {"lan": None, "tailscale": None}
-        self.remote = None
-        self._alive, self._busy, self._lan_busy, self._connecting = (
-            True,
-            False,
-            False,
-            False,
-        )
+        self.session_window = None
+        self.detached_windows = []
+        self._file_windows = []
+        self._alive = True
+        self._busy = False
+        self._lan_busy = False
+        self._connecting = False
         self._published_host = None
         self._auth_url = ""
         self._pair_cancel = threading.Event()
-        self._pair_dialog, self._incoming_pair_dialog = None, None
+        self._pair_dialog = None
+        self._incoming_pair_dialog = None
         self._misses = {}
+        self._tailscale_records = []
+        self._lan_records = []
+        self._unified_devices = []
+        self._active_group = None
+        self._group_buttons = []
+        self._local_ips_text = "未连接局域网"
+        self._lan_host_message = ""
+        self._nearby_lan_devices = []
+        self._dhcp_probing = set()
         self.environment = {
             "lan": [],
             "monitors": [],
@@ -100,55 +137,64 @@ class MainWindow(QMainWindow):
             },
         }
         self.lan_state = {}
+
         self.bridge = EnvironmentBridge(self)
         self.bridge.ready.connect(self.apply_environment)
         self.bridge.result.connect(self.job_result)
         self.bridge.pair_request.connect(self.confirm_pair)
         self.bridge.pair_code.connect(self.show_pair_code)
         self.bridge.host_status.connect(self.host_status)
+        self.bridge.host_clipboard.connect(self._apply_host_clipboard)
+        self.bridge.host_session_state.connect(self._on_host_session_state)
+        self.bridge.nearby_lan.connect(self._on_nearby_lan)
+
+        self.host_pill = HostSessionPill()
+        self.host_pill.pause_input_toggled.connect(self._set_hosts_input_paused)
+        self.host_pill.disconnect_requested.connect(self._disconnect_active_hosts)
         self.bridge.transfer_request.connect(self.confirm_transfer)
         self.bridge.transfer_progress.connect(self.transfer_progress)
+
+        self.host_clipboard_guard = ClipboardGuard()
+        self._qt_clipboard = QApplication.clipboard()
+        if self._qt_clipboard is not None:
+            self._qt_clipboard.dataChanged.connect(self._on_host_clipboard_changed)
+
+        # Build settings view first so all shared setting widgets exist
+        self.settings_view = SettingsView(self.store, self)
+        self._bind_settings_widgets()
+
+        # Root layout: Sidebar + Right Column (TopBar + Pages)
         root = QWidget()
-        row = QHBoxLayout(root)
-        row.setContentsMargins(16, 16, 16, 16)
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(210)
-        nav = QVBoxLayout(sidebar)
-        nav.setContentsMargins(18, 24, 18, 18)
-        brand = QLabel("Brioche")
-        brand.setObjectName("brand")
-        nav.addWidget(brand)
-        nav.addWidget(text("选择电脑，即刻连接。"))
-        nav.addSpacing(30)
+        shell = QHBoxLayout(root)
+        shell.setContentsMargins(14, 14, 14, 14)
+        shell.setSpacing(14)
+
+        sidebar = self._build_sidebar()
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(12)
+
+        topbar = self._build_topbar()
+        right_col.addWidget(topbar)
+
         self.pages = QStackedWidget()
-        self.pages.addWidget(self.internet_page())
-        self.pages.addWidget(self.lan_page())
-        self.pages.addWidget(self.settings_page())
-        transfer_page, transfer_layout = self.page('文件传输', '连接设备后，在远程窗口点击“文件互传”。接收前确认保存位置。')
-        self.transfer_board = TransferBoard();transfer_layout.addWidget(self.transfer_board,1)
-        self.pages.addWidget(transfer_page)
+        self.pages.addWidget(self._build_dashboard_page())
+        self.pages.addWidget(self._build_recents_page())
+        self.pages.addWidget(self._build_transfers_page())
+        self.pages.addWidget(self.settings_view)
         self.transitions = PageTransition(self.pages)
-        self.nav_buttons = []
-        for index, title in enumerate(("外网设备", "局域网设备", "设置", "文件传输")):
-            button = QPushButton(title)
-            button.setCheckable(True)
-            button.setObjectName('navButton')
-            button.clicked.connect(lambda checked=False, i=index: self.navigate(i))
-            self.nav_buttons.append(button)
-            nav.addWidget(button)
-        nav.addStretch()
-        nav.addWidget(text("远程分辨率"))
-        nav.addWidget(self.resolution)
-        nav.addWidget(self.match_display)
-        nav.addWidget(text("源屏匹配：断开后恢复\n目前支持 Ubuntu Xorg"))
-        nav.addSpacing(16)
-        nav.addWidget(text(f"v{__version__}\n局域网 · 内置 Tailscale"))
-        row.addWidget(sidebar)
-        row.addWidget(self.pages, 1)
+        right_col.addWidget(self.pages, 1)
+
+        shell.addWidget(sidebar)
+        shell.addLayout(right_col, 1)
         self.setCentralWidget(root)
-        self.navigate(0)
+
+        self._rebuild_group_sidebar()
+        self.navigate(self.PAGE_DEVICES)
+        self.apply_theme()
         self.apply_motion()
+        self._update_share_pill()
+
         self.poll = QTimer(self)
         self.poll.setInterval(300)
         self.poll.timeout.connect(self.poll_hosts)
@@ -161,230 +207,242 @@ class MainWindow(QMainWindow):
         self.lan_poll.setInterval(4000)
         self.lan_poll.timeout.connect(self.refresh_lan)
         self.lan_poll.start()
+
         self.refresh_environment()
         self.refresh_lan()
+        self.refresh_paired_devices()
+        self.lan_listener = LanBeaconListener(
+            local_pin_getter=self._local_host_pin,
+            on_change=lambda items: self.bridge.nearby_lan.emit(items) if self._alive else None,
+        )
+        self.lan_broadcaster = LanBeaconBroadcaster(self._beacon_host_info)
+        self.lan_listener.start()
+        self._sync_lan_broadcaster()
         from .display_mode import recover
 
         self.work("display_recovery", lambda: recover(self.store.folder))
+
         self.tray = QSystemTrayIcon(QApplication.instance().windowIcon(), self)
-        self.tray.setToolTip('Brioche · 后台共享')
-        menu = QMenu(self)
-        menu.addAction('打开 Brioche', self.restore_window)
-        menu.addSeparator()
-        menu.addAction('退出 Brioche', self.quit_application)
-        self.tray.setContextMenu(menu)
+        self.tray.setToolTip("Brioche · 后台共享")
+        tray_menu = QMenu(self)
+        tray_menu.addAction("打开 Brioche", self.restore_window)
+        tray_menu.addSeparator()
+        tray_menu.addAction("退出 Brioche", self.quit_application)
+        self.tray.setContextMenu(tray_menu)
         self.tray.activated.connect(self.tray_activated)
         self.tray.show()
         QApplication.instance().aboutToQuit.connect(self.shutdown)
 
-    def navigate(self, index):
-        self.transitions.show(index, not self.store.setting('reduced_motion', False))
-        for i, button in enumerate(self.nav_buttons):
-            button.setChecked(i == index)
+    # ------------------------------------------------------------------
+    # Layout builders
+    # ------------------------------------------------------------------
+    def _build_sidebar(self):
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(214)
+        nav = QVBoxLayout(sidebar)
+        nav.setContentsMargins(14, 20, 14, 14)
+        nav.setSpacing(6)
 
-    @staticmethod
-    def page(title, subtitle):
+        brand = QLabel("Brioche")
+        brand.setObjectName("brand")
+        nav.addWidget(brand)
+        tagline = text("选择电脑，即刻连接。")
+        nav.addWidget(tagline)
+        nav.addSpacing(14)
+
+        self.nav_buttons = []
+        nav_items = (
+            (self.PAGE_DEVICES, "我的设备"),
+            (self.PAGE_RECENTS, "最近连接"),
+            (self.PAGE_TRANSFERS, "文件传输"),
+            (self.PAGE_SETTINGS, "设置"),
+        )
+        for index, title in nav_items:
+            button = QPushButton(title)
+            button.setCheckable(True)
+            button.setObjectName("navButton")
+            button.clicked.connect(lambda checked=False, i=index: self._nav_clicked(i))
+            self.nav_buttons.append(button)
+            nav.addWidget(button)
+
+        nav.addSpacing(10)
+        self.group_header = QLabel("分组")
+        self.group_header.setObjectName("sectionLabel")
+        nav.addWidget(self.group_header)
+        self.groups_layout = QVBoxLayout()
+        self.groups_layout.setContentsMargins(0, 0, 0, 0)
+        self.groups_layout.setSpacing(3)
+        nav.addLayout(self.groups_layout)
+
+        nav.addStretch()
+
+        # Mini Tailscale account status card
+        account_card = QFrame()
+        account_card.setObjectName("miniCard")
+        ac_layout = QVBoxLayout(account_card)
+        ac_layout.setContentsMargins(12, 10, 12, 10)
+        ac_layout.setSpacing(6)
+        self.sidebar_account_label = QLabel("正在检查外网账号…")
+        self.sidebar_account_label.setObjectName("muted")
+        self.sidebar_account_label.setWordWrap(True)
+        self.sidebar_login_btn = QPushButton("登录 Tailscale")
+        self.sidebar_login_btn.setObjectName("primary")
+        self.sidebar_login_btn.clicked.connect(self.account_action)
+        ac_layout.addWidget(self.sidebar_account_label)
+        ac_layout.addWidget(self.sidebar_login_btn)
+        nav.addWidget(account_card)
+
+        # Quick theme toggle + version
+        footer = QHBoxLayout()
+        footer.setContentsMargins(2, 4, 2, 0)
+        self.theme_toggle_btn = QPushButton("主题")
+        self.theme_toggle_btn.setObjectName("ghost")
+        self.theme_toggle_btn.clicked.connect(self.cycle_theme)
+        ver = QLabel(f"v{__version__}")
+        ver.setObjectName("muted")
+        footer.addWidget(self.theme_toggle_btn)
+        footer.addStretch()
+        footer.addWidget(ver)
+        nav.addLayout(footer)
+        return sidebar
+
+    def _build_topbar(self):
+        bar = QFrame()
+        bar.setObjectName("topbar")
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(14, 10, 14, 10)
+        row.setSpacing(10)
+
+        self.search_input = QLineEdit()
+        self.search_input.setObjectName("searchInput")
+        self.search_input.setPlaceholderText("搜索设备名称、备注、IP 或分组…")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.textChanged.connect(self._on_search_changed)
+        row.addWidget(self.search_input, 1)
+
+        self.add_lan_btn = QPushButton("+ 添加局域网设备")
+        self.add_lan_btn.clicked.connect(self.open_add_lan_dialog)
+        row.addWidget(self.add_lan_btn)
+
+        self.share_pill = QPushButton("○ 本机未共享")
+        self.share_pill.setObjectName("sharePillOffline")
+        self.share_pill.clicked.connect(self._open_share_menu)
+        row.addWidget(self.share_pill)
+        return bar
+
+    def _build_dashboard_page(self):
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(4, 2, 0, 0)
+        outer.setSpacing(10)
+
+        # Filter pills + subtle live note
+        header = QHBoxLayout()
+        header.setSpacing(10)
+        self.filter_bar = FilterPillBar()
+        self.filter_bar.changed.connect(self._on_filter_changed)
+        header.addWidget(self.filter_bar, 1)
+        self.dashboard_note = QLabel("单击设备查看配置，双击立即连接。")
+        self.dashboard_note.setObjectName("muted")
+        header.addWidget(self.dashboard_note)
+        outer.addLayout(header)
+
+        # Main workspace split: Unified Device Grid + Collapsible Inspector Drawer
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        left_col = QVBoxLayout()
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(8)
+
+        self.device_list = DeviceList()
+        self.device_list.itemClicked.connect(self._device_selected)
+        self.device_list.itemDoubleClicked.connect(self._device_activated)
+        self.device_list.itemActivated.connect(self._device_activated)
+        self.device_list.context_requested.connect(self._device_context_menu)
+        left_col.addWidget(self.device_list, 1)
+
+        self.empty_label = text("暂无设备。登录 Tailscale 显示同账号设备，或点击右上角“+ 添加局域网设备”。")
+        left_col.addWidget(self.empty_label)
+
+        self.drawer = DeviceInspectorDrawer(self)
+        self.drawer.connect_requested.connect(self.connect_unified_device)
+        self.drawer.files_requested.connect(self.open_device_file_manager)
+        self.drawer.profile_changed.connect(self._on_device_profile_changed)
+        self.drawer.remove_lan_requested.connect(self._remove_lan_by_endpoint)
+
+        body.addLayout(left_col, 1)
+        body.addWidget(self.drawer)
+        outer.addLayout(body, 1)
+        return page
+
+    def _build_recents_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(24, 20, 16, 12)
-        layout.addWidget(text(title, True))
-        layout.addWidget(text(subtitle))
-        layout.addSpacing(12)
-        return page, layout
-
-    def internet_page(self):
-        page, layout = self.page(
-            "外网设备", "同一账号的电脑会自动出现，在线且已允许共享时点击即可连接。"
-        )
-        account = QHBoxLayout()
-        self.account_status = text("正在检查账号…")
-        self.login_button = QPushButton("登录 Tailscale")
-        self.login_button.setObjectName("primary")
-        self.login_button.clicked.connect(self.account_action)
-        account.addWidget(self.account_status, 1)
-        account.addWidget(self.login_button)
-        layout.addLayout(account)
-        self.internet_list = DeviceList()
-        self.internet_list.itemClicked.connect(self.internet_clicked)
-        self.internet_list.itemActivated.connect(self.internet_clicked)
-        layout.addWidget(self.internet_list, 1)
-        self.internet_empty = text("登录后，设备状态会自动更新。")
-        layout.addWidget(self.internet_empty)
-        self.external_allowed = QCheckBox("允许同账号设备连接这台电脑（记住此选择）")
-        self.external_allowed.setChecked(
-            bool(self.store.setting("external_allowed", False))
-        )
-        self.external_allowed.toggled.connect(self.share_preference)
-        layout.addWidget(self.external_allowed)
-        self.external_note = text("未开启本机外网共享")
-        layout.addWidget(self.external_note)
+        layout.setContentsMargins(8, 6, 4, 4)
+        layout.setSpacing(10)
+        layout.addWidget(text("最近连接", True))
+        layout.addWidget(text("按最近使用时间排列，双击在线设备可快速重连。"))
+        self.recent_list = DeviceList()
+        self.recent_list.itemDoubleClicked.connect(self._device_activated)
+        self.recent_list.itemActivated.connect(self._device_activated)
+        self.recent_list.itemClicked.connect(self._recent_selected)
+        layout.addWidget(self.recent_list, 1)
+        self.recent_empty = text("暂无连接记录，连接过任意设备后会显示在这里。")
+        layout.addWidget(self.recent_empty)
         return page
 
-    def lan_page(self):
-        page, layout = self.page(
-            "局域网设备",
-            "输入对方 IP 查找并添加。首次由对方确认配对，以后直接点击连接。",
-        )
-        search = QHBoxLayout()
-        self.lan_ip = QLineEdit()
-        self.lan_ip.setPlaceholderText("例如 192.168.1.8")
-        self.lan_ip.returnPressed.connect(self.find_lan)
-        self.find_button = QPushButton("查找并添加")
-        self.find_button.setObjectName("primary")
-        self.find_button.clicked.connect(self.find_lan)
-        search.addWidget(self.lan_ip, 1)
-        search.addWidget(self.find_button)
-        layout.addLayout(search)
-        self.lan_list = DeviceList()
-        self.lan_list.itemClicked.connect(self.lan_clicked)
-        self.lan_list.itemActivated.connect(self.lan_clicked)
-        layout.addWidget(self.lan_list, 1)
-        actions = QHBoxLayout()
-        self.lan_note = text("目录会保存在本机，不进行网段扫描。")
-        remove = QPushButton("移除选中设备")
-        remove.clicked.connect(self.remove_lan)
-        actions.addWidget(self.lan_note, 1)
-        actions.addWidget(remove)
-        layout.addLayout(actions)
-        self.lan_allowed = QCheckBox("允许局域网设备连接这台电脑（首次配对需本机确认）")
-        self.lan_allowed.setChecked(bool(self.store.setting("lan_allowed", False)))
-        self.lan_allowed.toggled.connect(self.share_preference)
-        layout.addWidget(self.lan_allowed)
-        self.local_address = text("正在读取本机 IP…")
-        layout.addWidget(self.local_address)
+    def _build_transfers_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 6, 4, 4)
+        layout.setSpacing(10)
+        layout.addWidget(text("文件传输", True))
+        layout.addWidget(text("连接设备后，在远程窗口点击“文件互传”。接收前确认保存位置。"))
+        self.transfer_board = TransferBoard()
+        layout.addWidget(self.transfer_board, 1)
         return page
 
-    def settings_page(self):
-        content, layout = self.page(
-            "设置", "常用操作留在设备页，画质与共享选项在这里调整。"
-        )
-        form = QFormLayout()
-        self.profile = QComboBox()
-        for label, data in (
-            ("均衡 · 2K / 60 FPS", (60, 16)),
-            ("高刷 · 2K / 90 FPS", (90, 20)),
-            ("极致 · 2K / 144 FPS", (144, 35)),
-            ("自定义", None),
-        ):
-            self.profile.addItem(label, data)
-        self.monitor = QComboBox()
-        self.mode = QComboBox()
-        self.mode.addItem("允许鼠标键盘控制", False)
-        self.mode.addItem("仅查看画面", True)
-        self.mode.setCurrentIndex(1 if self.store.setting("view_only", False) else 0)
-        form.addRow("连接画质", self.profile)
-        form.addRow("默认共享屏幕", self.monitor)
-        form.addRow("本机访问权限", self.mode)
-        layout.addLayout(form)
-        self.settings_note = text(
-            "共享过程中修改屏幕、编码或权限设置，将在下次开启共享时生效。"
-        )
-        layout.addWidget(self.settings_note)
-        self.web_enabled = QCheckBox("允许局域网浏览器访问")
-        self.web_enabled.setChecked(bool(self.store.setting("web_enabled", False)))
-        layout.addWidget(self.web_enabled)
-        self.file_enabled = QCheckBox('允许文件互传（接收前确认）')
-        self.file_enabled.setChecked(bool(self.store.setting('files_enabled', True)))
-        self.file_enabled.toggled.connect(self.save_settings)
-        layout.addWidget(self.file_enabled)
-        self.reduced_motion = QCheckBox('减少动态效果')
-        self.reduced_motion.setChecked(bool(self.store.setting('reduced_motion', False)))
-        self.reduced_motion.toggled.connect(self.apply_motion)
-        layout.addWidget(self.reduced_motion)
-        if platform.system() == 'Darwin':
-            self.mac_permission_status = text('正在检查 Mac 共享权限…')
-            layout.addWidget(self.mac_permission_status)
-            permissions = QHBoxLayout()
-            capture_permission=QPushButton('屏幕录制权限')
-            capture_permission.clicked.connect(lambda:self.mac_permission('screen'))
-            input_permission=QPushButton('辅助功能权限')
-            input_permission.clicked.connect(lambda:self.mac_permission('input'))
-            permissions.addWidget(capture_permission);permissions.addWidget(input_permission)
-            layout.addLayout(permissions)
-            layout.addWidget(text('共享这台 Mac 需屏幕录制权限，远程操作另需辅助功能；授权后重新打开 Brioche。'))
-        browser = QPushButton("复制浏览器链接")
-        browser.clicked.connect(self.copy_browser)
-        layout.addWidget(browser)
-        advanced = QWidget()
-        advanced_form = QFormLayout(advanced)
-        advanced_form.setContentsMargins(0, 0, 0, 0)
-        self.address = QComboBox()
-        advanced_form.addRow("局域网共享地址", self.address)
-        self.port = QSpinBox()
-        self.port.setRange(1024, 65535)
-        self.port.setValue(int(self.store.setting("port", 47995)))
-        self.web_port = QSpinBox()
-        self.web_port.setRange(1024, 65535)
-        self.web_port.setValue(int(self.store.setting("web_port", 47996)))
-        self.encoder = QComboBox()
-        self.encoder.addItem("自动 · 优先可用硬件编码", "auto")
-        self.encoder.addItem("兼容 · 软件 H.264", "libx264")
-        if platform.system() == 'Linux':
-            self.encoder.addItem('防频闪对照 · 兼容采集＋软件 H.264', 'stable')
-        self.encoder.setCurrentIndex(
-            max(0, self.encoder.findData(self.store.setting("encoder", "auto")))
-        )
-        self.resolution = QComboBox()
-        for label, value in (
-            ("2K 上限", "1440p"),
-            ("1080p 上限", "1080p"),
-            ("720p 上限", "720p"),
-            ("原生 · 最高4K", "native"),
-        ):
-            self.resolution.addItem(label, value)
-        self.resolution.setCurrentIndex(
-            max(0, self.resolution.findData(self.store.setting("resolution", "1440p")))
-        )
-        self.match_display = QCheckBox("源屏也匹配")
-        self.match_display.setChecked(bool(self.store.setting("match_display", False)))
-        self.match_display.setEnabled(self.resolution.currentData() != "native")
-        self.match_display.setToolTip(
-            "临时调整被控电脑的屏幕分辨率，正常断开后恢复。需要 Ubuntu Xorg 和允许键鼠控制；不勾选时只缩放视频。"
-        )
-        self.match_display.toggled.connect(self.save_settings)
-        self.fps = QComboBox()
-        for fps in FRAME_RATES:
-            self.fps.addItem(f"{fps} FPS", fps)
-        self.fps.setCurrentIndex(
-            max(0, self.fps.findData(self.store.setting("fps", 60)))
-        )
-        self.bitrate = QSpinBox()
-        self.bitrate.setRange(2, 80)
-        self.bitrate.setValue(int(self.store.setting("bitrate", 16)))
-        self.bitrate.setSuffix(" Mbps")
-        for title, widget in (
-            ("共享端口", self.port),
-            ("浏览器端口", self.web_port),
-            ("编码策略", self.encoder),
-            ("帧率上限", self.fps),
-            ("目标码率", self.bitrate),
-        ):
-            advanced_form.addRow(title, widget)
-        self.legacy_code = QLineEdit()
-        self.legacy_code.setEchoMode(QLineEdit.EchoMode.Password)
-        self.legacy_code.setPlaceholderText("兼容旧版连接码（可选）")
-        legacy = QPushButton("使用连接码")
-        legacy.clicked.connect(self.connect_legacy)
-        advanced_form.addRow(self.legacy_code, legacy)
-        clear = QPushButton("撤销本机所有局域网配对")
-        clear.clicked.connect(self.clear_pairs)
-        advanced_form.addRow(clear)
-        exit_button = QPushButton('退出 Brioche')
-        exit_button.clicked.connect(self.quit_application)
-        layout.addWidget(text('关闭主窗口会收起到托盘；没有托盘时最小化。共享与文件传输继续运行。'))
-        layout.addWidget(exit_button)
-        self.advanced_toggle = QPushButton("高级设置 ▸")
-        self.advanced_toggle.setCheckable(True)
-        self.advanced_toggle.toggled.connect(advanced.setVisible)
-        self.advanced_toggle.toggled.connect(
-            lambda opened: self.advanced_toggle.setText(
-                "收起高级设置 ▾" if opened else "高级设置 ▸"
-            )
-        )
-        layout.addWidget(self.advanced_toggle)
-        layout.addWidget(advanced)
-        advanced.hide()
-        self.connect_advanced = advanced
+    def _bind_settings_widgets(self):
+        sv = self.settings_view
+        self.theme_combo = sv.theme_combo
+        self.device_name = sv.device_name
+        self.reduced_motion = sv.reduced_motion
+        self.profile = sv.profile
+        self.resolution = sv.resolution
+        self.fps = sv.fps
+        self.bitrate = sv.bitrate
+        self.encoder = sv.encoder
+        self.match_display = sv.match_display
+        self.external_allowed = sv.external_allowed
+        self.lan_allowed = sv.lan_allowed
+        self.monitor = sv.monitor
+        self.mode = sv.mode
+        self.file_enabled = sv.file_enabled
+        self.file_browser_enabled = sv.file_browser_enabled
+        self.clipboard_enabled = sv.clipboard_enabled
+        self.audio_enabled = sv.audio_enabled
+        self.host_pill_enabled = sv.host_pill_enabled
+        self.clipboard_mode = sv.clipboard_mode
+        self.auto_reconnect = sv.auto_reconnect
+        self.sync_audio = sv.sync_audio
+        self.account_status = sv.account_status
+        self.login_button = sv.login_button
+        self.external_note = sv.external_note
+        self.address = sv.address
+        self.port = sv.port
+        self.web_port = sv.web_port
+        self.web_enabled = sv.web_enabled
+        self.lan_beacon_enabled = sv.lan_beacon_enabled
+        self.legacy_code = sv.legacy_code
+        self.settings_note = sv.settings_note
+        if hasattr(sv, "mac_permission_status"):
+            self.mac_permission_status = sv.mac_permission_status
+            sv.mac_screen_btn.clicked.connect(lambda: self.mac_permission("screen"))
+            sv.mac_input_btn.clicked.connect(lambda: self.mac_permission("input"))
+
+        # Sync quality preset index
         preset = next(
             (
                 i
@@ -396,22 +454,442 @@ class MainWindow(QMainWindow):
             3,
         )
         self.profile.setCurrentIndex(preset)
+
+        # Wire signals
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_combo_changed)
+        self.device_name.editingFinished.connect(
+            lambda: self.store.set_name(self.device_name.text())
+        )
+        self.reduced_motion.toggled.connect(self.apply_motion)
+        sv.exit_button.clicked.connect(self.quit_application)
+
         self.profile.currentIndexChanged.connect(self.apply_profile)
         for control in (self.resolution, self.fps):
             control.currentIndexChanged.connect(self.custom_profile)
         self.bitrate.valueChanged.connect(self.custom_profile)
+        self.match_display.toggled.connect(self.save_settings)
         for control in (self.mode, self.encoder, self.address, self.monitor):
             control.currentIndexChanged.connect(self.save_settings)
         for control in (self.port, self.web_port):
             control.valueChanged.connect(self.save_settings)
         self.web_enabled.toggled.connect(self.save_settings)
-        layout.addStretch()
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setWidget(content)
-        return scroll
+        self.lan_beacon_enabled.toggled.connect(self._on_beacon_toggled)
+        self.file_enabled.toggled.connect(self.save_settings)
+        self.file_browser_enabled.toggled.connect(self.save_settings)
+        self.clipboard_enabled.toggled.connect(self.save_settings)
+        self.audio_enabled.toggled.connect(self.save_settings)
+        self.host_pill_enabled.toggled.connect(self.save_settings)
+        self.clipboard_mode.currentIndexChanged.connect(self.save_settings)
+        self.auto_reconnect.toggled.connect(self.save_settings)
+        self.sync_audio.toggled.connect(self.save_settings)
+        self.external_allowed.toggled.connect(self.share_preference)
+        self.lan_allowed.toggled.connect(self.share_preference)
+        self.login_button.clicked.connect(self.account_action)
+        sv.copy_browser_btn.clicked.connect(self.copy_browser)
+        sv.clear_pairs_btn.clicked.connect(self.clear_pairs)
+        sv.legacy_btn.clicked.connect(self.connect_legacy)
 
+    # ------------------------------------------------------------------
+    # Navigation, Theme & Motion
+    # ------------------------------------------------------------------
+    def _nav_clicked(self, index):
+        if index == self.PAGE_DEVICES:
+            self._active_group = None
+            self._sync_group_buttons()
+            self._render_dashboard()
+        self.navigate(index)
+
+    def navigate(self, index):
+        self.transitions.show(index, not self.store.setting("reduced_motion", False))
+        for i, button in enumerate(self.nav_buttons):
+            button.setChecked(i == index and (index != self.PAGE_DEVICES or self._active_group is None))
+        if index == self.PAGE_RECENTS:
+            self._render_recents()
+
+    def apply_theme(self, preference=None):
+        pref = preference if preference is not None else self.store.setting("theme", "system")
+        if preference is not None:
+            self.store.configure(theme=pref)
+        resolved = resolve_mode(pref)
+        tokens = tokens_for(pref)
+        qss = build_stylesheet(pref)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(qss)
+        else:
+            self.setStyleSheet(qss)
+        self.device_list.apply_theme(tokens)
+        self.recent_list.apply_theme(tokens)
+        self.drawer.apply_theme(tokens)
+        self.settings_view.apply_theme(tokens)
+        label_map = {"light": "☀ 浅色", "dark": "🌙 深色", "system": f"◐ 自动({'深' if resolved == 'dark' else '浅'})"}
+        self.theme_toggle_btn.setText(label_map.get(pref, "◐ 自动"))
+        idx = self.theme_combo.findData(pref)
+        if idx >= 0 and self.theme_combo.currentIndex() != idx:
+            self.theme_combo.blockSignals(True)
+            self.theme_combo.setCurrentIndex(idx)
+            self.theme_combo.blockSignals(False)
+
+    def _on_theme_combo_changed(self):
+        self.apply_theme(self.theme_combo.currentData())
+
+    def cycle_theme(self):
+        order = ("light", "dark", "system")
+        current = self.store.setting("theme", "system")
+        nxt = order[(order.index(current) + 1) % len(order)] if current in order else "dark"
+        self.apply_theme(nxt)
+
+    def apply_motion(self):
+        enabled = not self.reduced_motion.isChecked()
+        self.store.configure(reduced_motion=not enabled)
+        for widget in (self.device_list, self.recent_list):
+            widget.set_animations(enabled)
+        if not enabled and hasattr(self, "transitions"):
+            self.transitions.show(self.pages.currentIndex(), False)
+
+    # ------------------------------------------------------------------
+    # Unified Device Aggregation, Filtering & Inspector
+    # ------------------------------------------------------------------
+    def _rebuild_unified(self):
+        self._unified_devices = build_unified_devices(
+            self._tailscale_records, self._lan_records, self.store
+        )
+        self._rebuild_group_sidebar()
+        self._render_dashboard()
+        if self.pages.currentIndex() == self.PAGE_RECENTS:
+            self._render_recents()
+
+    def _rebuild_group_sidebar(self):
+        while self.groups_layout.count():
+            item = self.groups_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._group_buttons = []
+        groups = self.store.all_groups()
+        self.group_header.setVisible(bool(groups))
+        for name, count in groups:
+            btn = QPushButton(f"• {name} ({count})")
+            btn.setCheckable(True)
+            btn.setObjectName("groupButton")
+            btn.setProperty("group_name", name)
+            btn.clicked.connect(lambda checked=False, g=name: self._select_group(g))
+            self.groups_layout.addWidget(btn)
+            self._group_buttons.append(btn)
+        if self._active_group and not any(g == self._active_group for g, _ in groups):
+            self._active_group = None
+        self._sync_group_buttons()
+
+    def _select_group(self, group_name):
+        self._active_group = None if self._active_group == group_name else group_name
+        self._sync_group_buttons()
+        self.navigate(self.PAGE_DEVICES)
+        self._render_dashboard()
+
+    def _sync_group_buttons(self):
+        for btn in self._group_buttons:
+            btn.setChecked(btn.property("group_name") == self._active_group)
+        if self.pages.currentIndex() == self.PAGE_DEVICES:
+            self.nav_buttons[0].setChecked(self._active_group is None)
+
+    def _on_search_changed(self, _text):
+        if self.pages.currentIndex() != self.PAGE_DEVICES:
+            self.navigate(self.PAGE_DEVICES)
+        self._render_dashboard()
+
+    def _on_filter_changed(self, _category):
+        self._render_dashboard()
+
+    def _render_dashboard(self):
+        all_devs = self._unified_devices
+        self.filter_bar.update_counts(
+            {
+                "all": len(all_devs),
+                "online": sum(1 for d in all_devs if d["online"]),
+                "favorite": sum(1 for d in all_devs if d["favorite"]),
+                "lan": sum(1 for d in all_devs if "lan" in d["channels"]),
+                "tailscale": sum(1 for d in all_devs if "tailscale" in d["channels"]),
+            }
+        )
+        visible = filter_devices(
+            all_devs,
+            query=self.search_input.text(),
+            category=self.filter_bar.current,
+            group=self._active_group,
+        )
+        self._render_device_list(self.device_list, visible)
+
+        if visible:
+            self.empty_label.hide()
+        else:
+            self.empty_label.show()
+            if all_devs:
+                self.empty_label.setText("没有符合当前筛选条件的设备，尝试清空搜索或切换分类。")
+            elif self.environment["tailscale"]["ready"]:
+                self.empty_label.setText("暂无同账号设备。请在另一台电脑登录同一 Tailscale 账号，或点击“+ 添加局域网设备”。")
+            else:
+                self.empty_label.setText("登录后自动显示同账号外网设备；也可点击右上角“+ 添加局域网设备”免登录连接。")
+
+        # Keep open inspector drawer fresh
+        if self.drawer.isVisible() and self.drawer.current_key:
+            updated = next((d for d in all_devs if d["key"] == self.drawer.current_key), None)
+            if updated:
+                self.drawer.show_device(updated)
+            else:
+                self.drawer._close()
+
+    def _render_recents(self):
+        by_key = {d["key"]: d for d in self._unified_devices}
+        recents = []
+        for entry in self.store.recent_connections():
+            live = by_key.get(entry["key"])
+            if live:
+                recents.append(
+                    {
+                        **live,
+                        "status_text": f"{live['status_text']}  ·  {_format_recent_time(entry.get('connected_at'))}",
+                    }
+                )
+            else:
+                recents.append(
+                    {
+                        "key": entry["key"],
+                        "name": entry.get("name", "未知设备"),
+                        "display_name": entry.get("name", "未知设备"),
+                        "platform": "",
+                        "channels": {},
+                        "active_mode": entry.get("mode"),
+                        "active_channel": None,
+                        "online": False,
+                        "connectable": False,
+                        "busy": False,
+                        "status_text": f"上次连接：{_format_recent_time(entry.get('connected_at'))}",
+                        "badge_text": "历史",
+                        "badge_tone": "offline",
+                        "ip": entry.get("address", ""),
+                        "favorite": False,
+                        "group": "",
+                        "profile": {},
+                    }
+                )
+        self._render_device_list(self.recent_list, recents)
+        self.recent_empty.setVisible(not recents)
+
+    @staticmethod
+    def _render_device_list(widget, devices):
+        selected = (
+            widget.currentItem().data(Qt.ItemDataRole.UserRole).get("key")
+            if widget.currentItem()
+            else None
+        )
+        existing = {
+            widget.item(i).data(Qt.ItemDataRole.UserRole)["key"]: widget.item(i)
+            for i in range(widget.count())
+        }
+        keep = set()
+        for idx, device in enumerate(devices):
+            key = device["key"]
+            keep.add(key)
+            item = existing.get(key)
+            if item is None:
+                item = QListWidgetItem()
+                size = (
+                    widget.gridSize()
+                    if isinstance(widget, DeviceList) and widget.gridSize().width() > 0
+                    else QSize(256, 214)
+                )
+                item.setSizeHint(size)
+                widget.insertItem(idx, item)
+                if isinstance(widget, DeviceList):
+                    widget.new_entry(key)
+            else:
+                current_row = widget.row(item)
+                if current_row != idx:
+                    taken = widget.takeItem(current_row)
+                    widget.insertItem(idx, taken)
+                    item = taken
+            item.setText(f"{device['display_name']}\n{device['status_text']}    ·    {device.get('ip', '')}")
+            item.setData(Qt.ItemDataRole.UserRole, device)
+            item.setToolTip(f"{device['display_name']} — {device['status_text']}")
+            if selected == key:
+                widget.setCurrentItem(item)
+        for key, item in existing.items():
+            if key not in keep:
+                widget.takeItem(widget.row(item))
+
+    def _device_selected(self, item):
+        device = item.data(Qt.ItemDataRole.UserRole)
+        if device:
+            self.drawer.show_device(device)
+
+    def _recent_selected(self, item):
+        device = item.data(Qt.ItemDataRole.UserRole)
+        if device and device.get("channels"):
+            self.navigate(self.PAGE_DEVICES)
+            self.drawer.show_device(device)
+
+    def _device_activated(self, item):
+        device = item.data(Qt.ItemDataRole.UserRole)
+        if device:
+            self.connect_unified_device(device)
+
+    def _device_context_menu(self, item, global_pos):
+        device = item.data(Qt.ItemDataRole.UserRole)
+        if not device:
+            return
+        menu = QMenu(self)
+        conn = menu.addAction("立即连接")
+        conn.setEnabled(bool(device.get("connectable")))
+        conn.triggered.connect(lambda: self.connect_unified_device(device))
+
+        files_act = menu.addAction("打开双栏文件管理器")
+        files_act.setEnabled(bool(device.get("connectable")))
+        files_act.triggered.connect(lambda: self.open_device_file_manager(device))
+
+        fav_label = "取消收藏" if device.get("favorite") else "收藏置顶"
+        fav = menu.addAction(fav_label)
+        fav.triggered.connect(lambda: self._toggle_device_favorite(device))
+
+        inspect = menu.addAction("设备详情与独立配置")
+        inspect.triggered.connect(lambda: self.drawer.show_device(device))
+
+        if "lan" in device.get("channels", {}):
+            menu.addSeparator()
+            lan = device["channels"]["lan"]
+            rem = menu.addAction("从局域网目录移除")
+            rem.triggered.connect(
+                lambda: self._remove_lan_by_endpoint(lan["ip"], int(lan.get("port", 47995)))
+            )
+        menu.exec(global_pos)
+
+    def _toggle_device_favorite(self, device):
+        new_fav = not bool(device.get("favorite"))
+        self.store.set_device_profile(device["key"], favorite=True if new_fav else None)
+        self._rebuild_unified()
+
+    def _on_device_profile_changed(self, device_key, payload):
+        self.store.set_device_profile(device_key, **payload)
+        self._rebuild_unified()
+
+    def _remove_lan_by_endpoint(self, ip, port):
+        self.store.remove(ip, port)
+        self.lan_state.pop((ip, port), None)
+        self.update_lan_list(list(self.lan_state.values()))
+
+    # ------------------------------------------------------------------
+    # Quick Share Popover & Add LAN Dialog
+    # ------------------------------------------------------------------
+    def _update_share_pill(self):
+        lan_on = self.lan_allowed.isChecked()
+        ext_on = self.external_allowed.isChecked()
+        parts = []
+        if lan_on:
+            parts.append("局域网")
+        if ext_on:
+            parts.append("外网")
+        if parts:
+            self.share_pill.setText("● 本机共享中 · " + "+".join(parts))
+            self.share_pill.setObjectName("sharePillOnline")
+        else:
+            self.share_pill.setText("○ 本机未共享")
+            self.share_pill.setObjectName("sharePillOffline")
+        self.share_pill.style().unpolish(self.share_pill)
+        self.share_pill.style().polish(self.share_pill)
+
+    def _open_share_menu(self):
+        menu = QMenu(self)
+        ext_act = menu.addAction("允许同账号外网连接本机")
+        ext_act.setCheckable(True)
+        ext_act.setChecked(self.external_allowed.isChecked())
+        ext_act.toggled.connect(self.external_allowed.setChecked)
+
+        lan_act = menu.addAction("允许局域网设备连接本机")
+        lan_act.setCheckable(True)
+        lan_act.setChecked(self.lan_allowed.isChecked())
+        lan_act.toggled.connect(self.lan_allowed.setChecked)
+
+        menu.addSeparator()
+        ip_act = menu.addAction(f"复制本机 IP：{self._local_ips_text}")
+        ip_act.setEnabled(self._local_ips_text != "未连接局域网")
+        ip_act.triggered.connect(
+            lambda: QApplication.clipboard().setText(self._local_ips_text.split("、")[0])
+        )
+
+        browser_act = menu.addAction("复制局域网浏览器链接")
+        browser_act.triggered.connect(self.copy_browser)
+
+        menu.addSeparator()
+        more_act = menu.addAction("打开共享与安全设置…")
+        more_act.triggered.connect(self._open_sharing_settings)
+        menu.exec(self.share_pill.mapToGlobal(self.share_pill.rect().bottomLeft()))
+
+    def _open_sharing_settings(self):
+        self.navigate(self.PAGE_SETTINGS)
+        self.settings_view.select_category(2)
+
+    def open_add_lan_dialog(self):
+        nearby = self.lan_listener.snapshot() if hasattr(self, "lan_listener") else self._nearby_lan_devices
+        dialog = AddLanDeviceDialog(self._local_ips_text, nearby_devices=nearby, parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            raw = dialog.value()
+            if raw:
+                self.find_lan(raw)
+
+    def _local_host_pin(self):
+        for host in self.hosts.values():
+            if host and host.pin:
+                return host.pin
+        return ""
+
+    def _beacon_host_info(self):
+        host = self.hosts.get("lan")
+        if not host or not host.ready.is_set() or host.stop_requested.is_set() or not host.pin:
+            return None
+        return {
+            "name": host.name,
+            "port": host.port,
+            "pin": host.pin,
+            "bind": host.bind,
+            "busy": host.session_gate.active,
+        }
+
+    def _sync_lan_broadcaster(self):
+        if not hasattr(self, "lan_broadcaster"):
+            return
+        if self.lan_allowed.isChecked() and self.lan_beacon_enabled.isChecked():
+            self.lan_broadcaster.start()
+        else:
+            self.lan_broadcaster.stop()
+
+    def _on_beacon_toggled(self):
+        self.save_settings()
+        self._sync_lan_broadcaster()
+
+    def _on_nearby_lan(self, items):
+        self._nearby_lan_devices = items
+        # Auto-heal saved LAN devices whose DHCP IP changed, verified by full TLS cert pin.
+        saved = self.store.devices()
+        for beacon in items:
+            prefix = beacon.get("pin_prefix")
+            if not prefix:
+                continue
+            for dev in saved:
+                pin = dev.get("pin") or dev.get("observed_pin") or ""
+                if not pin.startswith(prefix):
+                    continue
+                new_ep = (beacon["ip"], int(beacon["port"]))
+                if (dev["ip"], int(dev.get("port", 47995))) == new_ep:
+                    continue
+                if new_ep in self._dhcp_probing:
+                    continue
+                self._dhcp_probing.add(new_ep)
+                self.work(
+                    "dhcp_migrate",
+                    lambda ip=new_ep[0], port=new_ep[1], expected=pin: discover(ip, port, expected),
+                )
+
+    # ------------------------------------------------------------------
+    # Settings & StreamConfig
+    # ------------------------------------------------------------------
     def apply_profile(self):
         value = self.profile.currentData()
         if value:
@@ -423,8 +901,6 @@ class MainWindow(QMainWindow):
             for control in (self.resolution, self.fps, self.bitrate):
                 control.blockSignals(False)
             self.match_display.setEnabled(True)
-        else:
-            self.advanced_toggle.setChecked(True)
         self.save_settings()
 
     def custom_profile(self):
@@ -434,14 +910,15 @@ class MainWindow(QMainWindow):
         self.match_display.setEnabled(self.resolution.currentData() != "native")
         self.save_settings()
 
-    def stream_config(self):
-        return StreamConfig(
+    def stream_config(self, profile=None):
+        base = StreamConfig(
             self.resolution.currentData(),
             self.fps.currentData(),
             self.bitrate.value(),
             self.match_display.isChecked()
             and self.resolution.currentData() != "native",
         )
+        return effective_stream_config(base, profile) if profile else base
 
     def save_settings(self):
         if not hasattr(self, "address"):
@@ -459,44 +936,112 @@ class MainWindow(QMainWindow):
             bitrate=self.bitrate.value(),
             match_display=self.match_display.isChecked(),
             files_enabled=self.file_enabled.isChecked(),
+            file_browser_enabled=self.file_browser_enabled.isChecked(),
+            clipboard_enabled=self.clipboard_enabled.isChecked(),
+            audio_enabled=self.audio_enabled.isChecked(),
+            host_pill_enabled=self.host_pill_enabled.isChecked(),
+            clipboard_mode=self.clipboard_mode.currentData(),
+            auto_reconnect=self.auto_reconnect.isChecked(),
+            sync_audio=self.sync_audio.isChecked(),
+            lan_beacon_enabled=self.lan_beacon_enabled.isChecked(),
         )
         for host in self.hosts.values():
             if host:
                 host.files_enabled = self.file_enabled.isChecked() and not host.view_only
-                if not host.files_enabled:host.cancel_transfers()
+                host.file_browser_enabled = self.file_browser_enabled.isChecked() and not host.view_only
+                host.clipboard_enabled = self.clipboard_enabled.isChecked() and not host.view_only
+                host.audio_enabled = self.audio_enabled.isChecked()
+                if not host.files_enabled:
+                    host.cancel_transfers()
+        if not self.host_pill_enabled.isChecked():
+            self.host_pill.hide_session()
 
-    def apply_motion(self):
-        enabled = not self.reduced_motion.isChecked()
-        self.store.configure(reduced_motion=not enabled)
-        for widget in (self.internet_list,self.lan_list):widget.set_animations(enabled)
-        if not enabled and hasattr(self, 'transitions'):
-            self.transitions.show(self.pages.currentIndex(), False)
+    def _on_host_session_state(self, state):
+        if not self._alive:
+            return
+        if state.get("active") and self.host_pill_enabled.isChecked():
+            self.host_pill.show_session(
+                view_only=bool(state.get("view_only")),
+                input_paused=bool(state.get("input_paused")),
+            )
+        else:
+            self.host_pill.hide_session()
+
+    def _set_hosts_input_paused(self, paused):
+        for host in self.hosts.values():
+            if host and host.active:
+                host.set_input_paused(paused)
+
+    def _disconnect_active_hosts(self):
+        for host in self.hosts.values():
+            if host and host.active:
+                host.disconnect_viewer()
+        self.host_pill.hide_session()
+
+    def _apply_host_clipboard(self, text):
+        if (
+            not self._alive
+            or not self.clipboard_enabled.isChecked()
+            or self._qt_clipboard is None
+        ):
+            return
+        if self.host_clipboard_guard.accept_remote(text):
+            self._qt_clipboard.setText(text)
+
+    def _on_host_clipboard_changed(self):
+        if (
+            not self._alive
+            or not self.clipboard_enabled.isChecked()
+            or self._qt_clipboard is None
+        ):
+            return
+        active_hosts = [
+            h for h in self.hosts.values() if h and h.active and h.clipboard_enabled and not h.view_only
+        ]
+        if not active_hosts:
+            return
+        text = self._qt_clipboard.text()
+        if self.host_clipboard_guard.should_send_local(text):
+            for host in active_hosts:
+                host.push_clipboard(text)
 
     def mac_permission(self, kind):
-        from .mac_permissions import screen_allowed,input_allowed
-        allowed=(screen_allowed if kind=='screen' else input_allowed)(request=True)
-        self.settings_note.setText('权限已开启' if allowed else '请在系统偏好设置 → 安全性与隐私中授权；屏幕录制授权后需重新打开 Brioche。')
+        from .mac_permissions import input_allowed, screen_allowed
+
+        allowed = (screen_allowed if kind == "screen" else input_allowed)(request=True)
+        self.settings_note.setText(
+            "权限已开启"
+            if allowed
+            else "请在系统偏好设置 → 安全性与隐私中授权；屏幕录制授权后需重新打开 Brioche。"
+        )
         self.refresh_mac_permissions()
 
     def refresh_mac_permissions(self):
-        if not hasattr(self, 'mac_permission_status'):
+        if not hasattr(self, "mac_permission_status"):
             return
-        from .mac_permissions import screen_allowed,input_allowed
+        from .mac_permissions import input_allowed, screen_allowed
+
         try:
             screen, inputs = screen_allowed(), input_allowed()
             self.mac_permission_status.setText(
                 f'屏幕录制：{"已允许" if screen else "未允许，无法共享画面"}　'
-                f'辅助功能：{"已允许" if inputs else "未允许，无法远程操作"}')
+                f'辅助功能：{"已允许" if inputs else "未允许，无法远程操作"}'
+            )
         except Exception:
-            self.mac_permission_status.setText('无法检查 Mac 权限，请在系统偏好设置中确认')
+            self.mac_permission_status.setText("无法检查 Mac 权限，请在系统偏好设置中确认")
 
     def share_preference(self):
         self.store.configure(
             external_allowed=self.external_allowed.isChecked(),
             lan_allowed=self.lan_allowed.isChecked(),
         )
+        self._update_share_pill()
         self.ensure_hosts()
+        self._sync_lan_broadcaster()
 
+    # ------------------------------------------------------------------
+    # Background workers & Polling
+    # ------------------------------------------------------------------
     def work(self, operation, function):
         def run():
             result = {"op": operation}
@@ -544,15 +1089,22 @@ class MainWindow(QMainWindow):
         self.environment = result
         status = result["tailscale"]
         self.account_status.setText(status["message"])
+        self.sidebar_account_label.setText(status["message"])
         if login_url(status.get("auth_url", "")):
             self._auth_url = status["auth_url"]
         if status["ready"]:
             self._auth_url = ""
-        self.login_button.setText(
+        btn_label = (
             "账号 / 退出"
             if status["ready"]
             else "继续登录" if self._auth_url else "登录 Tailscale"
         )
+        self.login_button.setText(btn_label)
+        self.sidebar_login_btn.setText(btn_label)
+        self.sidebar_login_btn.setObjectName("ghost" if status["ready"] else "primary")
+        self.sidebar_login_btn.style().unpolish(self.sidebar_login_btn)
+        self.sidebar_login_btn.style().polish(self.sidebar_login_btn)
+
         for widget, entries in (
             (
                 self.address,
@@ -576,8 +1128,9 @@ class MainWindow(QMainWindow):
             if index >= 0:
                 widget.setCurrentIndex(index)
             widget.blockSignals(False)
+
         peers = status.get("peers", []) if status["ready"] else []
-        records = []
+        ts_records = []
         for peer in peers:
             ip = peer["ip"]
             alive = bool(peer.get("reachable", False))
@@ -587,7 +1140,7 @@ class MainWindow(QMainWindow):
                     "使用中"
                     if peer.get("busy")
                     else (
-                        "在线 · 点击连接"
+                        "在线 · 双击连接"
                         if peer.get("sharing")
                         else "在线 · 对方未允许共享"
                     )
@@ -598,71 +1151,21 @@ class MainWindow(QMainWindow):
                     if self._misses[ip] < 2 and peer.get("reported_online")
                     else "离线 / 未响应"
                 )
-            records.append(
-                (
-                    ip,
-                    peer.get("name", ip),
-                    label,
-                    {
-                        **peer,
-                        "online": alive,
-                        "connectable": alive
-                        and peer.get("sharing")
-                        and not peer.get("busy"),
-                    },
-                )
+            ts_records.append(
+                {
+                    **peer,
+                    "name": peer.get("name", ip),
+                    "online": alive,
+                    "connectable": alive
+                    and bool(peer.get("sharing"))
+                    and not peer.get("busy"),
+                    "status_text": label,
+                }
             )
-        self.render_list(self.internet_list, records)
-        self.internet_empty.setText(
-            "设备状态约每3秒更新；离线设备保留显示。"
-            if records
-            else (
-                "暂无同账号设备。请在另一台电脑打开新版 Brioche 并登录同一账号。"
-                if status["ready"]
-                else "登录后显示同一账号的设备，局域网无需登录。"
-            )
-        )
-        addresses = "、".join(a["ip"] for a in result["lan"]) or "未连接局域网"
-        self.local_address.setText("本机 IP：" + addresses)
+        self._tailscale_records = ts_records
+        self._local_ips_text = "、".join(a["ip"] for a in result["lan"]) or "未连接局域网"
+        self._rebuild_unified()
         self.ensure_hosts()
-
-    @staticmethod
-    def render_list(widget, records):
-        selected = (
-            widget.currentItem().data(Qt.ItemDataRole.UserRole).get("key")
-            if widget.currentItem()
-            else None
-        )
-        existing = {
-            widget.item(i).data(Qt.ItemDataRole.UserRole)["key"]: widget.item(i)
-            for i in range(widget.count())
-        }
-        keep = set()
-        for key, name, status, data in records:
-            keep.add(key)
-            item = existing.get(key)
-            if item is None:
-                item = QListWidgetItem(widget)
-                size=widget.gridSize() if isinstance(widget,DeviceList) and widget.gridSize().width()>0 else QSize(260,220)
-                item.setSizeHint(size)
-                if isinstance(widget,DeviceList):widget.new_entry(key)
-            item.setText(f'{name}\n{status}    ·    {data.get("ip", "")}')
-            item.setData(Qt.ItemDataRole.UserRole, {**data, "key": key,'display_name':name,'status_text':status})
-            item.setToolTip(status)
-            item.setForeground(
-                QColor(
-                    "#292823"
-                    if data.get("connectable")
-                    or data.get("online")
-                    or data.get("reachable")
-                    else "#8b867c"
-                )
-            )
-            if selected == key:
-                widget.setCurrentItem(item)
-        for key, item in existing.items():
-            if key not in keep:
-                widget.takeItem(widget.row(item))
 
     def refresh_lan(self):
         if self._lan_busy or not self._alive:
@@ -687,75 +1190,149 @@ class MainWindow(QMainWindow):
 
     def update_lan_list(self, results):
         self.lan_state = {(d["ip"], d["port"]): d for d in results}
-        records = []
+        lan_records = []
         for device in self.store.devices():
             key = (device["ip"], device["port"])
             state = self.lan_state.get(key, device)
-            online = state.get("online", False)
+            online = bool(state.get("online", False))
             status = (
                 (
                     "使用中"
                     if state.get("busy")
-                    else "在线 · 点击连接" if device.get("token") else "在线 · 点击配对"
+                    else "在线 · 双击连接" if device.get("token") else "在线 · 双击配对"
                 )
                 if online
                 else state.get("error", "待检测")
             )
-            records.append(
-                (
-                    f"{key[0]}:{key[1]}",
-                    device.get("name", device["ip"]),
-                    status,
-                    {**state, "connectable": online and not state.get("busy")},
-                )
+            lan_records.append(
+                {
+                    **device,
+                    **state,
+                    "name": device.get("name", device["ip"]),
+                    "online": online,
+                    "connectable": online and not state.get("busy"),
+                    "status_text": status,
+                }
             )
-        self.render_list(self.lan_list, records)
+        self._lan_records = lan_records
+        self._rebuild_unified()
 
-    def find_lan(self):
+    def find_lan(self, raw_text):
         try:
-            ip, port = target(self.lan_ip.text())
+            ip, port = target(raw_text)
         except ValueError as exc:
-            self.lan_note.setText(str(exc))
+            self.dashboard_note.setText(str(exc))
             return
-        self.find_button.setEnabled(False)
-        self.lan_note.setText("正在查找 Brioche…")
+        self.add_lan_btn.setEnabled(False)
+        self.dashboard_note.setText(f"正在查找 {ip}:{port}…")
         existing = next(
             (d for d in self.store.devices() if (d["ip"], d["port"]) == (ip, port)), {}
         )
         self.work("find", lambda: discover(ip, port, existing.get("pin")))
 
-    def remove_lan(self):
-        item = self.lan_list.currentItem()
-        if item:
-            data = item.data(Qt.ItemDataRole.UserRole)
-            self.store.remove(data["ip"], data["port"])
-            self.update_lan_list(list(self.lan_state.values()))
-
-    def internet_clicked(self, item):
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if not data.get("connectable"):
-            self.account_status.setText(
-                "设备需在线并允许外网共享，使用中的设备请先结束原连接。"
+    # ------------------------------------------------------------------
+    # Connection & Remote Session
+    # ------------------------------------------------------------------
+    def connect_unified_device(self, device):
+        if not device.get("connectable"):
+            self.dashboard_note.setText(
+                device.get("status_text") or "设备当前离线、未允许共享或正在使用中。"
             )
             return
-        self.connect_device("tailscale", data)
+        mode = device.get("active_mode")
+        channel = device.get("active_channel")
+        if not mode or not channel:
+            return
+        self.connect_device(
+            mode,
+            channel,
+            profile=device.get("profile"),
+            device_key=device.get("key"),
+            display_name=device.get("display_name", device.get("name", "")),
+        )
 
-    def lan_clicked(self, item):
-        data = item.data(Qt.ItemDataRole.UserRole)
-        if data.get("connectable"):
-            self.connect_device("lan", data)
-        else:
-            self.lan_note.setText(data.get("error", "对方尚未在线，或已有活动连接。"))
+    def open_device_file_manager(self, device):
+        if not device.get("connectable"):
+            self.dashboard_note.setText("设备当前离线或不可连接，无法打开文件管理器。")
+            return
+        mode = device.get("active_mode")
+        data = device.get("active_channel")
+        if not mode or not data:
+            return
+        display_name = device.get("display_name", device.get("name", ""))
+        self.dashboard_note.setText(f"正在打开 {display_name} 的文件管理器…")
 
-    def connect_device(self, mode, data):
-        if self.remote:
-            self.remote.raise_()
+        def resolve():
+            if mode == "tailscale":
+                uri = self.network.open_peer(data["ip"])
+            else:
+                remembered = next(
+                    (
+                        d
+                        for d in self.store.devices()
+                        if (d["ip"], d["port"]) == (data["ip"], data["port"])
+                    ),
+                    data,
+                )
+                if not remembered.get("token"):
+                    grant = pair(
+                        data["ip"],
+                        data["port"],
+                        data["observed_pin"],
+                        self.store.client_id,
+                        self.store.name,
+                        self.bridge.pair_code.emit,
+                        self._pair_cancel,
+                    )
+                    self.store.upsert({**remembered, **grant})
+                    remembered = {**remembered, **grant}
+                uri = access_uri(
+                    remembered["ip"],
+                    remembered["port"],
+                    remembered["pin"],
+                    remembered["token"],
+                )
+            return {"uri": uri, "display_name": display_name}
+
+        self.work("open_file_manager", resolve)
+
+    @property
+    def remote(self):
+        return self.session_window
+
+    @remote.setter
+    def remote(self, value):
+        self.session_window = value
+
+    def _all_session_windows(self):
+        windows = []
+        if self.session_window is not None:
+            windows.append(self.session_window)
+        windows.extend(self.detached_windows)
+        return windows
+
+    def _focus_existing_session(self, session_key):
+        if not session_key:
+            return False
+        for win in self._all_session_windows():
+            idx, _ = win.find_session(session_key)
+            if idx >= 0:
+                win.tabs.setCurrentIndex(idx)
+                win.showNormal()
+                win.raise_()
+                win.activateWindow()
+                return True
+        return False
+
+    def connect_device(self, mode, data, profile=None, device_key=None, display_name=""):
+        session_key = device_key or f"{mode}:{data['ip']}"
+        if self._focus_existing_session(session_key):
             return
         if self._connecting:
             return
         self._connecting = True
         self._pair_cancel.clear()
-        config = self.stream_config()
+        config = self.stream_config(profile)
 
         def connect():
             if mode == "tailscale":
@@ -787,7 +1364,14 @@ class MainWindow(QMainWindow):
                     remembered["pin"],
                     remembered["token"],
                 )
-            return {"uri": uri, "config": config, "mode": mode, "peer": data["ip"]}
+            return {
+                "uri": uri,
+                "config": config,
+                "mode": mode,
+                "peer": data["ip"],
+                "device_key": session_key,
+                "display_name": display_name or data.get("name", data["ip"]),
+            }
 
         self.work("connect", connect)
 
@@ -824,28 +1408,70 @@ class MainWindow(QMainWindow):
             self.settings_note.setText(str(exc))
 
     def open_remote(self, result):
-        from .ui import RemoteWindow
+        from .ui import SessionWindow
 
+        if result.get("device_key"):
+            self.store.record_recent(
+                result["device_key"],
+                result.get("display_name", result.get("peer", "")),
+                result["mode"],
+                result.get("peer", ""),
+            )
         callback = (
             (lambda: self.network.status(result["peer"]))
             if result["mode"] == "tailscale"
             else None
         )
-        self.remote = RemoteWindow(
+        if self.session_window is None:
+            win = SessionWindow()
+            win.closed.connect(self.remote_closed)
+            win.session_closed.connect(lambda _k: self.refresh_lan())
+            win.detach_window_created.connect(self._register_detached_window)
+            win.transfer_started.connect(self.transfer_board.add)
+            win.transfer_updated.connect(self.transfer_board.update_task)
+            self.session_window = win
+        reconnect_cb = (
+            (lambda peer=result["peer"]: self.network.open_peer(peer))
+            if result["mode"] == "tailscale" and result.get("peer")
+            else None
+        )
+        self.session_window.add_session(
             result["uri"],
             result["config"],
             network_mode=result["mode"],
             path_status=callback,
+            display_name=result.get("display_name") or result.get("peer", "远程桌面"),
+            session_key=result.get("device_key"),
+            reconnect_uri=reconnect_cb,
+            clipboard_mode=self.clipboard_mode.currentData() or "auto",
+            auto_reconnect=self.auto_reconnect.isChecked(),
+            audio_enabled=self.sync_audio.isChecked(),
         )
-        self.remote.closed.connect(self.remote_closed)
-        self.remote.transfer_started.connect(self.transfer_board.add)
-        self.remote.transfer_updated.connect(self.transfer_board.update_task)
-        self.remote.show()
+        self.session_window.show()
+        self.session_window.raise_()
+        self.session_window.activateWindow()
 
-    def remote_closed(self):
-        self.remote = None
+    def _register_detached_window(self, window):
+        self.detached_windows.append(window)
+        window.transfer_started.connect(self.transfer_board.add)
+        window.transfer_updated.connect(self.transfer_board.update_task)
+        window.session_closed.connect(lambda _k: self.refresh_lan())
+        window.closed.connect(
+            lambda w=window: self._detached_closed(w)
+        )
+
+    def _detached_closed(self, window):
+        if window in self.detached_windows:
+            self.detached_windows.remove(window)
         self.refresh_lan()
 
+    def remote_closed(self):
+        self.session_window = None
+        self.refresh_lan()
+
+    # ------------------------------------------------------------------
+    # Pairing, Hosts & Transfers
+    # ------------------------------------------------------------------
     def show_pair_code(self, code):
         if not self._connecting:
             return
@@ -875,7 +1501,10 @@ class MainWindow(QMainWindow):
         )
         dialog.setDefaultButton(QMessageBox.StandardButton.No)
         dialog.finished.connect(
-            lambda result: request.answer(result == QMessageBox.StandardButton.Yes)
+            lambda result: (
+                request.answer(result == QMessageBox.StandardButton.Yes),
+                QTimer.singleShot(200, self.refresh_paired_devices),
+            )
         )
         self._incoming_pair_dialog = dialog
         dialog.open()
@@ -922,17 +1551,26 @@ class MainWindow(QMainWindow):
                 on_pair=self.bridge.pair_request.emit,
                 session_gate=self.gate,
                 name=self.store.name,
-                files_enabled=self.file_enabled.isChecked() and not self.mode.currentData(),
+                files_enabled=self.file_enabled.isChecked()
+                and not self.mode.currentData(),
+                file_browser_enabled=self.file_browser_enabled.isChecked()
+                and not self.mode.currentData(),
                 on_transfer=self.bridge.transfer_request.emit,
                 on_transfer_progress=self.bridge.transfer_progress.emit,
                 file_gate=self.file_gate,
+                clipboard_enabled=self.clipboard_enabled.isChecked()
+                and not self.mode.currentData(),
+                on_clipboard=self.bridge.host_clipboard.emit,
+                audio_enabled=self.audio_enabled.isChecked(),
+                on_session_state=self.bridge.host_session_state.emit,
             )
             self.hosts[mode].start()
 
     def poll_hosts(self):
-        for task_id,(request,dialog) in list(self._transfer_dialogs.items()):
+        for task_id, (request, dialog) in list(self._transfer_dialogs.items()):
             if request.done.is_set():
-                dialog.reject();self._transfer_dialogs.pop(task_id,None)
+                dialog.reject()
+                self._transfer_dialogs.pop(task_id, None)
         for mode, host in list(self.hosts.items()):
             if host is None:
                 continue
@@ -965,31 +1603,42 @@ class MainWindow(QMainWindow):
     def host_status(self, mode, message):
         if mode == "tailscale":
             self.external_note.setText("本机外网共享：" + message)
-        elif self.environment["lan"]:
-            self.local_address.setText(
-                "本机 IP："
-                + "、".join(a["ip"] for a in self.environment["lan"])
-                + " · "
-                + message
-            )
+        else:
+            self._lan_host_message = message
+            self.dashboard_note.setText(f"局域网共享：{message}")
 
     def confirm_transfer(self, request):
         from PySide6.QtWidgets import QFileDialog
+
         if not self._alive:
-            request.respond();return
-        receiving=request.direction=='receive'
-        count=len(request.items)
-        names='、'.join(item['name'] for item in request.items[:3])[:140]
-        title=f'接收 {names}（{count}个文件），选择保存目录' if receiving else '对方请求文件：选择要发送的文件（最多32个）'
-        self.transfer_board.add(request.id,title,request.cancel)
-        self.navigate(3)
-        dialog=QFileDialog(self,title,downloads())
-        dialog.setFileMode(QFileDialog.FileMode.Directory if receiving else QFileDialog.FileMode.ExistingFiles)
-        if receiving:dialog.setOption(QFileDialog.Option.ShowDirsOnly,True)
-        dialog.filesSelected.connect(lambda paths:request.respond(paths[0] if receiving and paths else paths))
-        dialog.rejected.connect(lambda:request.respond())
-        dialog.finished.connect(lambda result:self._transfer_dialogs.pop(request.id,None))
-        self._transfer_dialogs[request.id]=(request,dialog)
+            request.respond()
+            return
+        receiving = request.direction == "receive"
+        count = len(request.items)
+        names = "、".join(item["name"] for item in request.items[:3])[:140]
+        title = (
+            f"接收 {names}（{count}个文件），选择保存目录"
+            if receiving
+            else "对方请求文件：选择要发送的文件（最多32个）"
+        )
+        self.transfer_board.add(request.id, title, request.cancel)
+        self.navigate(self.PAGE_TRANSFERS)
+        dialog = QFileDialog(self, title, downloads())
+        dialog.setFileMode(
+            QFileDialog.FileMode.Directory
+            if receiving
+            else QFileDialog.FileMode.ExistingFiles
+        )
+        if receiving:
+            dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        dialog.filesSelected.connect(
+            lambda paths: request.respond(paths[0] if receiving and paths else paths)
+        )
+        dialog.rejected.connect(lambda: request.respond())
+        dialog.finished.connect(
+            lambda result: self._transfer_dialogs.pop(request.id, None)
+        )
+        self._transfer_dialogs[request.id] = (request, dialog)
         dialog.open()
 
     def transfer_progress(self, value):
@@ -1002,28 +1651,49 @@ class MainWindow(QMainWindow):
             )
             if answer != QMessageBox.StandardButton.Yes:
                 return
-            if self.remote and self.remote.network_mode == "tailscale":
-                self.remote.close()
+            for win in list(self._all_session_windows()):
+                win.close_sessions_by_mode("tailscale")
             host = self.hosts["tailscale"]
             if host:
                 host.stop()
             self.work("logout", self.network.logout)
         else:
             self.login_button.setEnabled(False)
+            self.sidebar_login_btn.setEnabled(False)
             self.work("login", self.network.login)
 
     def copy_browser(self):
         host = self.hosts["lan"]
         if host and host.browser_url:
             QApplication.clipboard().setText(host.browser_url)
-            self.settings_note.setText(
+            msg = (
                 "浏览器链接已复制。首次访问请核对 HTTPS 证书 SHA256：\n"
                 + host.browser_pin
             )
+            self.settings_note.setText(msg)
+            self.dashboard_note.setText("已复制局域网浏览器链接")
         else:
-            self.settings_note.setText(
-                "请开启局域网共享和浏览器访问；修改浏览器选项后需要重新开启局域网共享。"
-            )
+            msg = "请开启局域网共享和浏览器访问；修改浏览器选项后需要重新开启局域网共享。"
+            self.settings_note.setText(msg)
+            self.dashboard_note.setText(msg)
+
+    def refresh_paired_devices(self):
+        host = self.hosts.get("lan")
+        from .lan import PairStore
+
+        store = host.pair_store if host and host.pair_store else PairStore(self.store.folder)
+        self.settings_view.set_paired_devices(store.list_pairs(), self.revoke_pair)
+
+    def revoke_pair(self, client_id):
+        host = self.hosts.get("lan")
+        from .lan import PairStore
+
+        store = host.pair_store if host and host.pair_store else PairStore(self.store.folder)
+        if store.revoke(client_id):
+            if host:
+                host.disconnect_viewer()
+            self.settings_note.setText("已撤销指定局域网设备的配对凭据")
+            self.refresh_paired_devices()
 
     def clear_pairs(self):
         host = self.hosts["lan"]
@@ -1040,6 +1710,7 @@ class MainWindow(QMainWindow):
             if host:
                 host.disconnect_viewer()
             self.settings_note.setText("局域网配对已撤销")
+            self.refresh_paired_devices()
 
     def job_result(self, result):
         operation = result["op"]
@@ -1049,6 +1720,7 @@ class MainWindow(QMainWindow):
             self._busy = False
             if error:
                 self.account_status.setText(error)
+                self.sidebar_account_label.setText(error)
             else:
                 self.apply_environment(value)
         elif operation == "lan":
@@ -1056,9 +1728,9 @@ class MainWindow(QMainWindow):
             if not error:
                 self.update_lan_list(value)
         elif operation == "find":
-            self.find_button.setEnabled(True)
+            self.add_lan_btn.setEnabled(True)
             if error:
-                self.lan_note.setText(
+                self.dashboard_note.setText(
                     "查找失败：" + error + "。请确认对方已开启局域网共享。"
                 )
             else:
@@ -1069,7 +1741,7 @@ class MainWindow(QMainWindow):
                         if k in ("ip", "port", "name", "platform", "observed_pin")
                     }
                 )
-                self.lan_note.setText("已加入目录，点击设备即可配对连接。")
+                self.dashboard_note.setText("已加入设备工作台，双击设备即可配对连接。")
                 self.refresh_lan()
         elif operation == "connect":
             self._connecting = False
@@ -1077,15 +1749,17 @@ class MainWindow(QMainWindow):
                 self._pair_dialog.close()
                 self._pair_dialog = None
             if error:
-                self.lan_note.setText(error)
+                self.dashboard_note.setText(error)
                 self.account_status.setText(error)
                 self.settings_note.setText(error)
             else:
                 self.open_remote(value)
         elif operation in ("login", "logout"):
             self.login_button.setEnabled(True)
+            self.sidebar_login_btn.setEnabled(True)
             if error:
                 self.account_status.setText(error)
+                self.sidebar_account_label.setText(error)
             elif operation == "login" and login_url(value.get("auth_url", "")):
                 self._auth_url = value["auth_url"]
                 QDesktopServices.openUrl(QUrl(self._auth_url))
@@ -1093,16 +1767,55 @@ class MainWindow(QMainWindow):
         elif operation == "publish" and error:
             self._published_host = None
             self.external_note.setText(error)
+        elif operation == "open_file_manager":
+            if self._pair_dialog:
+                self._pair_dialog.close()
+                self._pair_dialog = None
+            if error:
+                self.dashboard_note.setText(error)
+            else:
+                from .file_manager_ui import FileManagerWindow
+
+                win = FileManagerWindow(
+                    value["uri"], remote_name=value.get("display_name", "远端电脑"), parent=None
+                )
+                win.started.connect(self.transfer_board.add)
+                win.updated.connect(self.transfer_board.update_task)
+                win.finished.connect(
+                    lambda _r, w=win: self._file_windows.remove(w) if w in self._file_windows else None
+                )
+                self._file_windows.append(win)
+                win.show()
+                win.raise_()
+                win.activateWindow()
+        elif operation == "dhcp_migrate":
+            if not error and isinstance(value, dict):
+                self._dhcp_probing.discard((value["ip"], int(value["port"])))
+                self.store.upsert(
+                    {
+                        k: v
+                        for k, v in value.items()
+                        if k in ("ip", "port", "name", "platform", "observed_pin")
+                    }
+                )
+                self.dashboard_note.setText(f"已自动更新设备 {value.get('name', value['ip'])} 的最新局域网 IP：{value['ip']}")
+                self.refresh_lan()
         elif operation == "display_recovery" and error:
             self.settings_note.setText("临时分辨率恢复：" + error)
 
+    # ------------------------------------------------------------------
+    # Window / Tray Lifecycle
+    # ------------------------------------------------------------------
     def restore_window(self):
         self.showNormal()
         self.raise_()
         self.activateWindow()
 
     def tray_activated(self, reason):
-        if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
             self.restore_window()
 
     def quit_application(self):
@@ -1125,19 +1838,35 @@ class MainWindow(QMainWindow):
         if self._shutdown:
             return
         self._quitting = self._shutdown = True
-        if hasattr(self, 'tray'):
+        if hasattr(self, "tray"):
             self.tray.hide()
         self._alive = False
+        if self._qt_clipboard is not None:
+            try:
+                self._qt_clipboard.dataChanged.disconnect(self._on_host_clipboard_changed)
+            except (RuntimeError, TypeError):
+                pass
         self._pair_cancel.set()
         self.transfer_board.stop_all()
-        for request,dialog in list(self._transfer_dialogs.values()):request.cancel();dialog.reject()
+        for request, dialog in list(self._transfer_dialogs.values()):
+            request.cancel()
+            dialog.reject()
         self.poll.stop()
         self.network_poll.stop()
         self.lan_poll.stop()
+        if hasattr(self, "lan_broadcaster"):
+            self.lan_broadcaster.stop()
+        if hasattr(self, "lan_listener"):
+            self.lan_listener.stop()
         if self._incoming_pair_dialog:
             self._incoming_pair_dialog.close()
-        if self.remote:
-            self.remote.close()
+        if hasattr(self, "host_pill"):
+            self.host_pill.hide_session()
+            self.host_pill.close()
+        for fm in list(self._file_windows):
+            fm.close()
+        for win in list(self._all_session_windows()):
+            win.close()
         for host in self.hosts.values():
             if host:
                 host.stop()
