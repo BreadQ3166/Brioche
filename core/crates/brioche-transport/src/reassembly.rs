@@ -1,0 +1,221 @@
+//! Zero-head-of-line-blocking video frame assembler with automatic RS-FEC reconstruction,
+//! selective NACK suggestions, and PLI escalation on unrecoverable loss.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use brioche_proto::{PacketHeader, PacketKind};
+
+use crate::fec::{join_shards_into_frame, reconstruct_data};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssembledFrame {
+    pub stream_id: u16,
+    pub frame_id: u32,
+    pub flags: u16,
+    pub capture_ts_us: u64,
+    pub recovered_via_fec: bool,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssemblerEvent {
+    FrameReady(AssembledFrame),
+    RequestNack {
+        stream_id: u16,
+        frame_id: u32,
+        missing_shards: Vec<u16>,
+    },
+    RequestPli {
+        stream_id: u16,
+        dropped_frame_id: u32,
+    },
+}
+
+struct PendingFrame {
+    stream_id: u16,
+    flags: u16,
+    capture_ts_us: u64,
+    data_shards: usize,
+    fec_shards: usize,
+    shards: Vec<Option<Vec<u8>>>,
+    received_count: usize,
+    first_seen: Instant,
+    nack_sent: bool,
+}
+
+pub struct FrameAssembler {
+    stream_id: u16,
+    last_emitted_frame: Option<u32>,
+    max_pending_frames: usize,
+    max_frame_wait: Duration,
+    pending: BTreeMap<u32, PendingFrame>,
+    pub stats_frames_ok: u64,
+    pub stats_frames_fec_recovered: u64,
+    pub stats_frames_dropped: u64,
+}
+
+impl FrameAssembler {
+    pub fn new(stream_id: u16) -> Self {
+        Self {
+            stream_id,
+            last_emitted_frame: None,
+            max_pending_frames: 6,
+            max_frame_wait: Duration::from_millis(45),
+            pending: BTreeMap::new(),
+            stats_frames_ok: 0,
+            stats_frames_fec_recovered: 0,
+            stats_frames_dropped: 0,
+        }
+    }
+
+    pub fn reset_stream(&mut self, stream_id: u16) {
+        self.stream_id = stream_id;
+        self.last_emitted_frame = None;
+        self.pending.clear();
+    }
+
+    pub fn push_shard(
+        &mut self,
+        header: PacketHeader,
+        payload: Vec<u8>,
+        now: Instant,
+    ) -> Vec<AssemblerEvent> {
+        let mut events = Vec::new();
+        if !matches!(header.kind, PacketKind::VideoData | PacketKind::VideoFec) {
+            return events;
+        }
+        if header.stream_id != self.stream_id {
+            if header.stream_id > self.stream_id {
+                self.reset_stream(header.stream_id);
+            } else {
+                return events;
+            }
+        }
+        if let Some(last) = self.last_emitted_frame {
+            if header.frame_id <= last {
+                return events; // Late shard for already completed/skipped frame
+            }
+        }
+
+        let k = header.data_shards as usize;
+        let m = header.fec_shards as usize;
+        let total = k + m;
+        let shard_idx = header.shard_idx as usize;
+        if k == 0 || shard_idx >= total {
+            return events;
+        }
+
+        let entry = self.pending.entry(header.frame_id).or_insert_with(|| PendingFrame {
+            stream_id: header.stream_id,
+            flags: header.flags,
+            capture_ts_us: header.capture_ts_us,
+            data_shards: k,
+            fec_shards: m,
+            shards: vec![None; total],
+            received_count: 0,
+            first_seen: now,
+            nack_sent: false,
+        });
+
+        if entry.shards.len() == total && entry.shards[shard_idx].is_none() {
+            entry.shards[shard_idx] = Some(payload);
+            entry.received_count += 1;
+        }
+
+        if entry.received_count >= entry.data_shards {
+            let pending = self.pending.remove(&header.frame_id).unwrap();
+            let had_missing_data = pending.shards[..pending.data_shards]
+                .iter()
+                .any(|s| s.is_none());
+            if let Ok(data_shards) =
+                reconstruct_data(&pending.shards, pending.data_shards, pending.fec_shards)
+            {
+                if let Ok(frame_bytes) = join_shards_into_frame(&data_shards) {
+                    // Drop any older incomplete frames immediately (zero head-of-line blocking!)
+                    let stale: Vec<u32> = self
+                        .pending
+                        .keys()
+                        .copied()
+                        .filter(|&fid| fid < header.frame_id)
+                        .collect();
+                    for stale_id in stale {
+                        self.pending.remove(&stale_id);
+                        self.stats_frames_dropped += 1;
+                        if !header.is_idr() {
+                            events.push(AssemblerEvent::RequestPli {
+                                stream_id: self.stream_id,
+                                dropped_frame_id: stale_id,
+                            });
+                        }
+                    }
+
+                    self.last_emitted_frame = Some(header.frame_id);
+                    self.stats_frames_ok += 1;
+                    if had_missing_data {
+                        self.stats_frames_fec_recovered += 1;
+                    }
+                    events.push(AssemblerEvent::FrameReady(AssembledFrame {
+                        stream_id: pending.stream_id,
+                        frame_id: header.frame_id,
+                        flags: pending.flags,
+                        capture_ts_us: pending.capture_ts_us,
+                        recovered_via_fec: had_missing_data,
+                        payload: frame_bytes,
+                    }));
+                }
+            }
+        }
+
+        // Bound pending map size
+        while self.pending.len() > self.max_pending_frames {
+            if let Some((&oldest_id, _)) = self.pending.iter().next() {
+                self.pending.remove(&oldest_id);
+                self.stats_frames_dropped += 1;
+                events.push(AssemblerEvent::RequestPli {
+                    stream_id: self.stream_id,
+                    dropped_frame_id: oldest_id,
+                });
+            }
+        }
+
+        events
+    }
+
+    /// Periodic maintenance: emit selective NACK for fresh incomplete frames or drop expired frames.
+    pub fn poll_maintenance(&mut self, now: Instant, rtt_ms: f64) -> Vec<AssemblerEvent> {
+        let mut events = Vec::new();
+        let mut expired = Vec::new();
+
+        for (&frame_id, pf) in self.pending.iter_mut() {
+            let age = now.saturating_duration_since(pf.first_seen);
+            if age >= self.max_frame_wait {
+                expired.push(frame_id);
+            } else if !pf.nack_sent && rtt_ms < 25.0 && age >= Duration::from_millis(6) {
+                let missing: Vec<u16> = pf.shards[..pf.data_shards]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| if s.is_none() { Some(i as u16) } else { None })
+                    .collect();
+                if !missing.is_empty() {
+                    pf.nack_sent = true;
+                    events.push(AssemblerEvent::RequestNack {
+                        stream_id: self.stream_id,
+                        frame_id,
+                        missing_shards: missing,
+                    });
+                }
+            }
+        }
+
+        for frame_id in expired {
+            self.pending.remove(&frame_id);
+            self.stats_frames_dropped += 1;
+            events.push(AssemblerEvent::RequestPli {
+                stream_id: self.stream_id,
+                dropped_frame_id: frame_id,
+            });
+        }
+        events
+    }
+}

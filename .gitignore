@@ -32,3 +32,6 @@ Thumbs.db
 
 # Generated design preview
 ui-concept.png
+
+# Rust streaming core build artifacts
+core/target/

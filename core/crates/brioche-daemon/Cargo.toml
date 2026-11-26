@@ -1,0 +1,16 @@
+[package]
+name = "brioche-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "brioche-core"
+path = "src/main.rs"
+
+[dependencies]
+brioche-proto = { path = "../brioche-proto" }
+brioche-transport = { path = "../brioche-transport" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
