@@ -1,5 +1,6 @@
 """Modern theme-aware vector-painted controls. Animations run only during interaction."""
 
+import sys
 import time
 from PySide6.QtCore import Qt, QRectF, QSize, QVariantAnimation, QEasingCurve, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QFont, QLinearGradient
@@ -48,8 +49,11 @@ class RoundedComboBox(QComboBox):
         view.setItemDelegate(ComboDelegate(view))
         view.setUniformItemSizes(True)
         popup = view.window()
-        popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
-        popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        # Qt 6.7 libqcocoa has a use-after-free in NSWindowAccessibility / autorelease
+        # when QComboBoxPrivateContainer is forced to Frameless + WA_TranslucentBackground.
+        if sys.platform != "darwin":
+            popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+            popup.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._popup = popup
         self.apply_theme(LIGHT_TOKENS)
 

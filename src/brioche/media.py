@@ -35,9 +35,9 @@ class DesktopEncoder:
             self.codec.time_base = Fraction(1, config.fps)
             self.codec.framerate = Fraction(config.fps, 1)
             self.codec.bit_rate = config.bitrate_mbps * 1_000_000
-            self.codec.gop_size = config.fps
+            self.codec.gop_size = max(30, config.fps * 2) if encoder == "h264_videotoolbox" else config.fps
             self.codec.max_b_frames = 0
-            self.interpolation = "FAST_BILINEAR" if config.fps >= 60 else "BILINEAR"
+            self.interpolation = "BICUBIC"
             if encoder == "libx264":
                 self.codec.thread_count = min(8, os.cpu_count() or 1)
                 self.codec.options = {"preset": "ultrafast", "tune": "zerolatency",

@@ -48,7 +48,7 @@ def nvenc_available(path):
                 "-c:v",
                 "h264_nvenc",
                 "-preset",
-                "p1",
+                "p4",
                 "-tune",
                 "ull",
                 "-f",
@@ -151,14 +151,21 @@ class HardwareEncoder:
             ]
         else:
             raise RuntimeError("此平台尚未实现 NVENC 采集后端")
+        vf = (
+            "format=nv12"
+            if self.width == m["width"] and self.height == m["height"]
+            else f"scale={self.width}:{self.height}:flags=lanczos+accurate_rnd,format=nv12"
+        )
+        maxrate_mbps = min(100, max(config.bitrate_mbps + 4, int(round(config.bitrate_mbps * 1.35))))
+        bufsize_bits = max(2_000_000, config.bitrate_mbps * 1_000_000 // 2)
         command += [
             "-an",
             "-vf",
-            f"scale={self.width}:{self.height}:flags=fast_bilinear,format=nv12",
+            vf,
             "-c:v",
             "h264_nvenc",
             "-preset",
-            "p1",
+            "p4",
             "-tune",
             "ull",
             "-zerolatency",
@@ -167,20 +174,24 @@ class HardwareEncoder:
             "0",
             "-rc-lookahead",
             "0",
+            "-multipass",
+            "qres",
+            "-spatial-aq",
+            "1",
             "-slices",
             "4",
             "-rc",
-            "cbr",
+            "vbr",
             "-b:v",
             f"{config.bitrate_mbps}M",
             "-maxrate",
-            f"{config.bitrate_mbps}M",
+            f"{maxrate_mbps}M",
             "-bufsize",
-            str(max(100000, config.bitrate_mbps * 1_000_000 // config.fps)),
+            str(bufsize_bits),
             "-bf",
             "0",
             "-g",
-            str(max(1, config.fps // 4)),
+            str(max(30, config.fps * 2)),
             "-forced-idr",
             "1",
             "-fps_mode",

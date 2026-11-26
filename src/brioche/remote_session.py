@@ -181,7 +181,8 @@ class RemoteCanvas(QWidget):
             return QRectF()
         iw, ih = self.image.width(), self.image.height()
         if self.scale_mode == "actual":
-            w, h = float(iw), float(ih)
+            dpr = max(1.0, float(self.devicePixelRatioF()))
+            w, h = iw / dpr, ih / dpr
         elif self.scale_mode == "fill":
             scale = max(self.width() / iw, self.height() / ih)
             w, h = iw * scale, ih * scale

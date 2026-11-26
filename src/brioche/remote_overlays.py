@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 from .theme import DARK_TOKENS
-from .ui_components import RoundedComboBox
 
 OVERLAY_STYLE = """
 QFrame#floatingPill {
@@ -61,6 +60,22 @@ QFrame#floatingPill QComboBox:hover {
 QFrame#floatingPill QComboBox::drop-down {
     border: none;
     width: 18px;
+}
+QFrame#floatingPill QPushButton#monitorMenuBtn {
+    background: rgba(255, 255, 255, 16);
+    color: #F2EFE9;
+    border: 1px solid rgba(255, 255, 255, 24);
+    border-radius: 10px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 550;
+    text-align: left;
+}
+QFrame#floatingPill QPushButton#monitorMenuBtn:hover {
+    background: rgba(255, 255, 255, 28);
+}
+QFrame#floatingPill QPushButton#monitorMenuBtn:disabled {
+    color: rgba(232, 227, 218, 120);
 }
 QFrame#floatingPill QPushButton {
     background: transparent;
@@ -259,6 +274,101 @@ SCALE_MODES = (
 )
 
 
+class _MenuViewShim:
+    def __init__(self, button):
+        self._button = button
+
+    def isVisible(self):
+        return bool(self._button._menu_open)
+
+
+class MonitorMenuButton(QPushButton):
+    """Native QMenu-backed monitor switcher; avoids Qt6 libqcocoa QComboBox popup UAF crashes."""
+
+    activated = Signal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("monitorMenuBtn")
+        self._items = []
+        self._current = -1
+        self._menu_open = False
+        self._view_shim = _MenuViewShim(self)
+        self.clicked.connect(self._open_menu)
+
+    def view(self):
+        return self._view_shim
+
+    def count(self):
+        return len(self._items)
+
+    def currentIndex(self):
+        return self._current
+
+    def currentText(self):
+        if 0 <= self._current < len(self._items):
+            return self._items[self._current][0]
+        return ""
+
+    def itemData(self, index):
+        if 0 <= index < len(self._items):
+            return self._items[index][1]
+        return None
+
+    def findData(self, data):
+        for i, (_, value) in enumerate(self._items):
+            if value == data:
+                return i
+        return -1
+
+    def clear(self):
+        self._items.clear()
+        self._current = -1
+        self._refresh_label()
+
+    def addItem(self, text, data=None):
+        self._items.append((str(text), data))
+        if self._current < 0:
+            self._current = 0
+        self._refresh_label()
+
+    def setCurrentIndex(self, index):
+        if 0 <= index < len(self._items):
+            self._current = index
+        else:
+            self._current = -1
+        self._refresh_label()
+
+    def _refresh_label(self):
+        label = self.currentText() or "正在读取显示器…"
+        if len(label) > 26:
+            label = label[:25] + "…"
+        suffix = " ▾" if len(self._items) > 1 else ""
+        self.setText(f"{label}{suffix}")
+
+    def _open_menu(self):
+        if not self._items:
+            return
+        menu = QMenu(self)
+        chosen = []
+        for idx, (label, _data) in enumerate(self._items):
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(idx == self._current)
+            act.triggered.connect(lambda checked=False, i=idx: chosen.append(i))
+        self._menu_open = True
+        try:
+            menu.exec(self.mapToGlobal(self.rect().bottomLeft()))
+        finally:
+            self._menu_open = False
+        if chosen:
+            target = chosen[-1]
+            self.setCurrentIndex(target)
+            if not self.signalsBlocked():
+                # Defer emission past Cocoa's menu teardown autorelease cycle.
+                QTimer.singleShot(0, lambda i=target: self.activated.emit(i))
+
+
 class FloatingPillHandle(QPushButton):
     hovered = Signal()
 
@@ -314,10 +424,9 @@ class FloatingPillToolbar(QFrame):
         self.grip.setCursor(Qt.CursorShape.SizeHorCursor)
         row.addWidget(self.grip)
 
-        self.monitor_selector = RoundedComboBox()
-        self.monitor_selector.apply_theme(DARK_TOKENS)
+        self.monitor_selector = MonitorMenuButton()
         self.monitor_selector.setMinimumWidth(150)
-        self.monitor_selector.setMaximumWidth(215)
+        self.monitor_selector.setMaximumWidth(230)
         self.monitor_selector.addItem("正在读取显示器…")
         self.monitor_selector.setEnabled(False)
         self.monitor_selector.activated.connect(self.monitor_selected.emit)
