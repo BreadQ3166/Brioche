@@ -253,8 +253,8 @@ class SettingsView(QWidget):
         v2_form = QFormLayout()
         v2_form.setSpacing(10)
         self.stream_engine = self._combo()
-        self.stream_engine.addItem("自动 · 可用时启用 v2.0 Rust UDP/GPU 内核", "auto")
-        self.stream_engine.addItem("v2.0 原生引擎（UDP + RS-FEC + wgpu）", "v2_core")
+        self.stream_engine.addItem("稳定集成引擎（默认 · 自动重连/多标签/音频/剪贴板）", "auto")
+        self.stream_engine.addItem("v2.0 原生 Rust UDP/GPU 窗口（实验性 · 仅局域网）", "v2_core")
         self.stream_engine.addItem("v1.x 兼容引擎（TLS/TCP + Qt 画布）", "v1_compat")
         self.stream_engine.setCurrentIndex(
             max(0, self.stream_engine.findData(self.store.setting("stream_engine", "auto")))

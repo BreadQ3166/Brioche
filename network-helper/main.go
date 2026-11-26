@@ -105,7 +105,16 @@ func (b *bridge) info(w http.ResponseWriter, r *http.Request) {
 	s.Port = 47995 // Native host stays private on loopback; this is its tailnet endpoint.
 	json.NewEncoder(w).Encode(s)
 }
+func tuneTCP(conn net.Conn) {
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
+}
 func (b *bridge) copyConnection(a, c net.Conn, inbound bool) {
+	tuneTCP(a)
+	tuneTCP(c)
 	b.mu.Lock()
 	b.connections[a] = inbound
 	b.connections[c] = inbound
@@ -506,17 +515,23 @@ func (b *bridge) command(ctx context.Context, r request) (any, error) {
 			if len(peers) > 32 {
 				peers = peers[:32]
 			}
+			probeCtx, probeCancel := context.WithTimeout(ctx, 6*time.Second)
+			defer probeCancel()
 			var wait sync.WaitGroup
-			limit := make(chan struct{}, 4)
+			limit := make(chan struct{}, 6)
 			for _, peer := range peers {
 				peer["reported_online"] = peer["online"]
 				peer["reachable"], peer["sharing"], peer["busy"] = false, false, false
 				wait.Add(1)
 				go func(entry map[string]any) {
 					defer wait.Done()
-					limit <- struct{}{}
-					defer func() { <-limit }()
-					reachable, sharing, busy := b.presence(ctx, entry["ip"].(string))
+					select {
+					case limit <- struct{}{}:
+						defer func() { <-limit }()
+					case <-probeCtx.Done():
+						return
+					}
+					reachable, sharing, busy := b.presence(probeCtx, entry["ip"].(string))
 					entry["reachable"], entry["sharing"], entry["busy"] = reachable, sharing, busy
 				}(peer)
 			}
@@ -637,7 +652,7 @@ func main() {
 			output.Encode(map[string]any{"id": r.ID, "result": map[string]bool{"ok": true}})
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		result, err := b.command(ctx, r)
 		cancel()
 		response := map[string]any{"id": r.ID, "result": result}

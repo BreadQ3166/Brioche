@@ -87,11 +87,33 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
             return Some(path);
         }
     }
+    let bin_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
+    // Check bundled sibling media/ffmpeg relative to brioche-core executable first.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            for rel in [
+                exe_dir.join("..").join("media").join(bin_name),
+                exe_dir.join("media").join(bin_name),
+                exe_dir.join(bin_name),
+            ] {
+                if rel.is_file() {
+                    return Some(rel);
+                }
+            }
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let cand = dir.join(bin_name);
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
     let candidates = [
         "/usr/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
         "/opt/homebrew/bin/ffmpeg",
-        "/home/bread/.local/opt/brioche/0.9.1/_internal/media/ffmpeg",
     ];
     for c in candidates {
         let p = Path::new(c);

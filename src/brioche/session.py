@@ -29,13 +29,52 @@ NON_RETRYABLE_HINTS = (
 )
 
 
+RETRYABLE_HINTS = (
+    "超时",
+    "硬件视频流中断",
+    "硬件编码取帧超时",
+    "硬件编码进程已结束",
+    "连接意外中断",
+)
+
+
+def tune_socket(writer):
+    """Enable TCP_NODELAY and OS TCP keepalive so idle/bursty LAN & Tailscale links stay healthy."""
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    try:
+        if hasattr(socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 15)
+        elif hasattr(socket, "TCP_KEEPALIVE"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 15)
+        if hasattr(socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        if hasattr(socket, "TCP_KEEPCNT"):
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
+        if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 15_000, 5_000))
+    except OSError:
+        pass
+
+
 def is_retryable_disconnect(exc):
     if isinstance(exc, (TimeoutError, asyncio.TimeoutError, ConnectionError, asyncio.IncompleteReadError)):
         return True
-    if isinstance(exc, (ProtocolError, ValueError)):
-        return False
     msg = str(exc)
     if any(hint in msg for hint in NON_RETRYABLE_HINTS):
+        return False
+    if any(hint in msg for hint in RETRYABLE_HINTS):
+        return True
+    if isinstance(exc, (ProtocolError, ValueError)):
         return False
     return isinstance(exc, OSError)
 
@@ -171,6 +210,7 @@ class Host:
         self.peer_tasks = set()
         self.connection_tasks = {}
         self.session_tasks = set()
+        self._active_session = None
         self.stop_requested = threading.Event()
         self.web_enabled, self.web_port = web_enabled, web_port
         self.browser_url, self.browser_pin = "", ""
@@ -196,7 +236,7 @@ class Host:
         self.stop_event = asyncio.Event()
         context, self.pin = identity(self.folder)
         server = await asyncio.start_server(self._accept, self.bind, self.port, ssl=context,
-                                            ssl_handshake_timeout=5, backlog=4)
+                                            ssl_handshake_timeout=8, backlog=16)
         self.port = server.sockets[0].getsockname()[1]
         gateway = None
         try:
@@ -238,12 +278,14 @@ class Host:
         receiver = None
         audio_stream = None
         try:
+            tune_socket(writer)
+            write_lock = asyncio.Lock()
             # Bound unauthenticated peers and brute-force attempts. Tokens are 256-bit.
             now = time.monotonic()
             self._failures = [t for t in self._failures if now - t < 60]
-            if len(self.peer_tasks) > 4 or len(self._failures) >= 20:
+            if len(self.peer_tasks) > 16 or len(self._failures) >= 20:
                 return
-            kind, hello = await asyncio.wait_for(read_message(reader), 8)
+            kind, hello = await asyncio.wait_for(read_message(reader), 12)
             if kind == CONTROL and hello.get("type") in ("discover", "pair"):
                 await self._lan_request(reader, writer, hello)
                 return
@@ -295,9 +337,36 @@ class Host:
             if codec not in ("h264", "mjpeg") or (codec == "mjpeg" and config.fps > 30):
                 raise ProtocolError("不支持的画面格式或浏览器帧率")
             if not self.session_gate.acquire(task):
-                raise ProtocolError("被控端已有活动连接")
+                # Allow seamless reclaim when the SAME authenticated peer auto-reconnects
+                # (or when an old half-open session has gone silent > 12s).
+                peer_ip = str(peer[0]) if peer else ""
+                active_meta = self._active_session
+                reclaim = False
+                if active_meta is not None:
+                    is_same_peer = bool(peer_ip) and active_meta.get("peer_ip") == peer_ip
+                    is_stale = (time.monotonic() - active_meta.get("last_rx", 0.0)) > 12.0
+                    if (is_same_peer and bool(hello.get("reconnect"))) or is_stale:
+                        reclaim = True
+                        old_task = active_meta.get("task")
+                        if old_task is not None and not old_task.done():
+                            old_task.cancel()
+                if reclaim:
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
+                        if self.session_gate.acquire(task):
+                            break
+                        await asyncio.sleep(0.05)
+                    else:
+                        raise ProtocolError("被控端已有活动连接")
+                else:
+                    raise ProtocolError("被控端已有活动连接")
             self.active = acquired = True
             self.session_tasks.add(task)
+            self._active_session = {
+                "task": task,
+                "peer_ip": str(peer[0]) if peer else "",
+                "last_rx": time.monotonic(),
+            }
             if platform.system() == 'Darwin':
                 from .mac_permissions import require_host
                 require_host(self.view_only)
@@ -325,7 +394,7 @@ class Host:
                     audio_ready = True
             state = {"stream_id": 0, "monitor": self.monitor, "pending": None,
                      "switching": False, "last_switch": 0.0, "monitors": monitors}
-            await send(writer, pack_control(stream_info(media, monitors, self.monitor, 0, self.view_only, files=self.files_enabled, clipboard=self.clipboard_enabled, audio=audio_ready)))
+            await send(writer, pack_control(stream_info(media, monitors, self.monitor, 0, self.view_only, files=self.files_enabled, clipboard=self.clipboard_enabled, audio=audio_ready)), lock=write_lock)
             self.on_session_state({
                 "active": True,
                 "peer": str(peer[0]) if peer else "",
@@ -334,7 +403,7 @@ class Host:
                 "input_paused": self.input_paused,
             })
             self.status(f"正在共享 · {media.width}×{media.height} · 上限 {config.fps} FPS")
-            receiver = asyncio.create_task(self._receive_input(reader, writer, sink, state))
+            receiver = asyncio.create_task(self._receive_input(reader, writer, sink, state, write_lock))
             interval = 1 / config.fps
             frames, process_ms, report_at = 0, 0.0, time.monotonic()
             send_ms = 0.0
@@ -354,7 +423,7 @@ class Host:
                         replacement = await self._open_media(executor, config, selected, codec)
                     except Exception:
                         await send(writer, pack_control({"type": "monitor_error", "request": request,
-                                                        "message": "无法打开该显示器，已保留当前画面"}))
+                                                        "message": "无法打开该显示器，已保留当前画面"}), lock=write_lock)
                     else:
                         previous, media = media, replacement
                         self._media = media
@@ -364,7 +433,7 @@ class Host:
                         if sink:
                             sink.monitor = media.monitor
                         await send(writer, pack_control(stream_info(
-                            media, monitors, selected, state["stream_id"], self.view_only, "stream", request, files=self.files_enabled, clipboard=self.clipboard_enabled, audio=audio_ready)))
+                            media, monitors, selected, state["stream_id"], self.view_only, "stream", request, files=self.files_enabled, clipboard=self.clipboard_enabled, audio=audio_ready)), lock=write_lock)
                         self.status(f"正在共享显示器 {selected} · {media.width}×{media.height}")
                         frames, process_ms, report_at = 0, 0.0, time.monotonic()
                         send_ms = 0.0
@@ -373,10 +442,10 @@ class Host:
                         state["switching"] = False
                 pending_clip = self._take_pending_clipboard()
                 if pending_clip is not None and self.clipboard_enabled and not self.view_only:
-                    await send(writer, pack_control(pending_clip))
+                    await send(writer, pack_control(pending_clip), lock=write_lock)
                 if audio_stream is not None and self.audio_enabled:
                     for audio_pkt in audio_stream.drain_packets():
-                        await send(writer, pack_audio(audio_pkt))
+                        await send(writer, pack_audio(audio_pkt), lock=write_lock)
                 packets, elapsed = await self.loop.run_in_executor(executor, media.frame, state.pop("force_keyframe", False))
                 sending = time.perf_counter()
                 age = getattr(media, 'capture_age_ms', None)
@@ -384,7 +453,7 @@ class Host:
                     age_ms += age
                     age_frames += 1
                 for packet in packets:
-                    await send(writer, pack_video(packet))
+                    await send(writer, pack_video(packet), lock=write_lock)
                 send_ms += (time.perf_counter() - sending) * 1000
                 frames += bool(packets)
                 process_ms += elapsed
@@ -395,7 +464,7 @@ class Host:
                         "capture_encode_ms": round(process_ms / max(frames, 1), 2),
                         "send_ms": round(send_ms / max(frames, 1), 2),
                         "capture_age_ms": round(age_ms / age_frames, 2) if age_frames else None,
-                    }))
+                    }), lock=write_lock)
                     frames, process_ms, report_at = 0, 0.0, now
                     send_ms = 0.0
                     age_ms, age_frames = 0.0, 0
@@ -409,7 +478,7 @@ class Host:
         except Exception as exc:
             # Do not echo authentication payloads or secret URIs into logs.
             try:
-                await send(writer, pack_control({"type": "error", "message": str(exc)[:300]}))
+                await send(writer, pack_control({"type": "error", "message": str(exc)[:300]}), lock=write_lock)
             except Exception:
                 pass
             if acquired:
@@ -457,6 +526,8 @@ class Host:
                     self.active = False
                     self.input_paused = False
                     self.session_tasks.discard(task)
+                    if self._active_session and self._active_session.get("task") is task:
+                        self._active_session = None
                     self.on_session_state({"active": False})
                     self.status("等待连接")
             await close_writer(writer)
@@ -668,11 +739,13 @@ class Host:
                 pass
             raise
 
-    async def _receive_input(self, reader, writer, sink, state):
+    async def _receive_input(self, reader, writer, sink, state, write_lock=None):
         window, count = time.monotonic(), 0
         while True:
-            kind, message = await asyncio.wait_for(read_message(reader), 15)
+            kind, message = await asyncio.wait_for(read_message(reader), 30)
             now = time.monotonic()
+            if self._active_session is not None:
+                self._active_session["last_rx"] = now
             if now - window >= 1:
                 window, count = now, 0
             count += 1
@@ -684,7 +757,7 @@ class Host:
                 stamp = message.get("stamp")
                 if type(stamp) not in (float, int):
                     raise ProtocolError("无效 ping")
-                await send(writer, pack_control({"type": "pong", "stamp": stamp}))
+                await send(writer, pack_control({"type": "pong", "stamp": stamp}), lock=write_lock)
             elif message["type"] == "input":
                 if sink and (message.get("event") == "release" or (
                         not self.input_paused
@@ -699,7 +772,7 @@ class Host:
                 if (type(monitor) is not int or monitor not in {m["id"] for m in state["monitors"]}
                         or now - state["last_switch"] < .3):
                     await send(writer, pack_control({"type": "monitor_error", "request": request,
-                                                    "message": "显示器不可用或操作过快，请稍后重试"}))
+                                                    "message": "显示器不可用或操作过快，请稍后重试"}), lock=write_lock)
                     continue
                 state["last_switch"] = now
                 state["pending"] = (monitor, request)
@@ -776,7 +849,7 @@ class Viewer:
     def __init__(self, uri, config, on_frame, on_status=lambda message: None,
                  on_info=lambda info: None, on_stats=lambda stats: None,
                  on_clipboard=lambda text: None, audio_enabled=True,
-                 on_audio=lambda payload: None):
+                 on_audio=lambda payload: None, reconnect=False):
         self.address = parse_uri(uri)
         self.config = config
         self.on_frame, self.on_status = on_frame, on_status
@@ -784,6 +857,7 @@ class Viewer:
         self.on_clipboard = on_clipboard
         self.audio_enabled = bool(audio_enabled)
         self.on_audio = on_audio
+        self.reconnect = bool(reconnect)
         self.commands = queue.Queue(maxsize=128)
         self._mouse = None
         self._mouse_lock = threading.Lock()
@@ -889,16 +963,22 @@ class Viewer:
         self.on_status("正在建立加密连接…")
         reader, writer = await asyncio.wait_for(asyncio.open_connection(
             host, port, ssl=client_context(), server_hostname="brioche",
-            ssl_handshake_timeout=5), 10)
+            ssl_handshake_timeout=8), 15)
         sender = None
         try:
             verify_pin(writer.get_extra_info("ssl_object"), pin)
-            sock = writer.get_extra_info("socket")
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            await send(writer, pack_control({"type": "hello", "version": VERSION,
-                                            "token": token, "config": self.config.to_wire(),
-                                            "audio": self.audio_enabled}))
-            kind, info = await asyncio.wait_for(read_message(reader), 15)
+            tune_socket(writer)
+            hello_msg = {
+                "type": "hello",
+                "version": VERSION,
+                "token": token,
+                "config": self.config.to_wire(),
+                "audio": self.audio_enabled,
+            }
+            if self.reconnect:
+                hello_msg["reconnect"] = True
+            await send(writer, pack_control(hello_msg))
+            kind, info = await asyncio.wait_for(read_message(reader), 25)
             if kind != CONTROL or info["type"] != "welcome" or info.get("version") != VERSION:
                 raise ProtocolError(info.get("message", "服务端握手失败") if kind == CONTROL else "无效握手")
             w, h = validate_stream_info(info)
@@ -913,8 +993,8 @@ class Viewer:
             frames, byte_count, since = 0, 0, time.monotonic()
             decode_ms = convert_ms = submit_ms = 0.0
             while not self.stopped.is_set():
-                kind, payload = await asyncio.wait_for(read_message(reader), 12)
-                if self._switching.is_set() and time.monotonic() - self._switch_started > 10:
+                kind, payload = await asyncio.wait_for(read_message(reader), 25)
+                if self._switching.is_set() and time.monotonic() - self._switch_started > 15:
                     raise ProtocolError("切换显示器超时，请断开后重新连接")
                 if kind == VIDEO:
                     byte_count += len(payload)

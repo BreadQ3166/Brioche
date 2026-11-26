@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use brioche_proto::ControlMessage;
+pub use quinn::Connection as QuicConnection;
 use quinn::{ClientConfig, Connection, Endpoint, ServerConfig};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -137,7 +138,7 @@ pub fn bind_quic_server(
         .map_err(|e| QuicError::Tls(e.to_string()))?;
     let mut server_cfg = ServerConfig::with_crypto(Arc::new(quic_crypto));
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(std::time::Duration::from_secs(20).try_into().unwrap()));
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(45).try_into().unwrap()));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(4)));
     server_cfg.transport_config(Arc::new(transport));
 
@@ -167,7 +168,7 @@ pub async fn connect_quic_client(
         .map_err(|e| QuicError::Tls(e.to_string()))?;
     let mut client_cfg = ClientConfig::new(Arc::new(quic_crypto));
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(std::time::Duration::from_secs(20).try_into().unwrap()));
+    transport.max_idle_timeout(Some(std::time::Duration::from_secs(45).try_into().unwrap()));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(4)));
     client_cfg.transport_config(Arc::new(transport));
 

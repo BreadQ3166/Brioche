@@ -127,18 +127,38 @@ impl UdpMediaSender {
         self.congestion.current()
     }
 
-    /// Non-blocking drain of NACK / PLI / TWCC feedback datagrams from the viewer.
+    /// Non-blocking drain of NACK / PLI / TWCC / Ping feedback datagrams from the viewer.
     pub async fn poll_feedback(&mut self) -> std::io::Result<()> {
         loop {
             match self.socket.try_recv_from(&mut self.feedback_buf) {
-                Ok((n, _from)) => {
+                Ok((n, from)) => {
                     let Ok((hdr, pt)) = self
                         .rx_cipher
                         .open(&self.feedback_buf[..n], Some(&mut self.rx_replay))
                     else {
                         continue;
                     };
+                    // Learn authenticated peer's actual NAT/firewall mapped UDP port.
+                    self.peer = from;
                     match hdr.kind {
+                        PacketKind::Ping => {
+                            let pong_hdr = PacketHeader {
+                                kind: PacketKind::Pong,
+                                stream_id: self.stream_id,
+                                frame_id: 0,
+                                stripe_idx: 0,
+                                total_stripes: 0,
+                                shard_idx: 0,
+                                data_shards: 0,
+                                fec_shards: 0,
+                                flags: 0,
+                                capture_ts_us: hdr.capture_ts_us,
+                                seq_num: self.seq.fetch_add(1, Ordering::Relaxed),
+                            };
+                            if let Ok(dgram) = self.tx_cipher.seal(&pong_hdr, &pt) {
+                                let _ = self.socket.send_to(&dgram, self.peer).await;
+                            }
+                        }
                         PacketKind::Nack => {
                             // Payload: list of u16 BE encoded (stripe_idx << 8) | shard_idx
                             for chunk in pt.chunks_exact(2) {
@@ -371,6 +391,30 @@ impl UdpMediaReceiver {
         Ok(())
     }
 
+    /// Send an authenticated UDP Ping punch/keepalive packet to open firewall & NAT pinholes.
+    pub async fn send_ping(&self) -> std::io::Result<()> {
+        let Some(peer) = self.peer else {
+            return Ok(());
+        };
+        let hdr = PacketHeader {
+            kind: PacketKind::Ping,
+            stream_id: self.stream_id,
+            frame_id: 0,
+            stripe_idx: 0,
+            total_stripes: 0,
+            shard_idx: 0,
+            data_shards: 0,
+            fec_shards: 0,
+            flags: 0,
+            capture_ts_us: now_unix_us(),
+            seq_num: self.feedback_seq.fetch_add(1, Ordering::Relaxed),
+        };
+        if let Ok(dgram) = self.tx_cipher.seal(&hdr, &[]) {
+            self.socket.send_to(&dgram, peer).await?;
+        }
+        Ok(())
+    }
+
     pub async fn recv_frame(&mut self) -> std::io::Result<AssembledFrame> {
         loop {
             let (n, addr) = self.socket.recv_from(&mut self.buf).await?;
@@ -381,6 +425,9 @@ impl UdpMediaReceiver {
             else {
                 continue;
             };
+            if matches!(header.kind, PacketKind::Pong | PacketKind::Ping) {
+                continue;
+            }
             let mut ready = None;
             let mut pli_needed = false;
             for ev in self.assembler.push_shard(header, pt, Instant::now()) {
@@ -484,5 +531,36 @@ mod tests {
         assert!(sender.take_pli());
         assert_eq!(sender.stats_pli_received, 1);
         assert!(sender.current_quality().bitrate_kbps < before_bps);
+    }
+
+    #[tokio::test]
+    async fn symmetric_udp_ping_punch_learns_peer_and_keeps_session_alive() {
+        let key = [0x77u8; 32];
+        let rx_sock = bind_tuned_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let rx_addr = rx_sock.local_addr().unwrap();
+        let tx_sock = bind_tuned_udp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let tx_addr = tx_sock.local_addr().unwrap();
+
+        // Start sender with a stale/dummy peer port; receiver's authenticated Ping updates it!
+        let stale_peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let mut sender = UdpMediaSender::new(tx_sock, stale_peer, &key, 1);
+        let mut receiver = UdpMediaReceiver::new(rx_sock, &key, 1);
+        receiver.set_peer(tx_addr);
+
+        receiver.send_ping().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        sender.poll_feedback().await.unwrap();
+        assert_eq!(sender.peer, rx_addr);
+
+        let payload = vec![0xABu8; 2048];
+        sender.send_video_frame(&payload, FLAG_IDR, 0, None).await.unwrap();
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            receiver.recv_frame(),
+        )
+        .await
+        .expect("receiver should receive frame after UDP punch")
+        .unwrap();
+        assert_eq!(frame.payload, payload);
     }
 }

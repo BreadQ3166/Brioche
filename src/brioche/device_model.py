@@ -7,7 +7,8 @@ def _norm_name(name):
 
 def _pick_channel(channels, preferred="auto"):
     lan = channels.get("lan")
-    ts = channels.get("tailscale")
+    if preferred == "lan_only":
+        return ("lan", lan) if lan else (None, None)
     order = (
         ("lan", "tailscale")
         if preferred in ("auto", "lan")
@@ -31,15 +32,19 @@ def _pick_channel(channels, preferred="auto"):
     return None, None
 
 
-def _path_badge(mode, channel):
+def _path_badge(mode, channel, preferred="auto"):
     if not channel:
+        if preferred == "lan_only":
+            return ("未绑定 LAN", "offline")
         return ("离线", "offline")
     online = bool(channel.get("online") or channel.get("reachable"))
     if not online:
-        return ("离线", "offline")
+        return ("LAN 离线" if preferred == "lan_only" else "离线", "offline")
     if channel.get("busy"):
         return ("使用中", "relay")
     if mode == "lan":
+        if preferred == "lan_only":
+            return ("LAN 锁定" if channel.get("token") else "LAN 锁定 · 待配对", "online")
         return ("LAN 直连" if channel.get("token") else "LAN · 待配对", "online")
     if not channel.get("sharing"):
         return ("未共享", "offline")
@@ -103,15 +108,19 @@ def build_unified_devices(tailscale_records, lan_records, store):
 
         preferred = profile.get("preferred_channel", "auto")
         active_mode, active_channel = _pick_channel(entry["channels"], preferred)
-        online = any(
-            ch.get("online") or ch.get("reachable")
-            for ch in entry["channels"].values()
-        )
-        connectable = any(
-            ch.get("connectable") for ch in entry["channels"].values()
-        )
+        if preferred == "lan_only":
+            online = bool(active_channel and active_channel.get("online"))
+            connectable = bool(active_channel and active_channel.get("connectable"))
+        else:
+            online = any(
+                ch.get("online") or ch.get("reachable")
+                for ch in entry["channels"].values()
+            )
+            connectable = any(
+                ch.get("connectable") for ch in entry["channels"].values()
+            )
         busy = bool(active_channel and active_channel.get("busy"))
-        badge_text, badge_tone = _path_badge(active_mode, active_channel)
+        badge_text, badge_tone = _path_badge(active_mode, active_channel, preferred)
         display_name = profile.get("alias") or entry["name"]
         address_text = (
             f"{active_channel['ip']}:{active_channel['port']}"
@@ -120,6 +129,13 @@ def build_unified_devices(tailscale_records, lan_records, store):
         )
         if len(entry["channels"]) > 1:
             address_text += "  ·  双通道"
+        if preferred == "lan_only" and active_channel is None:
+            status_text = "已锁定仅局域网直连，请指定该设备的局域网 IP"
+        elif preferred == "lan_only" and not online:
+            err = active_channel.get("status_text") or "离线"
+            status_text = f"仅局域网直连（{err}，已禁用外网回退）"
+        else:
+            status_text = active_channel.get("status_text", "") if active_channel else ""
 
         result.append(
             {
@@ -130,10 +146,11 @@ def build_unified_devices(tailscale_records, lan_records, store):
                 "channels": entry["channels"],
                 "active_mode": active_mode,
                 "active_channel": active_channel,
+                "preferred_channel": preferred,
                 "online": online,
                 "connectable": connectable,
                 "busy": busy,
-                "status_text": active_channel.get("status_text", "") if active_channel else "",
+                "status_text": status_text,
                 "badge_text": badge_text,
                 "badge_tone": badge_tone,
                 "ip": address_text,

@@ -19,6 +19,8 @@ from .ui_components import RoundedComboBox
 
 class DeviceInspectorDrawer(QFrame):
     connect_requested = Signal(dict)
+    lan_connect_requested = Signal(dict)
+    bind_lan_requested = Signal(dict)
     files_requested = Signal(dict)
     profile_changed = Signal(str, dict)
     remove_lan_requested = Signal(str, int)
@@ -156,7 +158,8 @@ class DeviceInspectorDrawer(QFrame):
 
         self.preferred_channel = RoundedComboBox()
         self.preferred_channel.addItem("自动择优（LAN 优先）", "auto")
-        self.preferred_channel.addItem("优先局域网", "lan")
+        self.preferred_channel.addItem("仅局域网直连（不走外网）", "lan_only")
+        self.preferred_channel.addItem("优先局域网（离线回退外网）", "lan")
         self.preferred_channel.addItem("优先外网 Tailscale", "tailscale")
 
         for label, widget in (
@@ -184,6 +187,19 @@ class DeviceInspectorDrawer(QFrame):
         self.channels_label.setObjectName("muted")
         self.channels_label.setWordWrap(True)
         layout.addWidget(self.channels_label)
+
+        lan_row = QHBoxLayout()
+        lan_row.setSpacing(8)
+        self.lan_direct_btn = QPushButton("仅通过局域网连接")
+        self.lan_direct_btn.setToolTip("强制通过局域网直连此设备，不经过 Tailscale 外网")
+        self.lan_direct_btn.clicked.connect(self._emit_lan_connect)
+        self.bind_lan_btn = QPushButton("指定局域网 IP")
+        self.bind_lan_btn.setObjectName("ghost")
+        self.bind_lan_btn.setToolTip("手动输入或选择该设备的局域网 IP 地址并直连")
+        self.bind_lan_btn.clicked.connect(self._emit_bind_lan)
+        lan_row.addWidget(self.lan_direct_btn, 1)
+        lan_row.addWidget(self.bind_lan_btn)
+        layout.addLayout(lan_row)
 
         self.remove_btn = QPushButton("从局域网目录移除")
         self.remove_btn.setObjectName("danger")
@@ -263,6 +279,14 @@ class DeviceInspectorDrawer(QFrame):
                 path = ts.get("path") or "待检测"
                 lines.append(f"• 外网：{ts['ip']}（{state} · {path}）")
             self.channels_label.setText("\n".join(lines) or "—")
+            lan_ch = channels.get("lan")
+            lan_ready = bool(lan_ch and lan_ch.get("connectable"))
+            self.lan_direct_btn.setVisible(bool(lan_ch))
+            self.lan_direct_btn.setEnabled(lan_ready)
+            self.lan_direct_btn.setText(
+                "仅局域网直连" if lan_ready else "局域网通道离线"
+            )
+            self.bind_lan_btn.setText("修改 LAN IP" if lan_ch else "指定局域网 IP 连接")
             self.remove_btn.setVisible("lan" in channels)
             self.show()
         finally:
@@ -330,6 +354,14 @@ class DeviceInspectorDrawer(QFrame):
     def _emit_connect(self):
         if self._device:
             self.connect_requested.emit(self._device)
+
+    def _emit_lan_connect(self):
+        if self._device:
+            self.lan_connect_requested.emit(self._device)
+
+    def _emit_bind_lan(self):
+        if self._device:
+            self.bind_lan_requested.emit(self._device)
 
     def _emit_files(self):
         if self._device:

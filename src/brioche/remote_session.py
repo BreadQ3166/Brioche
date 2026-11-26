@@ -32,7 +32,7 @@ from .remote_overlays import (
 from .security import parse_uri
 from .session import Viewer
 
-RECONNECT_DELAYS = (1, 2, 4, 8, 12)
+RECONNECT_DELAYS = (1, 2, 3, 5, 8, 12)
 
 SESSION_WINDOW_STYLE = """
 QMainWindow#sessionWindow {
@@ -463,7 +463,7 @@ class RemoteSessionPage(QWidget):
         self.viewer.start()
         self._emit_tab_meta()
 
-    def _create_viewer(self, uri):
+    def _create_viewer(self, uri, reconnect=False):
         self._viewer_gen += 1
         gen = self._viewer_gen
         return Viewer(
@@ -476,6 +476,7 @@ class RemoteSessionPage(QWidget):
             lambda text, g=gen: self.bridge.clipboard.emit(text) if g == self._viewer_gen else None,
             audio_enabled=self._audio_enabled,
             on_audio=lambda payload, g=gen: self._push_audio(payload) if g == self._viewer_gen else None,
+            reconnect=reconnect,
         )
 
     def _push_audio(self, payload):
@@ -734,7 +735,7 @@ class RemoteSessionPage(QWidget):
         self.mailbox.clear()
         old = self.viewer
         old.stop()
-        self.viewer = self._create_viewer(uri)
+        self.viewer = self._create_viewer(uri, reconnect=True)
         self.canvas.viewer = self.viewer
         self.timer.start()
         if self.network_mode == "tailscale":

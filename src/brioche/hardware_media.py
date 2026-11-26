@@ -104,6 +104,7 @@ class HardwareEncoder:
         self.error = None
         self.logs = deque(maxlen=8)
         self.container = None
+        self._last_packet_at = time.monotonic()
         command = [
             self.path,
             "-hide_banner",
@@ -268,17 +269,25 @@ class HardwareEncoder:
                 self.container.close()
 
     def frame(self, force_keyframe=False):
-        # Periodic IDRs use a quarter-second GOP at the requested frame rate.
+        # Periodic IDRs use a 2-second GOP at the requested frame rate.
         # Do not discard encoded references; bounded pipe/queue backpressure keeps the chain intact.
         start = time.perf_counter()
         if self.closed.is_set():
             raise RuntimeError("硬件编码已停止")
         try:
-            item = self.packets.get(timeout=4)
+            item = self.packets.get(timeout=0.5)
         except queue.Empty:
-            raise RuntimeError(self.error or "硬件编码取帧超时")
+            if self.error:
+                raise RuntimeError(self.error)
+            if hasattr(self, "process") and self.process.poll() is not None:
+                raise RuntimeError(self.error or "硬件编码进程已结束")
+            if time.monotonic() - self._last_packet_at > 15.0:
+                raise RuntimeError(self.error or "硬件编码取帧超时")
+            # Transient stall (e.g. static screen / UAC / mode switch): keep session & heartbeat alive.
+            return [], (time.perf_counter() - start) * 1000
         if item is None:
             raise RuntimeError("硬件编码已停止")
+        self._last_packet_at = time.monotonic()
         data, stamp = item
         age = time.time() - stamp if stamp is not None else None
         self.capture_age_ms = age * 1000 if age is not None and 0 <= age < 60 else None

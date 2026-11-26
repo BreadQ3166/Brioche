@@ -395,26 +395,49 @@ class FilterPillBar(QWidget):
 
 
 class AddLanDeviceDialog(QDialog):
-    def __init__(self, local_ips="", nearby_devices=None, parent=None):
+    def __init__(
+        self,
+        local_ips="",
+        nearby_devices=None,
+        parent=None,
+        connect_primary=False,
+        target_name="",
+        initial_address="",
+    ):
         super().__init__(parent)
-        self.setWindowTitle("添加局域网设备")
-        self.setFixedWidth(470)
+        self.connect_immediately = bool(connect_primary)
+        heading_text = (
+            f"指定局域网连接 · {target_name}"
+            if target_name
+            else ("指定局域网 IP 直连" if connect_primary else "添加局域网设备")
+        )
+        self.setWindowTitle(heading_text)
+        self.setFixedWidth(490)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 20)
         layout.setSpacing(12)
 
-        title = QLabel("添加局域网设备")
+        title = QLabel(heading_text)
         title.setObjectName("subheading")
         layout.addWidget(title)
 
-        hint = QLabel("输入同一局域网电脑的 IPv4 地址（默认端口 47995），或从下方附近发现列表直接点选。首次连接将核对六位配对码。")
+        hint_text = (
+            "输入同一局域网电脑的 IPv4 地址（默认端口 47995），或从下方附近发现列表直接点选。此连接仅走局域网直连，不经过 Tailscale 外网或 DERP 中继。"
+            if connect_primary
+            else "输入同一局域网电脑的 IPv4 地址（默认端口 47995），或从下方附近发现列表直接点选。首次连接将核对六位配对码。"
+        )
+        hint = QLabel(hint_text)
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         self.ip_input = QLineEdit()
-        self.ip_input.setPlaceholderText("例如 192.168.1.8 或 192.168.1.8:47995")
-        self.ip_input.returnPressed.connect(self.accept)
+        self.ip_input.setPlaceholderText("例如 192.168.1.8 或 10.27.56.8:47995")
+        if initial_address:
+            self.ip_input.setText(initial_address)
+        self.ip_input.returnPressed.connect(
+            self._accept_connect if connect_primary else self._accept_add_only
+        )
         layout.addWidget(self.ip_input)
 
         nearby = list(nearby_devices or [])
@@ -444,7 +467,7 @@ class AddLanDeviceDialog(QDialog):
             self.nearby_list.itemDoubleClicked.connect(self._pick_and_accept)
             layout.addWidget(self.nearby_list)
         else:
-            no_nearby = QLabel("暂未监听到附近开启自动发现的局域网设备，可直接输入 IP 查找。")
+            no_nearby = QLabel("暂未监听到附近开启自动发现的局域网设备，请确认对方已开启局域网共享后直接输入 IP。")
             no_nearby.setObjectName("muted")
             no_nearby.setWordWrap(True)
             layout.addWidget(no_nearby)
@@ -468,12 +491,26 @@ class AddLanDeviceDialog(QDialog):
         buttons.addStretch()
         cancel = QPushButton("取消")
         cancel.clicked.connect(self.reject)
-        confirm = QPushButton("查找并添加")
-        confirm.setObjectName("primary")
-        confirm.clicked.connect(self.accept)
+        self.add_only_btn = QPushButton("仅添加到列表")
+        self.add_only_btn.clicked.connect(self._accept_add_only)
+        self.connect_now_btn = QPushButton("立即局域网直连")
+        self.connect_now_btn.clicked.connect(self._accept_connect)
+        if connect_primary:
+            self.connect_now_btn.setObjectName("primary")
+        else:
+            self.add_only_btn.setObjectName("primary")
         buttons.addWidget(cancel)
-        buttons.addWidget(confirm)
+        buttons.addWidget(self.add_only_btn)
+        buttons.addWidget(self.connect_now_btn)
         layout.addLayout(buttons)
+
+    def _accept_add_only(self):
+        self.connect_immediately = False
+        self.accept()
+
+    def _accept_connect(self):
+        self.connect_immediately = True
+        self.accept()
 
     def _pick_and_accept(self, item):
         self.ip_input.setText(item.data(Qt.ItemDataRole.UserRole))

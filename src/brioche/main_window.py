@@ -203,11 +203,11 @@ class MainWindow(QMainWindow):
         self.poll.timeout.connect(self.poll_hosts)
         self.poll.start()
         self.network_poll = QTimer(self)
-        self.network_poll.setInterval(3000)
+        self.network_poll.setInterval(6000)
         self.network_poll.timeout.connect(self.refresh_environment)
         self.network_poll.start()
         self.lan_poll = QTimer(self)
-        self.lan_poll.setInterval(4000)
+        self.lan_poll.setInterval(6000)
         self.lan_poll.timeout.connect(self.refresh_lan)
         self.lan_poll.start()
 
@@ -325,6 +325,11 @@ class MainWindow(QMainWindow):
         self.search_input.textChanged.connect(self._on_search_changed)
         row.addWidget(self.search_input, 1)
 
+        self.direct_lan_btn = QPushButton("⚡ 指定局域网连接")
+        self.direct_lan_btn.setToolTip("输入局域网 IP 或点选附近设备，仅走局域网直连（不经过外网/中继）")
+        self.direct_lan_btn.clicked.connect(lambda: self.open_direct_lan_dialog())
+        row.addWidget(self.direct_lan_btn)
+
         self.add_lan_btn = QPushButton("+ 添加局域网设备")
         self.add_lan_btn.clicked.connect(self.open_add_lan_dialog)
         row.addWidget(self.add_lan_btn)
@@ -372,6 +377,8 @@ class MainWindow(QMainWindow):
 
         self.drawer = DeviceInspectorDrawer(self)
         self.drawer.connect_requested.connect(self.connect_unified_device)
+        self.drawer.lan_connect_requested.connect(self.connect_device_via_lan)
+        self.drawer.bind_lan_requested.connect(self.open_direct_lan_dialog)
         self.drawer.files_requested.connect(self.open_device_file_manager)
         self.drawer.profile_changed.connect(self._on_device_profile_changed)
         self.drawer.remove_lan_requested.connect(self._remove_lan_by_endpoint)
@@ -750,6 +757,35 @@ class MainWindow(QMainWindow):
         conn.setEnabled(bool(device.get("connectable")))
         conn.triggered.connect(lambda: self.connect_unified_device(device))
 
+        channels = device.get("channels") or {}
+        lan_ch = channels.get("lan")
+        ts_ch = channels.get("tailscale")
+
+        if lan_ch:
+            lan_act = menu.addAction(
+                f"⚡ 仅通过局域网直连 ({lan_ch['ip']})"
+            )
+            lan_act.setEnabled(bool(lan_ch.get("connectable")))
+            lan_act.triggered.connect(lambda: self.connect_device_via_lan(device))
+        bind_lan_act = menu.addAction(
+            "修改并指定局域网 IP 连接…" if lan_ch else "⚡ 指定局域网 IP 直连…"
+        )
+        bind_lan_act.triggered.connect(lambda: self.open_direct_lan_dialog(device))
+
+        if ts_ch and lan_ch:
+            ts_act = menu.addAction(f"仅通过外网 Tailscale 连接 ({ts_ch['ip']})")
+            ts_act.setEnabled(bool(ts_ch.get("connectable")))
+            ts_act.triggered.connect(lambda: self.connect_device_via_tailscale(device))
+
+        lan_only_act = menu.addAction("锁定为仅局域网直连（禁用外网回退）")
+        lan_only_act.setCheckable(True)
+        is_lan_only = device.get("preferred_channel") == "lan_only"
+        lan_only_act.setChecked(is_lan_only)
+        lan_only_act.triggered.connect(
+            lambda checked=False: self._set_device_lan_only(device, checked)
+        )
+
+        menu.addSeparator()
         files_act = menu.addAction("打开双栏文件管理器")
         files_act.setEnabled(bool(device.get("connectable")))
         files_act.triggered.connect(lambda: self.open_device_file_manager(device))
@@ -761,14 +797,20 @@ class MainWindow(QMainWindow):
         inspect = menu.addAction("设备详情与独立配置")
         inspect.triggered.connect(lambda: self.drawer.show_device(device))
 
-        if "lan" in device.get("channels", {}):
+        if lan_ch:
             menu.addSeparator()
-            lan = device["channels"]["lan"]
             rem = menu.addAction("从局域网目录移除")
             rem.triggered.connect(
-                lambda: self._remove_lan_by_endpoint(lan["ip"], int(lan.get("port", 47995)))
+                lambda: self._remove_lan_by_endpoint(lan_ch["ip"], int(lan_ch.get("port", 47995)))
             )
         menu.exec(global_pos)
+
+    def _set_device_lan_only(self, device, enabled):
+        self.store.set_device_profile(
+            device["key"],
+            preferred_channel="lan_only" if enabled else None,
+        )
+        self._rebuild_unified()
 
     def _toggle_device_favorite(self, device):
         new_fav = not bool(device.get("favorite"))
@@ -837,11 +879,39 @@ class MainWindow(QMainWindow):
 
     def open_add_lan_dialog(self):
         nearby = self.lan_listener.snapshot() if hasattr(self, "lan_listener") else self._nearby_lan_devices
-        dialog = AddLanDeviceDialog(self._local_ips_text, nearby_devices=nearby, parent=self)
+        dialog = AddLanDeviceDialog(
+            self._local_ips_text,
+            nearby_devices=nearby,
+            parent=self,
+            connect_primary=False,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             raw = dialog.value()
             if raw:
-                self.find_lan(raw)
+                self.find_lan(raw, connect_now=dialog.connect_immediately)
+
+    def open_direct_lan_dialog(self, target_device=None):
+        nearby = self.lan_listener.snapshot() if hasattr(self, "lan_listener") else self._nearby_lan_devices
+        target_name = ""
+        initial_addr = ""
+        if isinstance(target_device, dict):
+            target_name = target_device.get("display_name") or target_device.get("name") or ""
+            lan_ch = (target_device.get("channels") or {}).get("lan")
+            if lan_ch and lan_ch.get("ip"):
+                port = int(lan_ch.get("port", 47995))
+                initial_addr = f"{lan_ch['ip']}:{port}" if port != 47995 else lan_ch["ip"]
+        dialog = AddLanDeviceDialog(
+            self._local_ips_text,
+            nearby_devices=nearby,
+            parent=self,
+            connect_primary=True,
+            target_name=target_name,
+            initial_address=initial_addr,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            raw = dialog.value()
+            if raw:
+                self.find_lan(raw, connect_now=dialog.connect_immediately)
 
     def _local_host_pin(self):
         for host in self.hosts.values():
@@ -1261,18 +1331,22 @@ class MainWindow(QMainWindow):
         self._lan_records = lan_records
         self._rebuild_unified()
 
-    def find_lan(self, raw_text):
+    def find_lan(self, raw_text, connect_now=False):
         try:
             ip, port = target(raw_text)
         except ValueError as exc:
             self.dashboard_note.setText(str(exc))
             return
         self.add_lan_btn.setEnabled(False)
-        self.dashboard_note.setText(f"正在查找 {ip}:{port}…")
+        self.direct_lan_btn.setEnabled(False)
+        self.dashboard_note.setText(
+            f"正在通过局域网直连 {ip}:{port}…" if connect_now else f"正在查找 {ip}:{port}…"
+        )
         existing = next(
             (d for d in self.store.devices() if (d["ip"], d["port"]) == (ip, port)), {}
         )
-        self.work("find", lambda: discover(ip, port, existing.get("pin")))
+        op = "find_and_connect" if connect_now else "find"
+        self.work(op, lambda: discover(ip, port, existing.get("pin")))
 
     # ------------------------------------------------------------------
     # Connection & Remote Session
@@ -1290,6 +1364,37 @@ class MainWindow(QMainWindow):
         self.connect_device(
             mode,
             channel,
+            profile=device.get("profile"),
+            device_key=device.get("key"),
+            display_name=device.get("display_name", device.get("name", "")),
+        )
+
+    def connect_device_via_lan(self, device):
+        lan_ch = (device.get("channels") or {}).get("lan")
+        if not lan_ch:
+            self.open_direct_lan_dialog(device)
+            return
+        if not lan_ch.get("connectable"):
+            self.dashboard_note.setText(
+                f"局域网通道 {lan_ch.get('ip', '')} 当前离线或使用中；请确认对方已开启局域网共享，或点击“指定局域网 IP”更新地址。"
+            )
+            return
+        self.connect_device(
+            "lan",
+            lan_ch,
+            profile=device.get("profile"),
+            device_key=device.get("key"),
+            display_name=device.get("display_name", device.get("name", "")),
+        )
+
+    def connect_device_via_tailscale(self, device):
+        ts_ch = (device.get("channels") or {}).get("tailscale")
+        if not ts_ch or not ts_ch.get("connectable"):
+            self.dashboard_note.setText("该设备外网 Tailscale 通道当前不可连接。")
+            return
+        self.connect_device(
+            "tailscale",
+            ts_ch,
             profile=device.get("profile"),
             device_key=device.get("key"),
             display_name=device.get("display_name", device.get("name", "")),
@@ -1410,7 +1515,7 @@ class MainWindow(QMainWindow):
                 )
             v2_endpoint = None
             engine_pref = self.store.setting("stream_engine", "auto")
-            if mode == "lan" and engine_pref != "v1_compat":
+            if mode == "lan" and engine_pref == "v2_core":
                 from .core_engine import find_core_binary, negotiate_v2_endpoint
 
                 if find_core_binary() is not None:
@@ -1420,6 +1525,8 @@ class MainWindow(QMainWindow):
                 "config": config,
                 "mode": mode,
                 "peer": data["ip"],
+                "port": int(data.get("port", 47995)),
+                "pin": remembered.get("pin", "") if mode == "lan" else "",
                 "device_key": session_key,
                 "display_name": display_name or data.get("name", data["ip"]),
                 "v2_endpoint": v2_endpoint,
@@ -1502,10 +1609,21 @@ class MainWindow(QMainWindow):
             win.transfer_started.connect(self.transfer_board.add)
             win.transfer_updated.connect(self.transfer_board.update_task)
             self.session_window = win
+        def _lan_reconnect_uri(pin=result.get("pin", ""), ip=result.get("peer", ""), port=result.get("port", 47995), fallback=result["uri"]):
+            devices = self.store.devices()
+            match = None
+            if pin:
+                match = next((d for d in devices if d.get("pin") == pin and d.get("token")), None)
+            if match is None and ip:
+                match = next((d for d in devices if d.get("ip") == ip and int(d.get("port", 47995)) == int(port) and d.get("token")), None)
+            if match is not None:
+                return access_uri(match["ip"], match["port"], match["pin"], match["token"])
+            return fallback
+
         reconnect_cb = (
             (lambda peer=result["peer"]: self.network.open_peer(peer))
             if result["mode"] == "tailscale" and result.get("peer")
-            else None
+            else (_lan_reconnect_uri if result["mode"] == "lan" else None)
         )
         self.session_window.add_session(
             result["uri"],
@@ -1800,22 +1918,38 @@ class MainWindow(QMainWindow):
             self._lan_busy = False
             if not error:
                 self.update_lan_list(value)
-        elif operation == "find":
+        elif operation in ("find", "find_and_connect"):
             self.add_lan_btn.setEnabled(True)
+            self.direct_lan_btn.setEnabled(True)
             if error:
                 self.dashboard_note.setText(
                     "查找失败：" + error + "。请确认对方已开启局域网共享。"
                 )
             else:
-                self.store.upsert(
-                    {
-                        k: v
-                        for k, v in value.items()
-                        if k in ("ip", "port", "name", "platform", "observed_pin")
-                    }
-                )
-                self.dashboard_note.setText("已加入设备工作台，双击设备即可配对连接。")
+                saved_record = {
+                    k: v
+                    for k, v in value.items()
+                    if k in ("ip", "port", "name", "platform", "observed_pin")
+                }
+                self.store.upsert(saved_record)
                 self.refresh_lan()
+                if operation == "find_and_connect":
+                    if value.get("busy"):
+                        self.dashboard_note.setText(
+                            f"局域网设备 {value.get('name', value['ip'])} 当前正在使用中，已加入列表。"
+                        )
+                    else:
+                        self.dashboard_note.setText(
+                            f"已找到局域网设备 {value.get('name', value['ip'])}（{value['ip']}），正在直连…"
+                        )
+                        self.connect_device(
+                            "lan",
+                            value,
+                            device_key=f"lan:{value['ip']}:{value['port']}",
+                            display_name=value.get("name", value["ip"]),
+                        )
+                else:
+                    self.dashboard_note.setText("已加入设备工作台，双击设备即可配对连接。")
         elif operation == "connect":
             self._connecting = False
             if self._pair_dialog:

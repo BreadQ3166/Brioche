@@ -96,6 +96,11 @@ async def read_message(reader):
     return kind, value
 
 
-async def send(writer, message):
-    writer.write(message)
-    await asyncio.wait_for(writer.drain(), 4)
+async def send(writer, message, timeout=15, lock=None):
+    if lock is not None:
+        async with lock:
+            writer.write(message)
+            await asyncio.wait_for(writer.drain(), timeout)
+    else:
+        writer.write(message)
+        await asyncio.wait_for(writer.drain(), timeout)

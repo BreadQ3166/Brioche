@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 from urllib.parse import urlsplit
 from .security import access_uri, data_dir, parse_uri
 
@@ -89,17 +90,42 @@ class EmbeddedNetwork:
         with self.lock:
             self._start()
             self.serial += 1
+            req_id = self.serial
+            wait_s = 35.0 if operation == "devices" else 25.0
             try:
-                self.process.stdin.write(json.dumps({"id": self.serial, "op": operation, **values}) + "\n")
+                self.process.stdin.write(json.dumps({"id": req_id, "op": operation, **values}) + "\n")
                 self.process.stdin.flush()
-                response = self.responses.get(timeout=20)
-                if not isinstance(response, dict) or response.get("id") != self.serial:
+                deadline = time.monotonic() + wait_s
+                response = None
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Empty()
+                    candidate = self.responses.get(timeout=remaining)
+                    if candidate is None:
+                        self._terminate()
+                        raise RuntimeError("内置网络模块已退出，请检查是否已打开另一份 Brioche")
+                    if not isinstance(candidate, dict):
+                        continue
+                    cid = candidate.get("id")
+                    if cid == req_id:
+                        response = candidate
+                        break
+                    if isinstance(cid, int) and cid < req_id:
+                        # Discard late response from an earlier timed-out background poll.
+                        continue
                     self._terminate()
-                    raise RuntimeError("内置网络模块已退出，请检查是否已打开另一份 Brioche")
+                    raise RuntimeError("内置网络模块状态异常，请稍后重试")
                 if response.get("error"):
                     raise RuntimeError(ERRORS.get(response["error"], "网络操作失败，请刷新后重试"))
                 return response["result"]
-            except (OSError, queue.Empty, ValueError, KeyError) as exc:
+            except queue.Empty as exc:
+                # Never kill active Tailscale tunnels just because a background poll was slow.
+                if operation in ("devices", "status") and self.process and self.process.poll() is None:
+                    raise RuntimeError("内置网络状态轮询超时，保持现有连接") from exc
+                self._terminate()
+                raise RuntimeError("内置网络响应超时或中断，请检查网络后重试") from exc
+            except (OSError, ValueError, KeyError) as exc:
                 self._terminate()
                 raise RuntimeError("内置网络响应超时或中断，请检查网络后重试") from exc
 

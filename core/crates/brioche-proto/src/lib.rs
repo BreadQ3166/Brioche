@@ -293,6 +293,8 @@ pub enum ControlMessage {
         codec: String,
         chroma_444: bool,
         monitors: Vec<MonitorDesc>,
+        #[serde(default)]
+        host_udp_port: u16,
     },
     SwitchMonitor {
         monitor_id: u32,
