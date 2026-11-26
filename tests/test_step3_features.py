@@ -81,23 +81,37 @@ class ClipboardAndInputUnitTests(unittest.TestCase):
         self.assertFalse(is_retryable_disconnect(RuntimeError("请在系统偏好设置允许屏幕录制权限")))
 
 
+class _SyntheticCapture:
+    def __init__(self, index, fps):
+        self.monitor = {"left": 0, "top": 0, "width": 320, "height": 180}
+        self.backend = "synthetic"
+
+    def grab(self):
+        import av
+
+        frame = av.VideoFrame(320, 180, "yuv420p")
+        for plane in frame.planes:
+            plane.update(bytes(plane.buffer_size))
+        return frame
+
+    def close(self):
+        pass
+
+
 class ClipboardTLSIntegrationTests(unittest.TestCase):
     def test_bidirectional_clipboard_over_tls_and_readonly_block(self):
-        try:
-            from test_multiscreen import MONITORS, RegionCapture
-        except ImportError:
-            from tests.test_multiscreen import MONITORS, RegionCapture
+        monitors = [{"id": 1, "label": "Synthetic", "left": 0, "top": 0, "width": 320, "height": 180}]
 
         with tempfile.TemporaryDirectory() as folder:
             host_received = []
             viewer_received = []
             with (
                 patch("brioche.session.platform.system", return_value="Linux"),
-                patch("brioche.capture.list_monitors", return_value=MONITORS[:1]),
-                patch("brioche.media.DesktopCapture", RegionCapture),
+                patch("brioche.capture.list_monitors", return_value=monitors),
+                patch("brioche.media.DesktopCapture", _SyntheticCapture),
                 patch("brioche.platform_input.InputSink") as sink_cls,
             ):
-                sink_cls.return_value.monitor = MONITORS[0]
+                sink_cls.return_value.monitor = monitors[0]
                 host = Host(
                     port=0,
                     folder=folder,

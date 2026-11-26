@@ -218,7 +218,9 @@ class FileTLSIntegration(unittest.TestCase):
     def test_cancel_in_flight_removes_partial_file(self):
         file = self.input / "large.bin"
         file.write_bytes(secrets.token_bytes(2 * 1024 * 1024))
-        job = self.job("upload", [str(file)])
+        job = TransferJob(self.uri(), "upload", [str(file)], self.status.append, rate=1024 * 1024)
+        self.jobs.append(job)
+        job.start()
         self.assertTrue(
             until(lambda: any(value.get("completed", 0) > 0 for value in self.status))
         )

@@ -104,12 +104,26 @@ class OpusAudioPipelineTests(unittest.TestCase):
             player.close()
 
 
+class _SyntheticCapture:
+    def __init__(self, index, fps):
+        self.monitor = {"left": 0, "top": 0, "width": 320, "height": 180}
+        self.backend = "synthetic"
+
+    def grab(self):
+        import av
+
+        frame = av.VideoFrame(320, 180, "yuv420p")
+        for plane in frame.planes:
+            plane.update(bytes(plane.buffer_size))
+        return frame
+
+    def close(self):
+        pass
+
+
 class AudioAndPauseTLSIntegrationTests(unittest.TestCase):
     def test_tls_audio_stream_and_host_input_pause(self):
-        try:
-            from test_multiscreen import MONITORS, RegionCapture
-        except ImportError:
-            from tests.test_multiscreen import MONITORS, RegionCapture
+        monitors = [{"id": 1, "label": "Synthetic", "left": 0, "top": 0, "width": 320, "height": 180}]
 
         pcm = make_sine_pcm()
         count = [0]
@@ -129,13 +143,13 @@ class AudioAndPauseTLSIntegrationTests(unittest.TestCase):
 
             with (
                 patch("brioche.session.platform.system", return_value="Linux"),
-                patch("brioche.capture.list_monitors", return_value=MONITORS[:1]),
-                patch("brioche.media.DesktopCapture", RegionCapture),
+                patch("brioche.capture.list_monitors", return_value=monitors),
+                patch("brioche.media.DesktopCapture", _SyntheticCapture),
                 patch("brioche.platform_input.InputSink") as sink_cls,
                 patch("brioche.audio.AudioCaptureStream", side_effect=fake_audio_stream),
             ):
                 sink = sink_cls.return_value
-                sink.monitor = MONITORS[0]
+                sink.monitor = monitors[0]
                 host = Host(
                     port=0,
                     folder=folder,

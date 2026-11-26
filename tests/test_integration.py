@@ -88,7 +88,7 @@ class DesktopIntegration(unittest.TestCase):
         self.assertTrue(ready.wait(15),statuses)
         self.assertTrue(info[0]['files'])
         count=len(frames)
-        job=TransferJob(self.uri(),'upload',[str(source)])
+        job=TransferJob(self.uri(),'upload',[str(source)],rate=512*1024)
         job.start()
         try:
             self.assertTrue(job.finished.wait(10))
