@@ -277,6 +277,13 @@ impl PacketCipher {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ControlMessage {
+    SessionHello {
+        udp_port: u16,
+        requested_codec: String,
+        chroma_444: bool,
+        fps: u32,
+        bitrate_kbps: u32,
+    },
     StreamDescriptor {
         stream_id: u16,
         monitor_id: u32,
@@ -285,10 +292,14 @@ pub enum ControlMessage {
         fps_limit: u32,
         codec: String,
         chroma_444: bool,
+        monitors: Vec<MonitorDesc>,
     },
     SwitchMonitor {
         monitor_id: u32,
         request_id: u32,
+    },
+    InputEvent {
+        event: InputAction,
     },
     CursorShape {
         hash: String,
@@ -296,7 +307,7 @@ pub enum ControlMessage {
         height: u16,
         hotspot_x: u16,
         hotspot_y: u16,
-        rgba_b64: String,
+        rgba_hex: String,
     },
     CursorPosition {
         x: f32,
@@ -314,6 +325,25 @@ pub enum ControlMessage {
         rtt_us: u64,
         recv_bitrate_kbps: u32,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MonitorDesc {
+    pub id: u32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub primary: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InputAction {
+    Move { x: f32, y: f32 },
+    Button { button: String, down: bool },
+    Scroll { dx: i32, dy: i32 },
+    Key { key: String, down: bool },
+    ReleaseAll,
 }
 
 #[cfg(test)]

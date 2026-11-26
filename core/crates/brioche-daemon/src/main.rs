@@ -1,15 +1,31 @@
-//! brioche-core: Next-gen Rust low-latency streaming engine CLI, hardware probe & E2E benchmark.
+//! brioche-core: Next-gen Rust low-latency streaming engine CLI, host, GPU viewer & benchmarks.
+//!
+//! Subcommands:
+//!   info           - Probe GPU (Vulkan/Metal/DX12), hardware encoders, capture & monitors
+//!   host           - Start live Brioche v3 QUIC + encrypted UDP/RS-FEC host daemon
+//!   view           - Connect to a Brioche v3 host with native winit + wgpu GPU viewer
+//!   bench-udp      - Encrypted UDP + GF(256) RS-FEC throughput & latency benchmark
+//!   bench-stream   - Persistent NVENC/HEVC-444 -> UDP+FEC (5% loss) -> Decoder -> Vulkan wgpu 60-frame E2E test
 
 use std::env;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use brioche_codec::{
-    bgra_to_yuv444p_bt709, encode_single_bgra_frame, probe_encoders, EncodeProfile, PixelChroma,
-    VideoCodec,
+    probe_encoders, EncodeProfile, PixelChroma, StreamingDecoder, StreamingEncoder, VideoCodec,
 };
-use brioche_proto::{FLAG_HEVC, FLAG_IDR, FLAG_YUV444, PROTO_VERSION};
+use brioche_input::{create_injector, MonitorRect};
+use brioche_proto::{
+    ControlMessage, MonitorDesc, FLAG_HEVC, FLAG_IDR, FLAG_YUV444, PROTO_VERSION,
+};
+use brioche_render::window::{run_viewer_window, PendingYuvFrame};
 use brioche_render::{ChromaFormat, GpuVideoRenderer};
+use brioche_transport::quic::{
+    bind_quic_server, connect_quic_client, generate_self_signed_identity, recv_control, send_control,
+};
 use brioche_transport::udp::{bind_tuned_udp, now_unix_us, UdpMediaReceiver, UdpMediaSender};
 use serde::Serialize;
 
@@ -29,14 +45,39 @@ struct BenchResult {
     latency_p99_ms: f64,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
-        Some("bench-udp") => run_bench(&args[2..]).await,
-        Some("bench-pipeline") => run_pipeline_bench().await,
+        Some("view") => run_view_cli(&args[2..]),
+        Some("host") => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(run_host_cli(&args[2..]));
+        }
+        Some("bench-udp") => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(run_bench_udp(&args[2..]));
+        }
+        Some("bench-stream") => {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(run_bench_stream(&args[2..]));
+        }
         _ => run_info(),
     }
+}
+
+fn arg_val<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
+    args.windows(2)
+        .find(|w| w[0] == key)
+        .map(|w| w[1].as_str())
 }
 
 fn run_info() {
@@ -73,138 +114,601 @@ fn run_info() {
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
 
-async fn run_pipeline_bench() {
-    let caps = probe_encoders();
-    let mut capture_ms = 0.0;
-    let mut cursor_info = serde_json::json!(null);
-    let (src_w, src_h, bgra) = {
-        #[cfg(target_os = "linux")]
-        {
-            match brioche_capture::linux_x11::X11ShmCapturer::open(1) {
-                Ok(mut cap) => {
-                    let frame = cap.grab_frame().expect("MIT-SHM grab failed");
-                    capture_ms = frame.capture_us as f64 / 1000.0;
-                    if let Ok((cur, changed)) = cap.grab_cursor() {
-                        cursor_info = serde_json::json!({
-                            "x": cur.x,
-                            "y": cur.y,
-                            "size": [cur.width, cur.height],
-                            "shape_changed": changed,
-                            "hash_prefix": &cur.shape_hash[..12],
-                        });
-                    }
-                    (frame.width, frame.height, frame.bgra)
-                }
-                Err(_) => (1920, 1080, vec![0x55u8; 1920 * 1080 * 4]),
-            }
+/// Live Brioche v3 Host: QUIC pinned control + MIT-SHM/XFixes capture + persistent NVENC + Brioche-UDP/FEC.
+async fn run_host_cli(args: &[String]) {
+    let bind_ip = arg_val(args, "--bind").unwrap_or("127.0.0.1");
+    let quic_port: u16 = arg_val(args, "--quic-port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let monitor_id: u32 = arg_val(args, "--monitor")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let view_only = args.iter().any(|a| a == "--view-only");
+
+    let key: [u8; 32] = if let Some(khex) = arg_val(args, "--key") {
+        let raw = hex::decode(khex).expect("invalid --key hex");
+        raw.try_into().expect("--key must be 32 bytes hex")
+    } else {
+        // Ephemeral 256-bit key derived from system time + pid + address entropy
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut out = [0u8; 32];
+        for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
+            let mut h = DefaultHasher::new();
+            now_unix_us().hash(&mut h);
+            std::process::id().hash(&mut h);
+            i.hash(&mut h);
+            chunk.copy_from_slice(&h.finish().to_be_bytes());
         }
-        #[cfg(not(target_os = "linux"))]
-        {
-            (1920u32, 1080u32, vec![0x55u8; 1920 * 1080 * 4])
-        }
+        out
     };
 
-    // Hardware encode real captured frame
-    let (encoded_bytes, encoder_used, encode_ms, chroma_444) = if let Some(ref c) = caps {
-        let ffmpeg = PathBuf::from(&c.ffmpeg_path);
-        let dst_w = src_w.min(2560) / 2 * 2;
-        let dst_h = src_h.min(1440) / 2 * 2;
+    let identity = generate_self_signed_identity().expect("QUIC cert generation failed");
+    let quic_addr: SocketAddr = format!("{bind_ip}:{quic_port}").parse().unwrap();
+    let (quic_ep, bound_quic) = bind_quic_server(quic_addr, &identity).expect("bind QUIC failed");
+
+    // Emit single-line machine-readable JSON for PySide6 supervisor
+    let ready = serde_json::json!({
+        "ready": true,
+        "quic_port": bound_quic.port(),
+        "pin": identity.sha256_pin,
+        "key": hex::encode(key),
+        "monitor": monitor_id,
+    });
+    println!("{}", ready);
+
+    while let Some(incoming) = quic_ep.accept().await {
+        let Ok(conn) = incoming.await else {
+            continue;
+        };
+        let peer_ip = conn.remote_address().ip();
+        let (mut ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
+            Ok(pair) => pair,
+            Err(_) => continue,
+        };
+        let Ok(ControlMessage::SessionHello {
+            udp_port,
+            requested_codec,
+            chroma_444,
+            fps,
+            bitrate_kbps,
+        }) = recv_control(&mut ctrl_recv).await
+        else {
+            continue;
+        };
+
+        let Some(caps) = probe_encoders() else {
+            eprintln!("no ffmpeg encoder found");
+            continue;
+        };
+        let ffmpeg = PathBuf::from(&caps.ffmpeg_path);
+        let use_nvenc = caps.hevc_nvenc || caps.h264_nvenc;
+        let codec = if requested_codec == "hevc" && caps.hevc_nvenc {
+            VideoCodec::Hevc
+        } else {
+            VideoCodec::H264
+        };
+        let chroma = if chroma_444 && (caps.hevc_nvenc_444 || caps.h264_nvenc_444) {
+            PixelChroma::Yuv444p
+        } else {
+            PixelChroma::Yuv420p
+        };
+
+        #[cfg(target_os = "linux")]
+        let monitors = brioche_capture::linux_x11::list_monitors().unwrap_or_default();
+        #[cfg(not(target_os = "linux"))]
+        let monitors: Vec<brioche_capture::MonitorInfo> = Vec::new();
+
+        let monitor_descs: Vec<MonitorDesc> = monitors
+            .iter()
+            .map(|m| MonitorDesc {
+                id: m.id,
+                name: m.name.clone(),
+                width: m.width,
+                height: m.height,
+                primary: m.primary,
+            })
+            .collect();
+
+        let active_mon = Arc::new(AtomicU32::new(monitor_id));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let peer_udp = SocketAddr::new(peer_ip, udp_port);
+        let udp_sock = bind_tuned_udp("0.0.0.0:0".parse().unwrap()).unwrap();
+        let mut sender = UdpMediaSender::new(udp_sock, peer_udp, &key, 1);
+
+        // Open capturer on Linux X11 MIT-SHM + XFixes
+        #[cfg(target_os = "linux")]
+        let mut cap = match brioche_capture::linux_x11::X11ShmCapturer::open(monitor_id) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("capture open failed: {e}");
+                continue;
+            }
+        };
+        #[cfg(target_os = "linux")]
+        let mon = cap.monitor().clone();
+        #[cfg(not(target_os = "linux"))]
+        let mon = brioche_capture::MonitorInfo {
+            id: 1,
+            name: "Display 1".into(),
+            left: 0,
+            top: 0,
+            width: 1920,
+            height: 1080,
+            primary: true,
+        };
+
+        let dst_w = mon.width.min(2560) / 2 * 2;
+        let dst_h = mon.height.min(1440) / 2 * 2;
+        let _ = send_control(
+            &mut ctrl_send,
+            &ControlMessage::StreamDescriptor {
+                stream_id: 1,
+                monitor_id: mon.id,
+                width: dst_w,
+                height: dst_h,
+                fps_limit: fps.clamp(30, 144),
+                codec: if matches!(codec, VideoCodec::Hevc) {
+                    "hevc".into()
+                } else {
+                    "h264".into()
+                },
+                chroma_444: matches!(chroma, PixelChroma::Yuv444p),
+                monitors: monitor_descs,
+            },
+        )
+        .await;
+
+        let mut injector = create_injector(
+            MonitorRect {
+                left: mon.left,
+                top: mon.top,
+                width: mon.width,
+                height: mon.height,
+            },
+            view_only,
+        );
+        let stop_rx = stop_flag.clone();
+        let active_mon_rx = active_mon.clone();
+        let input_task = tokio::spawn(async move {
+            while let Ok(msg) = recv_control(&mut ctrl_recv).await {
+                match msg {
+                    ControlMessage::InputEvent { event } => {
+                        let _ = injector.apply(&event);
+                    }
+                    ControlMessage::SwitchMonitor { monitor_id, .. } => {
+                        active_mon_rx.store(monitor_id, Ordering::Release);
+                    }
+                    _ => {}
+                }
+            }
+            injector.release_all();
+            stop_rx.store(true, Ordering::Release);
+        });
+
         let profile = EncodeProfile {
-            src_width: src_w,
-            src_height: src_h,
+            src_width: mon.width,
+            src_height: mon.height,
             dst_width: dst_w,
             dst_height: dst_h,
-            fps: 60,
-            bitrate_kbps: 20_000,
-            codec: if c.hevc_nvenc {
-                VideoCodec::Hevc
-            } else {
-                VideoCodec::H264
-            },
-            chroma: if c.h264_nvenc_444 {
-                PixelChroma::Yuv444p
-            } else {
-                PixelChroma::Yuv420p
-            },
+            fps: fps.clamp(30, 144),
+            bitrate_kbps: bitrate_kbps.clamp(2_000, 80_000),
+            codec,
+            chroma,
         };
-        let t0 = Instant::now();
-        let (bytes, enc) = encode_single_bgra_frame(&ffmpeg, &bgra, &profile, c.h264_nvenc)
-            .unwrap_or_else(|_| (vec![0xABu8; 48 * 1024], "synthetic"));
-        (
-            bytes,
-            enc,
-            t0.elapsed().as_secs_f64() * 1000.0,
-            c.h264_nvenc_444,
-        )
+        let mut encoder = match StreamingEncoder::start(&ffmpeg, &profile, use_nvenc) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("encoder start failed: {e}");
+                input_task.abort();
+                continue;
+            }
+        };
+
+        let frame_interval = Duration::from_secs_f64(1.0 / profile.fps as f64);
+        let mut last_sent = Instant::now();
+        let mut idle_streak = 0u32;
+
+        while !stop_flag.load(Ordering::Acquire) {
+            let tick = Instant::now();
+            let _ = sender.poll_feedback().await;
+
+            #[cfg(target_os = "linux")]
+            let grabbed = cap.grab_frame();
+            #[cfg(not(target_os = "linux"))]
+            let grabbed: Result<brioche_capture::CapturedFrame, _> = Ok(
+                brioche_capture::CapturedFrame {
+                    width: mon.width,
+                    height: mon.height,
+                    stride: mon.width * 4,
+                    bgra: vec![0x30u8; (mon.width * mon.height * 4) as usize],
+                    dirty: true,
+                    capture_us: 0,
+                },
+            );
+
+            // Separated hardware cursor sync over QUIC
+            #[cfg(target_os = "linux")]
+            if let Ok((cur, shape_changed)) = cap.grab_cursor() {
+                if shape_changed && cur.width > 0 && cur.height > 0 {
+                    let _ = send_control(
+                        &mut ctrl_send,
+                        &ControlMessage::CursorShape {
+                            hash: cur.shape_hash,
+                            width: cur.width,
+                            height: cur.height,
+                            hotspot_x: cur.hotspot_x,
+                            hotspot_y: cur.hotspot_y,
+                            rgba_hex: hex::encode(&cur.rgba),
+                        },
+                    )
+                    .await;
+                }
+                let nx = cur.x as f32 / mon.width.max(1) as f32;
+                let ny = cur.y as f32 / mon.height.max(1) as f32;
+                let visible = (0.0..=1.0).contains(&nx) && (0.0..=1.0).contains(&ny);
+                let _ = send_control(
+                    &mut ctrl_send,
+                    &ControlMessage::CursorPosition {
+                        x: nx,
+                        y: ny,
+                        visible,
+                    },
+                )
+                .await;
+            }
+
+            if let Ok(frame) = grabbed {
+                // Idle frame pacing: static desktop drops to ~2 FPS heartbeat; wakes instantly on change
+                let force_send = frame.dirty || last_sent.elapsed() >= Duration::from_millis(500);
+                if force_send {
+                    idle_streak = 0;
+                    if encoder.push_bgra(&frame.bgra).is_err() {
+                        break;
+                    }
+                    last_sent = Instant::now();
+                } else {
+                    idle_streak = idle_streak.saturating_add(1);
+                }
+            }
+
+            let quality = sender.current_quality();
+            while let Some(au) = encoder.try_recv_au() {
+                let mut flags = 0u8;
+                if au.is_idr {
+                    flags |= FLAG_IDR;
+                }
+                if matches!(encoder.codec, VideoCodec::Hevc) {
+                    flags |= FLAG_HEVC;
+                }
+                if matches!(encoder.chroma, PixelChroma::Yuv444p) {
+                    flags |= FLAG_YUV444;
+                }
+                let _ = sender
+                    .send_video_frame(&au.data, flags, quality.fec_percent, None)
+                    .await;
+            }
+
+            let sleep_for = if idle_streak > 4 {
+                Duration::from_millis(30)
+            } else {
+                frame_interval.saturating_sub(tick.elapsed())
+            };
+            if !sleep_for.is_zero() {
+                tokio::time::sleep(sleep_for).await;
+            }
+        }
+        input_task.abort();
+    }
+}
+
+/// Live Brioche v3 Viewer: native winit + wgpu Vulkan/Metal/DX12 window + QUIC + UDP/RS-FEC.
+fn run_view_cli(args: &[String]) {
+    let host = arg_val(args, "--host").unwrap_or("127.0.0.1").to_string();
+    let quic_port: u16 = arg_val(args, "--quic-port")
+        .and_then(|s| s.parse().ok())
+        .expect("--quic-port required");
+    let pin = arg_val(args, "--pin").expect("--pin required").to_string();
+    let key_hex = arg_val(args, "--key").expect("--key required");
+    let key: [u8; 32] = hex::decode(key_hex)
+        .expect("invalid --key hex")
+        .try_into()
+        .expect("--key must be 32 bytes hex");
+    let title = arg_val(args, "--title")
+        .unwrap_or("Brioche v2.0 · GPU 极速会话")
+        .to_string();
+    let fps: u32 = arg_val(args, "--fps")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let bitrate_kbps: u32 = arg_val(args, "--bitrate")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20_000);
+    let chroma_444 = !args.iter().any(|a| a == "--no-444");
+
+    let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel::<ControlMessage>();
+    let _ = run_viewer_window(title, ctrl_tx, move |viewer_handle| {
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let addr: SocketAddr = format!("{host}:{quic_port}").parse().unwrap();
+                let (_ep, conn) = match connect_quic_client(addr, &pin).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("QUIC connect failed: {e}");
+                        viewer_handle.close();
+                        return;
+                    }
+                };
+                let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                let udp_sock = bind_tuned_udp("0.0.0.0:0".parse().unwrap()).unwrap();
+                let local_udp_port = udp_sock.local_addr().unwrap().port();
+                let _ = send_control(
+                    &mut send,
+                    &ControlMessage::SessionHello {
+                        udp_port: local_udp_port,
+                        requested_codec: "hevc".into(),
+                        chroma_444,
+                        fps,
+                        bitrate_kbps,
+                    },
+                )
+                .await;
+
+                let Ok(ControlMessage::StreamDescriptor {
+                    stream_id,
+                    width,
+                    height,
+                    codec,
+                    chroma_444: actual_444,
+                    ..
+                }) = recv_control(&mut recv).await
+                else {
+                    viewer_handle.close();
+                    return;
+                };
+
+                viewer_handle.set_title(format!(
+                    "Brioche v2.0 · {width}×{height} · {} {}",
+                    codec.to_uppercase(),
+                    if actual_444 { "4:4:4" } else { "4:2:0" }
+                ));
+
+                // Outgoing input/control forwarder
+                tokio::spawn(async move {
+                    while let Ok(msg) = ctrl_rx.recv() {
+                        if send_control(&mut send, &msg).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+
+                // Incoming cursor/stream control listener
+                let vh_ctrl = viewer_handle.clone();
+                tokio::spawn(async move {
+                    while let Ok(msg) = recv_control(&mut recv).await {
+                        match msg {
+                            ControlMessage::CursorShape {
+                                width,
+                                height,
+                                rgba_hex,
+                                ..
+                            } => {
+                                if let Ok(rgba) = hex::decode(rgba_hex) {
+                                    vh_ctrl.update_cursor_shape(
+                                        width as u32,
+                                        height as u32,
+                                        rgba,
+                                    );
+                                }
+                            }
+                            ControlMessage::CursorPosition { x, y, visible } => {
+                                vh_ctrl.update_cursor_pos(x, y, visible);
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+
+                let ffmpeg = brioche_codec::find_ffmpeg().expect("ffmpeg required");
+                let vcodec = if codec == "hevc" {
+                    VideoCodec::Hevc
+                } else {
+                    VideoCodec::H264
+                };
+                let pchroma = if actual_444 {
+                    PixelChroma::Yuv444p
+                } else {
+                    PixelChroma::Yuv420p
+                };
+                let rchroma = if actual_444 {
+                    ChromaFormat::Yuv444p
+                } else {
+                    ChromaFormat::Yuv420p
+                };
+                let mut decoder =
+                    StreamingDecoder::start(&ffmpeg, vcodec, pchroma, width, height).unwrap();
+                let mut receiver = UdpMediaReceiver::new(udp_sock, &key, stream_id);
+
+                while let Ok(frame) = receiver.recv_frame().await {
+                    if decoder.push_access_unit(&frame.payload).is_err() {
+                        break;
+                    }
+                    if let Some(yuv) = decoder.recv_frame_timeout(Duration::from_millis(80)) {
+                        viewer_handle.publish_frame(PendingYuvFrame {
+                            width: yuv.width,
+                            height: yuv.height,
+                            chroma: rchroma,
+                            y: yuv.y,
+                            u: yuv.u,
+                            v: yuv.v,
+                        });
+                    }
+                }
+            });
+        });
+    });
+}
+
+/// Sustained 60-frame persistent streaming benchmark:
+/// Persistent NVENC HEVC 4:4:4 -> Multi-Stripe Encrypted UDP+RS-FEC (5% loss) -> Persistent Decoder -> Vulkan wgpu Shader.
+async fn run_bench_stream(args: &[String]) {
+    let total_frames: usize = arg_val(args, "--frames")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    let width = 1920u32;
+    let height = 1080u32;
+
+    let caps = probe_encoders().expect("ffmpeg required for bench-stream");
+    let ffmpeg = PathBuf::from(&caps.ffmpeg_path);
+    let use_nvenc = caps.hevc_nvenc || caps.h264_nvenc;
+    let codec = if caps.hevc_nvenc {
+        VideoCodec::Hevc
     } else {
-        (vec![0xABu8; 48 * 1024], "synthetic", 0.0, false)
+        VideoCodec::H264
+    };
+    let chroma = if caps.hevc_nvenc_444 || caps.h264_nvenc_444 {
+        PixelChroma::Yuv444p
+    } else {
+        PixelChroma::Yuv420p
+    };
+    let rchroma = match chroma {
+        PixelChroma::Yuv444p => ChromaFormat::Yuv444p,
+        PixelChroma::Yuv420p => ChromaFormat::Yuv420p,
     };
 
-    // Transmit encoded frame over encrypted Brioche-UDP + 15% RS-FEC with 5% loss
-    let key = [0x99u8; 32];
+    let profile = EncodeProfile {
+        src_width: width,
+        src_height: height,
+        dst_width: width,
+        dst_height: height,
+        fps: 60,
+        bitrate_kbps: 20_000,
+        codec,
+        chroma,
+    };
+    let mut encoder = StreamingEncoder::start(&ffmpeg, &profile, use_nvenc).unwrap();
+    let mut decoder = StreamingDecoder::start(&ffmpeg, encoder.codec, chroma, width, height).unwrap();
+    let mut renderer = GpuVideoRenderer::new(
+        width,
+        height,
+        rchroma,
+        wgpu::TextureFormat::Rgba8Unorm,
+    )
+    .unwrap();
+    renderer.set_sharpness(0.35);
+
+    let key = [0x5Au8; 32];
     let rx_sock = bind_tuned_udp("127.0.0.1:0".parse().unwrap()).unwrap();
     let rx_addr = rx_sock.local_addr().unwrap();
     let tx_sock = bind_tuned_udp("127.0.0.1:0".parse().unwrap()).unwrap();
     let mut sender = UdpMediaSender::new(tx_sock, rx_addr, &key, 1);
     let mut receiver = UdpMediaReceiver::new(rx_sock, &key, 1);
 
-    let t_net = Instant::now();
-    let rx_task = tokio::spawn(async move { receiver.recv_frame().await.unwrap() });
-    let flags = FLAG_IDR | if chroma_444 { FLAG_YUV444 } else { 0 };
-    let (_fid, dgrams_sent, dgrams_dropped) = sender
-        .send_video_frame(&encoded_bytes, flags, 15, Some(20))
-        .await
-        .unwrap();
-    let rx_frame = rx_task.await.unwrap();
-    let transport_ms = t_net.elapsed().as_secs_f64() * 1000.0;
-    assert_eq!(rx_frame.payload, encoded_bytes);
-
-    // Upload planar YUV444 frame to real wgpu Vulkan/Metal/D3D12 shader + render
-    let gpu_w = 1280u32;
-    let gpu_h = 720u32;
-    let sample_bgra = vec![0x70u8; (gpu_w * gpu_h * 4) as usize];
-    let (y, u, v) = bgra_to_yuv444p_bt709(&sample_bgra, gpu_w, gpu_h);
-    let gpu_report = match GpuVideoRenderer::new(
-        gpu_w,
-        gpu_h,
-        ChromaFormat::Yuv444p,
-        wgpu::TextureFormat::Rgba8Unorm,
-    ) {
-        Ok(mut renderer) => {
-            renderer.set_sharpness(0.35);
-            let t_gpu = Instant::now();
-            renderer
-                .upload_yuv(gpu_w, gpu_h, ChromaFormat::Yuv444p, &y, &u, &v)
-                .unwrap();
-            let _rgba = renderer.render_offscreen_rgba(gpu_w, gpu_h);
-            let gpu_ms = t_gpu.elapsed().as_secs_f64() * 1000.0;
-            serde_json::json!({
-                "adapter": renderer.adapter_name,
-                "backend": renderer.backend_name,
-                "upload_and_shader_render_ms": (gpu_ms * 1000.0).round() / 1000.0,
-            })
+    let started = Instant::now();
+    // True concurrent pipelining (no lockstep wait):
+    // Thread 1 pushes frames into persistent NVENC -> Thread 2 streams AUs over encrypted UDP+FEC
+    // -> Thread 3 receives & feeds persistent decoder -> Main uploads YUV444 to RTX 3090 Vulkan wgpu.
+    let (au_tx, mut au_rx) = tokio::sync::mpsc::channel::<brioche_codec::EncodedAccessUnit>(16);
+    let encoder_name = encoder.encoder_name;
+    let enc_codec = encoder.codec;
+    let push_handle = std::thread::spawn(move || {
+        let mut frame_buf = vec![0x48u8; (width * height * 4) as usize];
+        for i in 0..total_frames {
+            let bar_y = (i * 12) % (height as usize - 16);
+            let row_start = bar_y * width as usize * 4;
+            for b in &mut frame_buf[row_start..row_start + width as usize * 4 * 8] {
+                *b = ((i * 19 + 80) & 0xFF) as u8;
+            }
+            if encoder.push_bgra(&frame_buf).is_err() {
+                break;
+            }
+            while let Some(au) = encoder.try_recv_au() {
+                let _ = au_tx.blocking_send(au);
+            }
         }
-        Err(e) => serde_json::json!({ "error": e.to_string() }),
-    };
-
-    let summary = serde_json::json!({
-        "source_resolution": [src_w, src_h],
-        "capture_mit_shm_ms": (capture_ms * 1000.0).round() / 1000.0,
-        "hardware_cursor_separated": cursor_info,
-        "encoder": encoder_used,
-        "chroma_444": chroma_444,
-        "encoded_frame_bytes": encoded_bytes.len(),
-        "single_shot_encode_ms": (encode_ms * 1000.0).round() / 1000.0,
-        "udp_aead_fec_ms": (transport_ms * 1000.0).round() / 1000.0,
-        "udp_datagrams_sent": dgrams_sent,
-        "udp_datagrams_dropped_5pct": dgrams_dropped,
-        "fec_recovered": rx_frame.recovered_via_fec,
-        "wgpu_render": gpu_report,
+        encoder.finish_input();
+        while let Some(au) = encoder.recv_au_timeout(Duration::from_millis(300)) {
+            let _ = au_tx.blocking_send(au);
+        }
     });
-    println!("{}", serde_json::to_string_pretty(&summary).unwrap());
+
+    let send_task = tokio::spawn(async move {
+        let mut bytes_total = 0usize;
+        let mut dgrams_dropped = 0usize;
+        let mut sent_frames = 0usize;
+        while let Some(au) = au_rx.recv().await {
+            bytes_total += au.data.len();
+            let flags = if au.is_idr { FLAG_IDR } else { 0 } | FLAG_HEVC | FLAG_YUV444;
+            let (_fid, _s, dropped) = sender
+                .send_video_frame(&au.data, flags, 15, Some(20))
+                .await
+                .unwrap();
+            dgrams_dropped += dropped;
+            sent_frames += 1;
+        }
+        (bytes_total, dgrams_dropped, sent_frames)
+    });
+
+    let (yuv_tx, mut yuv_rx) = tokio::sync::mpsc::channel::<brioche_codec::DecodedYuvFrame>(8);
+    let recv_task = tokio::spawn(async move {
+        while let Ok(Ok(rx_frame)) =
+            tokio::time::timeout(Duration::from_millis(400), receiver.recv_frame()).await
+        {
+            if decoder.push_access_unit(&rx_frame.payload).is_err() {
+                break;
+            }
+            while let Some(yuv) = decoder.recv_frame_timeout(Duration::from_millis(2)) {
+                let _ = yuv_tx.send(yuv).await;
+            }
+        }
+        decoder.finish_input();
+        while let Some(yuv) = decoder.recv_frame_timeout(Duration::from_millis(300)) {
+            let _ = yuv_tx.send(yuv).await;
+        }
+        receiver.stats()
+    });
+
+    let mut decoded_frames = 0usize;
+    let mut gpu_upload_ms_total = 0.0;
+    while let Some(yuv) = yuv_rx.recv().await {
+        let t_gpu = Instant::now();
+        renderer
+            .upload_yuv(yuv.width, yuv.height, rchroma, &yuv.y, &yuv.u, &yuv.v)
+            .unwrap();
+        gpu_upload_ms_total += t_gpu.elapsed().as_secs_f64() * 1000.0;
+        decoded_frames += 1;
+    }
+
+    let _ = push_handle.join();
+    let (encoded_bytes_total, total_dgrams_dropped, _sent_frames) = send_task.await.unwrap();
+    let (udp_ok, udp_fec_rec, udp_dropped) = recv_task.await.unwrap();
+    let elapsed_s = started.elapsed().as_secs_f64();
+
+    let report = serde_json::json!({
+        "resolution": [width, height],
+        "encoder": encoder_name,
+        "codec": format!("{:?}", enc_codec),
+        "chroma": format!("{:?}", chroma),
+        "gpu_adapter": renderer.adapter_name,
+        "gpu_backend": renderer.backend_name,
+        "frames_pushed": total_frames,
+        "frames_decoded_and_gpu_uploaded": decoded_frames,
+        "sustained_e2e_fps": (decoded_frames as f64 / elapsed_s * 10.0).round() / 10.0,
+        "avg_frame_ms": (elapsed_s * 1000.0 / decoded_frames.max(1) as f64 * 100.0).round() / 100.0,
+        "avg_gpu_yuv_upload_ms": (gpu_upload_ms_total / decoded_frames.max(1) as f64 * 1000.0).round() / 1000.0,
+        "avg_encoded_kb": (encoded_bytes_total as f64 / total_frames.max(1) as f64 / 1024.0 * 10.0).round() / 10.0,
+        "udp_frames_ok": udp_ok,
+        "udp_fec_recovered": udp_fec_rec,
+        "udp_frames_dropped": udp_dropped,
+        "simulated_5pct_datagrams_dropped": total_dgrams_dropped,
+    });
+    println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
 
-async fn run_bench(args: &[String]) {
+async fn run_bench_udp(args: &[String]) {
     let mut frames: usize = 120;
     let mut frame_kb: usize = 48;
     let mut fec_percent: u8 = 15;

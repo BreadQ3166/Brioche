@@ -81,6 +81,7 @@ class EnvironmentBridge(QObject):
     host_clipboard = Signal(str)
     host_session_state = Signal(dict)
     nearby_lan = Signal(list)
+    core_engine_text = Signal(str)
     transfer_request = Signal(object)
     transfer_progress = Signal(dict)
 
@@ -147,6 +148,7 @@ class MainWindow(QMainWindow):
         self.bridge.host_clipboard.connect(self._apply_host_clipboard)
         self.bridge.host_session_state.connect(self._on_host_session_state)
         self.bridge.nearby_lan.connect(self._on_nearby_lan)
+        self.bridge.core_engine_text.connect(self._on_core_engine_text)
 
         self.host_pill = HostSessionPill()
         self.host_pill.pause_input_toggled.connect(self._set_hosts_input_paused)
@@ -209,6 +211,7 @@ class MainWindow(QMainWindow):
         self.lan_poll.start()
 
         self.refresh_environment()
+        self._probe_core_engine_async()
         self.refresh_lan()
         self.refresh_paired_devices()
         self.lan_listener = LanBeaconListener(
@@ -415,6 +418,9 @@ class MainWindow(QMainWindow):
         self.bitrate = sv.bitrate
         self.encoder = sv.encoder
         self.match_display = sv.match_display
+        self.stream_engine = sv.stream_engine
+        self.chroma_444 = sv.chroma_444
+        self.core_engine_status = sv.core_engine_status
         self.external_allowed = sv.external_allowed
         self.lan_allowed = sv.lan_allowed
         self.monitor = sv.monitor
@@ -468,6 +474,8 @@ class MainWindow(QMainWindow):
             control.currentIndexChanged.connect(self.custom_profile)
         self.bitrate.valueChanged.connect(self.custom_profile)
         self.match_display.toggled.connect(self.save_settings)
+        self.stream_engine.currentIndexChanged.connect(self.save_settings)
+        self.chroma_444.toggled.connect(self.save_settings)
         for control in (self.mode, self.encoder, self.address, self.monitor):
             control.currentIndexChanged.connect(self.save_settings)
         for control in (self.port, self.web_port):
@@ -935,6 +943,8 @@ class MainWindow(QMainWindow):
             fps=self.fps.currentData(),
             bitrate=self.bitrate.value(),
             match_display=self.match_display.isChecked(),
+            stream_engine=self.stream_engine.currentData(),
+            chroma_444=self.chroma_444.isChecked(),
             files_enabled=self.file_enabled.isChecked(),
             file_browser_enabled=self.file_browser_enabled.isChecked(),
             clipboard_enabled=self.clipboard_enabled.isChecked(),
@@ -1056,6 +1066,39 @@ class MainWindow(QMainWindow):
                     pass
 
         threading.Thread(target=run, name="brioche-" + operation, daemon=True).start()
+
+    def _on_core_engine_text(self, text):
+        if hasattr(self, "core_engine_status"):
+            self.core_engine_status.setText(text)
+
+    def _probe_core_engine_async(self):
+        from .core_engine import probe_core_capabilities
+
+        def work():
+            caps = probe_core_capabilities()
+            if caps.get("available"):
+                gpu = caps.get("gpu_renderer") or {}
+                enc = caps.get("encoders") or {}
+                parts = []
+                if gpu.get("available"):
+                    parts.append(f"GPU：{gpu.get('adapter')} ({gpu.get('backend')})")
+                if enc.get("hevc_nvenc"):
+                    parts.append("HEVC NVENC")
+                elif enc.get("h264_nvenc"):
+                    parts.append("H.264 NVENC")
+                if enc.get("hevc_nvenc_444") or enc.get("h264_nvenc_444"):
+                    parts.append("YUV 4:4:4 就绪")
+                parts.append("UDP+RS-FEC · QUIC TLS1.3")
+                text = f"v{caps.get('version', '2.0')} 已就绪 · " + " · ".join(parts)
+            else:
+                text = f"未检测到原生引擎（将自动使用 v1.x 兼容内核）：{caps.get('reason', '')}"
+            if self._alive:
+                try:
+                    self.bridge.core_engine_text.emit(text)
+                except RuntimeError:
+                    pass
+
+        threading.Thread(target=work, name="brioche-core-probe", daemon=True).start()
 
     def refresh_environment(self):
         if self._busy or not self._alive:

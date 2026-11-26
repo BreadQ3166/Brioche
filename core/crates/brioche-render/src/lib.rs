@@ -1,6 +1,8 @@
 //! GPU-accelerated wgpu (Vulkan / Metal / D3D12) planar YUV420P & YUV444P renderer
 //! with Contrast Adaptive Sharpening (CAS) and separated hardware cursor compositing.
 
+pub mod window;
+
 use bytemuck::{Pod, Zeroable};
 use thiserror::Error;
 use wgpu::util::DeviceExt;
@@ -33,7 +35,7 @@ struct Uniforms {
 pub struct GpuVideoRenderer {
     pub adapter_name: String,
     pub backend_name: String,
-    device: wgpu::Device,
+    pub(crate) device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -87,6 +89,20 @@ impl GpuVideoRenderer {
             None,
         ))
         .map_err(|e| RenderError::Device(e.to_string()))?;
+
+        Self::from_device(device, queue, adapter_name, backend_name, width, height, chroma, target_format)
+    }
+
+    pub fn from_device(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        adapter_name: String,
+        backend_name: String,
+        width: u32,
+        height: u32,
+        chroma: ChromaFormat,
+        target_format: wgpu::TextureFormat,
+    ) -> Result<Self, RenderError> {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("brioche-yuv-cas-shader"),

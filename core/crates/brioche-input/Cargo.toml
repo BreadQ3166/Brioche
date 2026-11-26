@@ -1,0 +1,12 @@
+[package]
+name = "brioche-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+brioche-proto = { path = "../brioche-proto" }
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+x11rb = { version = "0.13", features = ["xtest"] }

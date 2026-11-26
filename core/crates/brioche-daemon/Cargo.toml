@@ -11,9 +11,11 @@ path = "src/main.rs"
 [dependencies]
 brioche-capture = { path = "../brioche-capture" }
 brioche-codec = { path = "../brioche-codec" }
+brioche-input = { path = "../brioche-input" }
 brioche-proto = { path = "../brioche-proto" }
 brioche-render = { path = "../brioche-render" }
 brioche-transport = { path = "../brioche-transport" }
+hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

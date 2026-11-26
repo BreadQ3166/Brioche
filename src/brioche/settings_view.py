@@ -245,6 +245,33 @@ class SettingsView(QWidget):
         self.match_display.setEnabled(self.resolution.currentData() != "native")
         layout.addWidget(self.match_display)
         col.addWidget(card)
+
+        v2_card, v2_layout = _card(
+            "下一代串流内核（brioche-core v2.0 · Rust + UDP/QUIC + GPU）",
+            "采用多条带 RS-FEC 加密 UDP + QUIC 钉扎控制面 + HEVC YUV 4:4:4 文字锐利 + wgpu 原生着色器渲染。",
+        )
+        v2_form = QFormLayout()
+        v2_form.setSpacing(10)
+        self.stream_engine = self._combo()
+        self.stream_engine.addItem("自动 · 可用时启用 v2.0 Rust UDP/GPU 内核", "auto")
+        self.stream_engine.addItem("v2.0 原生引擎（UDP + RS-FEC + wgpu）", "v2_core")
+        self.stream_engine.addItem("v1.x 兼容引擎（TLS/TCP + Qt 画布）", "v1_compat")
+        self.stream_engine.setCurrentIndex(
+            max(0, self.stream_engine.findData(self.store.setting("stream_engine", "auto")))
+        )
+        v2_form.addRow("串流引擎模式", self.stream_engine)
+        v2_layout.addLayout(v2_form)
+
+        self.chroma_444 = QCheckBox("开启 YUV 4:4:4 文字锐利模式（4K/2K 办公与代码无色度模糊，需硬件支持）")
+        self.chroma_444.setChecked(bool(self.store.setting("chroma_444", True)))
+        v2_layout.addWidget(self.chroma_444)
+
+        self.core_engine_status = QLabel("正在检测 brioche-core 原生引擎与 GPU 能力…")
+        self.core_engine_status.setObjectName("muted")
+        self.core_engine_status.setWordWrap(True)
+        v2_layout.addWidget(self.core_engine_status)
+        col.addWidget(v2_card)
+
         col.addStretch()
         return self._wrap_scroll(page)
 
