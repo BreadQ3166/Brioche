@@ -166,8 +166,16 @@ class EmbeddedNetwork:
         with self.lock:
             if host.stop_requested.is_set():
                 return
-            self.request("share", share={"port": host.port, "pin": host.pin, "token": host.token,
-                                         "busy": host.session_gate.active})
+            payload = {
+                "port": host.port,
+                "pin": host.pin,
+                "token": host.token,
+                "busy": host.session_gate.active,
+            }
+            core_udp_port = getattr(host, "core_udp_port", 0)
+            if core_udp_port:
+                payload["udp_port"] = int(core_udp_port)
+            self.request("share", share=payload)
 
     def clear(self, token=""):
         if self.process and self.process.poll() is None:
@@ -178,6 +186,11 @@ class EmbeddedNetwork:
         uri = access_uri("127.0.0.1", result["port"], result["pin"], result["token"])
         parse_uri(uri)
         return uri
+
+    def open_udp_tunnel(self, ip, port=47997):
+        """Open a local loopback UDP port bridged over Tailscale WireGuard to peer :47997/udp."""
+        result = self.request("udp_tunnel", ip=ip, port=int(port))
+        return int(result["port"]), str(result.get("tunnel", ""))
 
     def proxy_uri(self, uri):
         host, port, pin, token = parse_uri(uri)

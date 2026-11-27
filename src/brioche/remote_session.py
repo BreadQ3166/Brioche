@@ -83,38 +83,58 @@ class Bridge(QObject):
     network = Signal(dict)
     clipboard = Signal(str)
     reconnect_uri_ready = Signal(str, str)
+    frame_ready = Signal()
 
 
 class FrameMailbox:
-    def __init__(self):
+    def __init__(self, prefer_yuv=False, on_ready=None):
         self.lock = threading.Lock()
         self.image = None
+        self.prefer_yuv = bool(prefer_yuv)
+        self._on_ready = on_ready
+        self._wake_pending = threading.Event()
+        self._seq = 0
 
     def publish(self, frame):
-        if frame.format.name == "bgra" and sys.byteorder == "little":
-            pixel_format = QImage.Format.Format_RGB32
+        fmt = frame.format.name
+        if self.prefer_yuv and fmt in ("yuv420p", "yuvj420p", "yuv444p", "yuvj444p", "nv12"):
+            from .gpu_canvas import YuvFrame
+
+            self._seq += 1
+            item = YuvFrame.from_av_frame(frame, frame_id=self._seq)
         else:
-            if frame.format.name != "rgb24":
-                frame = frame.reformat(format="rgb24")
-            pixel_format = QImage.Format.Format_RGB888
-        plane = frame.planes[0]
-        # A deep copy owns the pixels after PyAV releases the decoded frame.
-        image = QImage(
-            memoryview(plane),
-            frame.width,
-            frame.height,
-            plane.line_size,
-            pixel_format,
-        ).copy()
+            if fmt == "bgra" and sys.byteorder == "little":
+                pixel_format = QImage.Format.Format_RGB32
+            else:
+                if fmt != "rgb24":
+                    frame = frame.reformat(format="rgb24")
+                pixel_format = QImage.Format.Format_RGB888
+            plane = frame.planes[0]
+            # A deep copy owns the pixels after PyAV releases the decoded frame.
+            item = QImage(
+                memoryview(plane),
+                frame.width,
+                frame.height,
+                plane.line_size,
+                pixel_format,
+            ).copy()
         with self.lock:
-            self.image = image
+            self.image = item
+        if self._on_ready is not None and not self._wake_pending.is_set():
+            self._wake_pending.set()
+            try:
+                self._on_ready()
+            except RuntimeError:
+                pass
 
     def take(self):
+        self._wake_pending.clear()
         with self.lock:
             image, self.image = self.image, None
         return image
 
     def clear(self):
+        self._wake_pending.clear()
         with self.lock:
             self.image = None
 
@@ -170,16 +190,76 @@ class RemoteCanvas(QWidget):
         self.setMinimumSize(480, 270)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.gpu_surface = None
+        self._yuv_frame = None
+        from .gpu_canvas import GpuYuvSurface, gpu_opengl_allowed
+
+        if gpu_opengl_allowed():
+            try:
+                self.gpu_surface = GpuYuvSurface(self)
+                self.gpu_surface.hide()
+            except Exception:
+                self.gpu_surface = None
+
+    @property
+    def has_frame(self):
+        return self._yuv_frame is not None or self.image is not None
+
+    def supports_gpu_yuv(self):
+        return self.gpu_surface is not None
+
+    def set_frame(self, frame):
+        from .gpu_canvas import YuvFrame
+
+        if isinstance(frame, YuvFrame):
+            self._yuv_frame = frame
+            self.image = None
+            if self.gpu_surface is not None:
+                self.gpu_surface.setGeometry(self.rect())
+                self.gpu_surface.set_target_rect(self.image_rect())
+                if not self.gpu_surface.isVisible():
+                    self.gpu_surface.show()
+                    self.gpu_surface.lower()
+                self.gpu_surface.set_frame(frame)
+                return
+            # Fallback if GL surface unavailable
+            self.update()
+        else:
+            self._yuv_frame = None
+            self.image = frame
+            if self.gpu_surface is not None and self.gpu_surface.isVisible():
+                self.gpu_surface.clear_frame()
+                self.gpu_surface.hide()
+            self.update()
+
+    def clear_frame(self):
+        self._yuv_frame = None
+        self.image = None
+        if self.gpu_surface is not None:
+            self.gpu_surface.clear_frame()
+            self.gpu_surface.hide()
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self.gpu_surface is not None:
+            self.gpu_surface.setGeometry(self.rect())
+            self.gpu_surface.set_target_rect(self.image_rect())
 
     def set_scale_mode(self, mode):
         if mode in ("fit", "actual", "fill"):
             self.scale_mode = mode
+            if self.gpu_surface is not None:
+                self.gpu_surface.set_target_rect(self.image_rect())
             self.update()
 
     def image_rect(self):
-        if self.image is None:
+        if self._yuv_frame is not None:
+            iw, ih = self._yuv_frame.width, self._yuv_frame.height
+        elif self.image is not None:
+            iw, ih = self.image.width(), self.image.height()
+        else:
             return QRectF()
-        iw, ih = self.image.width(), self.image.height()
         if self.scale_mode == "actual":
             dpr = max(1.0, float(self.devicePixelRatioF()))
             w, h = iw / dpr, ih / dpr
@@ -370,9 +450,14 @@ class RemoteSessionPage(QWidget):
         self.current_info = {}
         self._uri = uri
         self._transfer_dialog = None
-        self.mailbox = FrameMailbox()
+        self.canvas = RemoteCanvas(None)
+        self._prefer_yuv = self.canvas.supports_gpu_yuv()
+        self.mailbox = FrameMailbox(
+            prefer_yuv=self._prefer_yuv,
+            on_ready=lambda: self.bridge.frame_ready.emit() if not self._closed else None,
+        )
         self.viewer = self._create_viewer(uri)
-        self.canvas = RemoteCanvas(self.viewer)
+        self.canvas.viewer = self.viewer
         self.stats_values = {}
         self.presented, self.since, self.presented_fps = 0, time.monotonic(), 0.0
         self._path_text = {
@@ -442,14 +527,16 @@ class RemoteSessionPage(QWidget):
         self.bridge.network.connect(self.path_result)
         self.bridge.clipboard.connect(self._apply_remote_clipboard)
         self.bridge.reconnect_uri_ready.connect(self._finish_reconnect)
+        self.bridge.frame_ready.connect(self.present)
 
         self._qt_clipboard = QApplication.clipboard()
         if self._qt_clipboard is not None:
             self._qt_clipboard.dataChanged.connect(self._on_local_clipboard_changed)
 
+        # Event-driven presentation via frame_ready eliminates 6ms polling jitter;
+        # this lightweight 250ms timer only drives HUD metrics & fallback housekeeping.
         self.timer = QTimer(self)
-        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.timer.setInterval(6)
+        self.timer.setInterval(250)
         self.timer.timeout.connect(self.present)
         self.timer.start()
 
@@ -477,6 +564,7 @@ class RemoteSessionPage(QWidget):
             audio_enabled=self._audio_enabled,
             on_audio=lambda payload, g=gen: self._push_audio(payload) if g == self._viewer_gen else None,
             reconnect=reconnect,
+            prefer_yuv=self._prefer_yuv,
         )
 
     def _push_audio(self, payload):
@@ -558,7 +646,7 @@ class RemoteSessionPage(QWidget):
         self.toolbar.show()
         self.toolbar.raise_()
         self.toolbar.reposition()
-        if not self.toolbar.pin_btn.isChecked() and self.canvas.image is not None:
+        if not self.toolbar.pin_btn.isChecked() and self.canvas.has_frame:
             self._hide_timer.start()
 
     def _collapse_toolbar(self):
@@ -566,7 +654,7 @@ class RemoteSessionPage(QWidget):
             self.toolbar.pin_btn.isChecked()
             or self.toolbar.underMouse()
             or self.toolbar.monitor_selector.view().isVisible()
-            or self.canvas.image is None
+            or not self.canvas.has_frame
         ):
             return
         self.toolbar.hide()
@@ -578,7 +666,7 @@ class RemoteSessionPage(QWidget):
         if pinned:
             self._hide_timer.stop()
             self.reveal_toolbar()
-        elif self.canvas.image is not None:
+        elif self.canvas.has_frame:
             self._hide_timer.start()
 
     def _toggle_hud(self, visible):
@@ -748,7 +836,7 @@ class RemoteSessionPage(QWidget):
 
     def set_status(self, message):
         self.canvas.message = message
-        if self.canvas.image is None:
+        if not self.canvas.has_frame:
             self.canvas.update()
         else:
             self.toast.show_message(message)
@@ -758,7 +846,7 @@ class RemoteSessionPage(QWidget):
         state = (
             "reconnecting"
             if self._reconnecting
-            else ("offline" if self._disconnected else ("online" if self.canvas.image is not None else "connecting"))
+            else ("offline" if self._disconnected else ("online" if self.canvas.has_frame else "connecting"))
         )
         title = self.display_name
         if self._reconnecting:
@@ -797,7 +885,7 @@ class RemoteSessionPage(QWidget):
             if self._auto_reconnect and info.get("retryable") and not self._closed:
                 self._schedule_reconnect(info.get("reason", ""))
                 return
-            if self.canvas.image is None:
+            if not self.canvas.has_frame:
                 self.canvas.message = self.canvas.message or info.get("reason") or "连接已结束，请关闭此标签页后重试"
                 self.canvas.update()
             self.reconnect_overlay.hide()
@@ -847,8 +935,7 @@ class RemoteSessionPage(QWidget):
             self.canvas.release_input()
             if info["type"] == "stream":
                 self.mailbox.clear()
-                self.canvas.image = None
-                self.canvas.update()
+                self.canvas.clear_frame()
                 self.stats_values.clear()
                 self.presented, self.since = 0, time.monotonic()
             self.canvas.allowed = info.get("input", False)
@@ -880,7 +967,7 @@ class RemoteSessionPage(QWidget):
         if self.viewer.switch_monitor(selected):
             self.canvas.allowed = False
             self.mailbox.clear()
-            self.canvas.image = None
+            self.canvas.clear_frame()
             self.canvas.message = f"正在切换到显示器 {selected}…"
             self.canvas.update()
             self.monitor_selector.setEnabled(False)
@@ -914,11 +1001,10 @@ class RemoteSessionPage(QWidget):
         self.toolbar.reposition()
 
     def present(self):
-        image = self.mailbox.take()
-        if image is not None:
-            first_frame = self.canvas.image is None
-            self.canvas.image = image
-            self.canvas.update()
+        frame = self.mailbox.take()
+        if frame is not None:
+            first_frame = not self.canvas.has_frame
+            self.canvas.set_frame(frame)
             self.presented += 1
             if first_frame:
                 self._emit_tab_meta()
@@ -926,10 +1012,18 @@ class RemoteSessionPage(QWidget):
                     self._hide_timer.start()
         now = time.monotonic()
         if now - self.since >= 1:
-            painted_fps = self.canvas.painted / (now - self.since)
-            paint_ms = self.canvas.paint_ms / max(1, self.canvas.painted)
-            self.canvas.painted = 0
-            self.canvas.paint_ms = 0.0
+            if self.canvas.gpu_surface is not None and self.canvas.gpu_surface.isVisible():
+                painted_count = self.canvas.gpu_surface.painted
+                paint_total = self.canvas.gpu_surface.paint_ms
+                self.canvas.gpu_surface.painted = 0
+                self.canvas.gpu_surface.paint_ms = 0.0
+            else:
+                painted_count = self.canvas.painted
+                paint_total = self.canvas.paint_ms
+                self.canvas.painted = 0
+                self.canvas.paint_ms = 0.0
+            painted_fps = painted_count / (now - self.since)
+            paint_ms = paint_total / max(1, painted_count)
             self.presented_fps = self.presented / (now - self.since)
             self.presented, self.since = 0, now
             self.hud.update_metrics(
@@ -978,6 +1072,8 @@ class RemoteSessionPage(QWidget):
         self.path_timer.stop()
         self.timer.stop()
         self.canvas.release_input()
+        if self.canvas.gpu_surface is not None:
+            self.canvas.gpu_surface.cleanup()
         self.viewer.stop()
         self.viewer.join(2)
 

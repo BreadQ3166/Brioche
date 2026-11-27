@@ -5,7 +5,9 @@
 use std::ffi::c_void;
 use std::time::Instant;
 
-use crate::{CaptureError, CapturedFrame, CursorSnapshot, DirtyDetector, MonitorInfo};
+use crate::{
+    CaptureError, CapturedFrame, CapturedFrameRef, CursorSnapshot, DirtyDetector, MonitorInfo,
+};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -84,6 +86,7 @@ pub struct MacCgCapturer {
     display_id: u32,
     monitor: MonitorInfo,
     dirty: DirtyDetector,
+    frame_buf: Vec<u8>,
 }
 
 unsafe impl Send for MacCgCapturer {}
@@ -104,6 +107,7 @@ impl MacCgCapturer {
             display_id: idx,
             monitor,
             dirty: DirtyDetector::default(),
+            frame_buf: Vec::new(),
         })
     }
 
@@ -111,7 +115,7 @@ impl MacCgCapturer {
         &self.monitor
     }
 
-    pub fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+    pub fn grab_frame_ref(&mut self) -> Result<CapturedFrameRef<'_>, CaptureError> {
         let started = Instant::now();
         unsafe {
             let img = CGDisplayCreateImage(self.display_id);
@@ -136,26 +140,46 @@ impl MacCgCapturer {
             let len = CFDataGetLength(data) as usize;
             let ptr = CFDataGetBytePtr(data);
             let row_bytes = width as usize * 4;
-            let mut bgra = Vec::with_capacity(row_bytes * height as usize);
+            self.frame_buf.clear();
+            self.frame_buf.reserve(row_bytes * height as usize);
             if !ptr.is_null() && len >= stride * height as usize {
                 let raw = std::slice::from_raw_parts(ptr, len);
-                for r in 0..height as usize {
-                    bgra.extend_from_slice(&raw[r * stride..r * stride + row_bytes]);
+                if stride == row_bytes {
+                    self.frame_buf.extend_from_slice(&raw[..row_bytes * height as usize]);
+                } else {
+                    for r in 0..height as usize {
+                        self.frame_buf
+                            .extend_from_slice(&raw[r * stride..r * stride + row_bytes]);
+                    }
                 }
             }
             CFRelease(data);
             CGImageRelease(img);
 
-            let dirty = self.dirty.check_bgra(&bgra, width, height, width * 4);
-            Ok(CapturedFrame {
+            let dirty = self
+                .dirty
+                .check_bgra(&self.frame_buf, width, height, width * 4);
+            Ok(CapturedFrameRef {
                 width,
                 height,
                 stride: width * 4,
-                bgra,
+                bgra: &self.frame_buf,
                 dirty,
                 capture_us: started.elapsed().as_micros() as u64,
             })
         }
+    }
+
+    pub fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        let r = self.grab_frame_ref()?;
+        Ok(CapturedFrame {
+            width: r.width,
+            height: r.height,
+            stride: r.stride,
+            bgra: r.bgra.to_vec(),
+            dirty: r.dirty,
+            capture_us: r.capture_us,
+        })
     }
 
     pub fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError> {

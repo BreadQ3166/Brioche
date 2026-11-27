@@ -378,6 +378,7 @@ class MainWindow(QMainWindow):
         self.drawer = DeviceInspectorDrawer(self)
         self.drawer.connect_requested.connect(self.connect_unified_device)
         self.drawer.lan_connect_requested.connect(self.connect_device_via_lan)
+        self.drawer.v2_connect_requested.connect(self.connect_device_via_v2_lan)
         self.drawer.bind_lan_requested.connect(self.open_direct_lan_dialog)
         self.drawer.files_requested.connect(self.open_device_file_manager)
         self.drawer.profile_changed.connect(self._on_device_profile_changed)
@@ -767,6 +768,11 @@ class MainWindow(QMainWindow):
             )
             lan_act.setEnabled(bool(lan_ch.get("connectable")))
             lan_act.triggered.connect(lambda: self.connect_device_via_lan(device))
+            v2_act = menu.addAction(
+                f"🚀 v2.0 Rust UDP/GPU 极速直连 ({lan_ch['ip']})"
+            )
+            v2_act.setEnabled(bool(lan_ch.get("connectable")))
+            v2_act.triggered.connect(lambda: self.connect_device_via_v2_lan(device))
         bind_lan_act = menu.addAction(
             "修改并指定局域网 IP 连接…" if lan_ch else "⚡ 指定局域网 IP 直连…"
         )
@@ -1387,6 +1393,20 @@ class MainWindow(QMainWindow):
             display_name=device.get("display_name", device.get("name", "")),
         )
 
+    def connect_device_via_v2_lan(self, device):
+        lan_ch = (device.get("channels") or {}).get("lan")
+        if not lan_ch or not lan_ch.get("connectable"):
+            self.dashboard_note.setText("该设备局域网通道未在线，无法发起 v2.0 UDP/GPU 直连。")
+            return
+        self.connect_device(
+            "lan",
+            lan_ch,
+            profile=device.get("profile"),
+            device_key=f"v2:{device.get('key')}",
+            display_name=device.get("display_name", device.get("name", "")),
+            force_engine="v2_core",
+        )
+
     def connect_device_via_tailscale(self, device):
         ts_ch = (device.get("channels") or {}).get("tailscale")
         if not ts_ch or not ts_ch.get("connectable"):
@@ -1473,7 +1493,7 @@ class MainWindow(QMainWindow):
                 return True
         return False
 
-    def connect_device(self, mode, data, profile=None, device_key=None, display_name=""):
+    def connect_device(self, mode, data, profile=None, device_key=None, display_name="", force_engine=None):
         session_key = device_key or f"{mode}:{data['ip']}"
         if self._focus_existing_session(session_key):
             return
@@ -1514,7 +1534,7 @@ class MainWindow(QMainWindow):
                     remembered["token"],
                 )
             v2_endpoint = None
-            engine_pref = self.store.setting("stream_engine", "auto")
+            engine_pref = force_engine or self.store.setting("stream_engine", "auto")
             if mode == "lan" and engine_pref == "v2_core":
                 from .core_engine import find_core_binary, negotiate_v2_endpoint
 
@@ -1590,6 +1610,8 @@ class MainWindow(QMainWindow):
                 fps=cfg.fps,
                 bitrate_kbps=cfg.bitrate_mbps * 1000,
                 chroma_444=bool(self.chroma_444.isChecked()),
+                audio=bool(self.sync_audio.isChecked()),
+                clipboard=(self.clipboard_mode.currentData() != "off"),
             )
             self._v2_viewer_procs.append(proc)
             self.dashboard_note.setText(

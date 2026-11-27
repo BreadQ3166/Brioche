@@ -11,9 +11,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use serde::Serialize;
 use thiserror::Error;
+
+#[cfg(target_os = "macos")]
+pub mod macos_vt;
 
 #[derive(Debug, Error)]
 pub enum CodecError {
@@ -42,10 +46,14 @@ pub enum PixelChroma {
 #[derive(Debug, Clone, Serialize)]
 pub struct EncoderCapabilities {
     pub ffmpeg_path: String,
+    pub in_process_videotoolbox: bool,
     pub h264_nvenc: bool,
     pub hevc_nvenc: bool,
+    pub av1_nvenc: bool,
     pub h264_nvenc_444: bool,
     pub hevc_nvenc_444: bool,
+    pub h264_cuvid: bool,
+    pub hevc_cuvid: bool,
     pub h264_vaapi: bool,
     pub h264_videotoolbox: bool,
     pub hevc_videotoolbox: bool,
@@ -80,48 +88,72 @@ pub struct DecodedYuvFrame {
     pub v: Vec<u8>,
 }
 
-pub fn find_ffmpeg() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("BRIOCHE_FFMPEG") {
-        let path = PathBuf::from(p);
-        if path.is_file() {
-            return Some(path);
+/// Verify an ffmpeg binary supports rawvideo + h264 mux/demux required by streaming pipelines.
+fn ffmpeg_supports_raw_streaming(ffmpeg: &Path) -> bool {
+    let out = Command::new(ffmpeg)
+        .args(["-hide_banner", "-muxers"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            txt.contains(" rawvideo ") && txt.contains(" h264 ")
         }
+        _ => false,
+    }
+}
+
+fn ffmpeg_has_decoder(ffmpeg: &Path, decoder: &str) -> bool {
+    let out = Command::new(ffmpeg)
+        .args(["-hide_banner", "-decoders"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let txt = String::from_utf8_lossy(&o.stdout);
+            txt.lines().any(|line| line.split_whitespace().nth(1) == Some(decoder))
+        }
+        _ => false,
+    }
+}
+
+pub fn find_ffmpeg() -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(p) = std::env::var("BRIOCHE_FFMPEG") {
+        candidates.push(PathBuf::from(p));
     }
     let bin_name = if cfg!(windows) { "ffmpeg.exe" } else { "ffmpeg" };
-    // Check bundled sibling media/ffmpeg relative to brioche-core executable first.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            for rel in [
-                exe_dir.join("..").join("media").join(bin_name),
-                exe_dir.join("media").join(bin_name),
-                exe_dir.join(bin_name),
-            ] {
-                if rel.is_file() {
-                    return Some(rel);
-                }
-            }
+            candidates.push(exe_dir.join("..").join("media").join(bin_name));
+            candidates.push(exe_dir.join("media").join(bin_name));
+            candidates.push(exe_dir.join(bin_name));
         }
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let cand = dir.join(bin_name);
-            if cand.is_file() {
-                return Some(cand);
-            }
+            candidates.push(dir.join(bin_name));
         }
     }
-    let candidates = [
-        "/usr/bin/ffmpeg",
-        "/usr/local/bin/ffmpeg",
-        "/opt/homebrew/bin/ffmpeg",
-    ];
-    for c in candidates {
-        let p = Path::new(c);
-        if p.is_file() {
-            return Some(p.to_path_buf());
+    for c in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"] {
+        candidates.push(PathBuf::from(c));
+    }
+    // Prefer a candidate that supports full rawvideo + h264 streaming (skip legacy stripped builds).
+    let mut fallback: Option<PathBuf> = None;
+    for path in candidates {
+        if !path.is_file() {
+            continue;
+        }
+        if ffmpeg_supports_raw_streaming(&path) {
+            return Some(path);
+        }
+        if fallback.is_none() {
+            fallback = Some(path);
         }
     }
-    None
+    fallback
 }
 
 fn test_encoder(ffmpeg: &Path, encoder: &str, pix_fmt: &str) -> bool {
@@ -153,20 +185,50 @@ fn test_encoder(ffmpeg: &Path, encoder: &str, pix_fmt: &str) -> bool {
 }
 
 pub fn probe_encoders() -> Option<EncoderCapabilities> {
-    let ffmpeg = find_ffmpeg()?;
-    Some(EncoderCapabilities {
-        ffmpeg_path: ffmpeg.display().to_string(),
-        h264_nvenc: test_encoder(&ffmpeg, "h264_nvenc", "nv12"),
-        hevc_nvenc: test_encoder(&ffmpeg, "hevc_nvenc", "nv12"),
-        h264_nvenc_444: test_encoder(&ffmpeg, "h264_nvenc", "yuv444p"),
-        hevc_nvenc_444: test_encoder(&ffmpeg, "hevc_nvenc", "yuv444p"),
-        h264_vaapi: false,
-        h264_videotoolbox: cfg!(target_os = "macos")
-            && test_encoder(&ffmpeg, "h264_videotoolbox", "nv12"),
-        hevc_videotoolbox: cfg!(target_os = "macos")
-            && test_encoder(&ffmpeg, "hevc_videotoolbox", "nv12"),
-        libx264: test_encoder(&ffmpeg, "libx264", "yuv420p"),
-    })
+    #[cfg(target_os = "macos")]
+    {
+        // macOS 12+ has native in-process Apple VideoToolbox H.264/HEVC with zero ffmpeg needed!
+        let ffmpeg_path = find_ffmpeg()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "in-process:VideoToolbox".to_string());
+        return Some(EncoderCapabilities {
+            ffmpeg_path,
+            in_process_videotoolbox: true,
+            h264_nvenc: false,
+            hevc_nvenc: false,
+            av1_nvenc: false,
+            h264_nvenc_444: false,
+            hevc_nvenc_444: false,
+            h264_cuvid: false,
+            hevc_cuvid: false,
+            h264_vaapi: false,
+            h264_videotoolbox: true,
+            hevc_videotoolbox: true,
+            libx264: false,
+        });
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let ffmpeg = find_ffmpeg()?;
+        let h264_nvenc = test_encoder(&ffmpeg, "h264_nvenc", "nv12");
+        let hevc_nvenc = test_encoder(&ffmpeg, "hevc_nvenc", "nv12");
+        let av1_nvenc = test_encoder(&ffmpeg, "av1_nvenc", "nv12");
+        Some(EncoderCapabilities {
+            ffmpeg_path: ffmpeg.display().to_string(),
+            in_process_videotoolbox: false,
+            h264_nvenc,
+            hevc_nvenc,
+            av1_nvenc,
+            h264_nvenc_444: h264_nvenc && test_encoder(&ffmpeg, "h264_nvenc", "yuv444p"),
+            hevc_nvenc_444: hevc_nvenc && test_encoder(&ffmpeg, "hevc_nvenc", "yuv444p"),
+            h264_cuvid: h264_nvenc && ffmpeg_has_decoder(&ffmpeg, "h264_cuvid"),
+            hevc_cuvid: hevc_nvenc && ffmpeg_has_decoder(&ffmpeg, "hevc_cuvid"),
+            h264_vaapi: false,
+            h264_videotoolbox: false,
+            hevc_videotoolbox: false,
+            libx264: test_encoder(&ffmpeg, "libx264", "yuv420p"),
+        })
+    }
 }
 
 /// Incremental Annex-B Access Unit splitter for H.264 & HEVC streams.
@@ -277,7 +339,7 @@ impl AnnexBSplitter {
     }
 }
 
-fn find_start_codes(data: &[u8]) -> Vec<usize> {
+pub(crate) fn find_start_codes(data: &[u8]) -> Vec<usize> {
     let mut pos = Vec::new();
     let mut i = 0usize;
     while i + 3 <= data.len() {
@@ -301,21 +363,55 @@ fn find_start_codes(data: &[u8]) -> Vec<usize> {
     pos
 }
 
-/// Persistent zero-latency hardware streaming encoder (no per-frame process spawn overhead!).
-pub struct StreamingEncoder {
-    pub encoder_name: &'static str,
-    pub codec: VideoCodec,
-    pub chroma: PixelChroma,
-    pub dst_width: u32,
-    pub dst_height: u32,
+struct FfmpegEncoderInner {
     child: Child,
     stdin: Option<ChildStdin>,
     rx: Receiver<EncodedAccessUnit>,
     reader_thread: Option<JoinHandle<()>>,
 }
 
+impl Drop for FfmpegEncoderInner {
+    fn drop(&mut self) {
+        self.stdin.take();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(h) = self.reader_thread.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+enum EncoderBackend {
+    #[cfg(target_os = "macos")]
+    VideoToolbox(macos_vt::VtEncoder),
+    Ffmpeg {
+        inner: FfmpegEncoderInner,
+        ffmpeg_path: PathBuf,
+        profile: EncodeProfile,
+        use_nvenc: bool,
+        last_reconfig: Instant,
+    },
+}
+
+/// Persistent zero-latency hardware streaming encoder with live ABR & instant PLI IDR recovery.
+/// - macOS 12+: 100% in-process Apple VideoToolbox (zero ffmpeg, instant ABR & PLI!)
+/// - Linux/Windows: hardware NVENC (HEVC/H.264/4:4:4) with live ABR step-adaptation & PLI IDR.
+pub struct StreamingEncoder {
+    pub encoder_name: &'static str,
+    pub codec: VideoCodec,
+    pub chroma: PixelChroma,
+    pub dst_width: u32,
+    pub dst_height: u32,
+    pub current_bitrate_kbps: u32,
+    backend: EncoderBackend,
+}
+
 impl StreamingEncoder {
-    pub fn start(ffmpeg: &Path, profile: &EncodeProfile, use_nvenc: bool) -> Result<Self, CodecError> {
+    fn spawn_ffmpeg_encoder(
+        ffmpeg: &Path,
+        profile: &EncodeProfile,
+        use_nvenc: bool,
+    ) -> Result<(&'static str, VideoCodec, FfmpegEncoderInner), CodecError> {
         let (encoder_name, pix_fmt, actual_codec) = if use_nvenc {
             match (profile.codec, profile.chroma) {
                 (VideoCodec::Hevc, PixelChroma::Yuv444p) => ("hevc_nvenc", "yuv444p", VideoCodec::Hevc),
@@ -429,7 +525,7 @@ impl StreamingEncoder {
             .stdout
             .take()
             .ok_or_else(|| CodecError::Process("missing encoder stdout".into()))?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(8);
         let reader_thread = thread::spawn(move || {
             let mut splitter = AnnexBSplitter::new(actual_codec);
             let mut buf = vec![0u8; 64 * 1024];
@@ -449,44 +545,168 @@ impl StreamingEncoder {
                 let _ = tx.send(au);
             }
         });
+        Ok((
+            encoder_name,
+            actual_codec,
+            FfmpegEncoderInner {
+                child,
+                stdin,
+                rx,
+                reader_thread: Some(reader_thread),
+            },
+        ))
+    }
 
+    pub fn start(ffmpeg: &Path, profile: &EncodeProfile, use_nvenc: bool) -> Result<Self, CodecError> {
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(vt) = macos_vt::VtEncoder::start(profile) {
+                let name = match profile.codec {
+                    VideoCodec::Hevc => "hevc_videotoolbox_inproc",
+                    VideoCodec::H264 => "h264_videotoolbox_inproc",
+                };
+                return Ok(Self {
+                    encoder_name: name,
+                    codec: profile.codec,
+                    chroma: PixelChroma::Yuv420p,
+                    dst_width: profile.dst_width,
+                    dst_height: profile.dst_height,
+                    current_bitrate_kbps: profile.bitrate_kbps,
+                    backend: EncoderBackend::VideoToolbox(vt),
+                });
+            }
+        }
+        let (encoder_name, actual_codec, inner) =
+            Self::spawn_ffmpeg_encoder(ffmpeg, profile, use_nvenc)?;
         Ok(Self {
             encoder_name,
             codec: actual_codec,
             chroma: profile.chroma,
             dst_width: profile.dst_width,
             dst_height: profile.dst_height,
-            child,
-            stdin,
-            rx,
-            reader_thread: Some(reader_thread),
+            current_bitrate_kbps: profile.bitrate_kbps,
+            backend: EncoderBackend::Ffmpeg {
+                inner,
+                ffmpeg_path: ffmpeg.to_path_buf(),
+                profile: profile.clone(),
+                use_nvenc,
+                last_reconfig: Instant::now(),
+            },
         })
     }
 
+    /// Real closed-loop TWCC ABR bitrate adaptation.
+    pub fn update_bitrate(&mut self, target_kbps: u32) {
+        let clamped = target_kbps.clamp(2_000, 80_000);
+        match &mut self.backend {
+            #[cfg(target_os = "macos")]
+            EncoderBackend::VideoToolbox(vt) => {
+                if clamped.abs_diff(self.current_bitrate_kbps) >= 500 {
+                    vt.set_bitrate_kbps(clamped);
+                    self.current_bitrate_kbps = clamped;
+                }
+            }
+            EncoderBackend::Ffmpeg {
+                inner,
+                ffmpeg_path,
+                profile,
+                use_nvenc,
+                last_reconfig,
+            } => {
+                let delta_pct = (clamped.abs_diff(self.current_bitrate_kbps) * 100)
+                    / self.current_bitrate_kbps.max(1);
+                if delta_pct >= 25 && last_reconfig.elapsed() >= std::time::Duration::from_secs(2) {
+                    let mut next_profile = profile.clone();
+                    next_profile.bitrate_kbps = clamped;
+                    if let Ok((_, _, new_inner)) =
+                        Self::spawn_ffmpeg_encoder(ffmpeg_path, &next_profile, *use_nvenc)
+                    {
+                        *inner = new_inner;
+                        *profile = next_profile;
+                        *last_reconfig = Instant::now();
+                        self.current_bitrate_kbps = clamped;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Instant PLI recovery: immediately emit a fresh IDR keyframe so lost-packet artifacts clear.
+    pub fn force_idr(&mut self) {
+        match &mut self.backend {
+            #[cfg(target_os = "macos")]
+            EncoderBackend::VideoToolbox(vt) => {
+                vt.force_idr();
+            }
+            EncoderBackend::Ffmpeg {
+                inner,
+                ffmpeg_path,
+                profile,
+                use_nvenc,
+                last_reconfig,
+            } => {
+                if last_reconfig.elapsed() >= std::time::Duration::from_millis(500) {
+                    if let Ok((_, _, new_inner)) =
+                        Self::spawn_ffmpeg_encoder(ffmpeg_path, profile, *use_nvenc)
+                    {
+                        *inner = new_inner;
+                        *last_reconfig = Instant::now();
+                    }
+                }
+            }
+        }
+    }
+
     pub fn push_bgra(&mut self, bgra: &[u8]) -> Result<(), CodecError> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| CodecError::Process("encoder closed".into()))?;
-        stdin.write_all(bgra)?;
-        stdin.flush()?;
-        Ok(())
+        match &mut self.backend {
+            #[cfg(target_os = "macos")]
+            EncoderBackend::VideoToolbox(vt) => vt.push_bgra(bgra),
+            EncoderBackend::Ffmpeg { inner, .. } => {
+                let stdin = inner
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| CodecError::Process("encoder closed".into()))?;
+                stdin.write_all(bgra)?;
+                Ok(())
+            }
+        }
     }
 
     pub fn finish_input(&mut self) {
-        self.stdin.take();
+        match &mut self.backend {
+            #[cfg(target_os = "macos")]
+            EncoderBackend::VideoToolbox(vt) => vt.flush(),
+            EncoderBackend::Ffmpeg { inner, .. } => {
+                inner.stdin.take();
+            }
+        }
     }
 
     pub fn try_recv_au(&self) -> Option<EncodedAccessUnit> {
-        self.rx.try_recv().ok()
+        match &self.backend {
+            #[cfg(target_os = "macos")]
+            EncoderBackend::VideoToolbox(vt) => vt.try_recv_au(),
+            EncoderBackend::Ffmpeg { inner, .. } => inner.rx.try_recv().ok(),
+        }
     }
 
     pub fn recv_au_timeout(&self, timeout: std::time::Duration) -> Option<EncodedAccessUnit> {
-        self.rx.recv_timeout(timeout).ok()
+        match &self.backend {
+            #[cfg(target_os = "macos")]
+            EncoderBackend::VideoToolbox(vt) => vt.recv_au_timeout(timeout),
+            EncoderBackend::Ffmpeg { inner, .. } => inner.rx.recv_timeout(timeout).ok(),
+        }
     }
 }
 
-impl Drop for StreamingEncoder {
+struct FfmpegDecoderInner {
+    child: Child,
+    stdin: Option<ChildStdin>,
+    rx: Receiver<DecodedYuvFrame>,
+    reader_thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for FfmpegDecoderInner {
     fn drop(&mut self) {
         self.stdin.take();
         let _ = self.child.kill();
@@ -497,12 +717,19 @@ impl Drop for StreamingEncoder {
     }
 }
 
-/// Persistent low-latency decoder outputting raw planar YUV420P or YUV444P directly for `wgpu`.
+enum DecoderBackend {
+    #[cfg(target_os = "macos")]
+    VideoToolbox(macos_vt::VtDecoder),
+    Ffmpeg(FfmpegDecoderInner),
+}
+
+/// Persistent low-latency hardware decoder outputting raw planar YUV420P or YUV444P directly for `wgpu`.
+/// - macOS 12+: in-process Apple VideoToolbox HW decode
+/// - NVIDIA Linux/Windows: NVDEC (`hevc_cuvid` / `h264_cuvid`) HW decode when available
+/// - Windows non-NVIDIA: `d3d11va` HW accel probe with low-delay multi-thread fallback
 pub struct StreamingDecoder {
-    child: Child,
-    stdin: Option<ChildStdin>,
-    rx: Receiver<DecodedYuvFrame>,
-    reader_thread: Option<JoinHandle<()>>,
+    pub decoder_name: &'static str,
+    backend: DecoderBackend,
 }
 
 impl StreamingDecoder {
@@ -513,6 +740,21 @@ impl StreamingDecoder {
         width: u32,
         height: u32,
     ) -> Result<Self, CodecError> {
+        #[cfg(target_os = "macos")]
+        {
+            if matches!(chroma, PixelChroma::Yuv420p) {
+                if let Ok(vt) = macos_vt::VtDecoder::start(codec) {
+                    return Ok(Self {
+                        decoder_name: match codec {
+                            VideoCodec::Hevc => "hevc_videotoolbox_inproc",
+                            VideoCodec::H264 => "h264_videotoolbox_inproc",
+                        },
+                        backend: DecoderBackend::VideoToolbox(vt),
+                    });
+                }
+            }
+        }
+
         let in_fmt = match codec {
             VideoCodec::Hevc => "hevc",
             VideoCodec::H264 => "h264",
@@ -521,6 +763,23 @@ impl StreamingDecoder {
             PixelChroma::Yuv420p => "yuv420p",
             PixelChroma::Yuv444p => "yuv444p",
         };
+
+        // Enable NVDEC hardware decode for 4:2:0 streams when CUVID is built into ffmpeg
+        // (4:4:4 stays on multi-threaded low-delay decode since older CUVID drivers vary on 4:4:4).
+        let cuvid_name = match (codec, chroma) {
+            (VideoCodec::Hevc, PixelChroma::Yuv420p) if ffmpeg_has_decoder(ffmpeg, "hevc_cuvid") => {
+                Some("hevc_cuvid")
+            }
+            (VideoCodec::H264, PixelChroma::Yuv420p) if ffmpeg_has_decoder(ffmpeg, "h264_cuvid") => {
+                Some("h264_cuvid")
+            }
+            _ => None,
+        };
+        let decoder_name = cuvid_name.unwrap_or(match codec {
+            VideoCodec::Hevc => "hevc_lowdelay",
+            VideoCodec::H264 => "h264_lowdelay",
+        });
+
         let mut cmd = Command::new(ffmpeg);
         cmd.args([
             "-hide_banner",
@@ -534,6 +793,13 @@ impl StreamingDecoder {
             "nobuffer",
             "-flags",
             "low_delay",
+        ]);
+        if let Some(cuvid) = cuvid_name {
+            cmd.args(["-c:v", cuvid]);
+        } else if cfg!(windows) && matches!(chroma, PixelChroma::Yuv420p) {
+            cmd.args(["-hwaccel", "auto"]);
+        }
+        cmd.args([
             "-f",
             in_fmt,
             "-i",
@@ -556,7 +822,7 @@ impl StreamingDecoder {
             .stdout
             .take()
             .ok_or_else(|| CodecError::Process("missing decoder stdout".into()))?;
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(8);
 
         let y_len = (width * height) as usize;
         let (cw, ch) = match chroma {
@@ -589,39 +855,47 @@ impl StreamingDecoder {
         });
 
         Ok(Self {
-            child,
-            stdin,
-            rx,
-            reader_thread: Some(reader_thread),
+            decoder_name,
+            backend: DecoderBackend::Ffmpeg(FfmpegDecoderInner {
+                child,
+                stdin,
+                rx,
+                reader_thread: Some(reader_thread),
+            }),
         })
     }
 
     pub fn push_access_unit(&mut self, au: &[u8]) -> Result<(), CodecError> {
-        let stdin = self
-            .stdin
-            .as_mut()
-            .ok_or_else(|| CodecError::Process("decoder closed".into()))?;
-        stdin.write_all(au)?;
-        stdin.flush()?;
-        Ok(())
+        match &mut self.backend {
+            #[cfg(target_os = "macos")]
+            DecoderBackend::VideoToolbox(vt) => vt.push_access_unit(au),
+            DecoderBackend::Ffmpeg(inner) => {
+                let stdin = inner
+                    .stdin
+                    .as_mut()
+                    .ok_or_else(|| CodecError::Process("decoder closed".into()))?;
+                stdin.write_all(au)?;
+                stdin.flush()?;
+                Ok(())
+            }
+        }
     }
 
     pub fn finish_input(&mut self) {
-        self.stdin.take();
+        match &mut self.backend {
+            #[cfg(target_os = "macos")]
+            DecoderBackend::VideoToolbox(_) => {}
+            DecoderBackend::Ffmpeg(inner) => {
+                inner.stdin.take();
+            }
+        }
     }
 
     pub fn recv_frame_timeout(&self, timeout: std::time::Duration) -> Option<DecodedYuvFrame> {
-        self.rx.recv_timeout(timeout).ok()
-    }
-}
-
-impl Drop for StreamingDecoder {
-    fn drop(&mut self) {
-        self.stdin.take();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        if let Some(h) = self.reader_thread.take() {
-            let _ = h.join();
+        match &self.backend {
+            #[cfg(target_os = "macos")]
+            DecoderBackend::VideoToolbox(vt) => vt.recv_frame_timeout(timeout),
+            DecoderBackend::Ffmpeg(inner) => inner.rx.recv_timeout(timeout).ok(),
         }
     }
 }

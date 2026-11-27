@@ -19,6 +19,7 @@ class CoreHostEndpoint:
     pin: str
     key: str
     monitor: int
+    udp_port: int = 0
 
 
 def find_core_binary():
@@ -115,6 +116,7 @@ class CoreHostProcess:
             pin=str(info["pin"]),
             key=str(info["key"]),
             monitor=int(info.get("monitor", self.monitor)),
+            udp_port=int(info.get("udp_port", 0)),
         )
         return self.endpoint
 
@@ -146,6 +148,10 @@ def launch_core_viewer(
     fps=60,
     bitrate_kbps=20000,
     chroma_444=True,
+    audio=True,
+    clipboard=True,
+    udp_target_host=None,
+    udp_target_port=0,
     binary=None,
 ):
     exe = Path(binary) if binary else find_core_binary()
@@ -171,6 +177,12 @@ def launch_core_viewer(
     ]
     if not chroma_444:
         cmd.append("--no-444")
+    if not audio:
+        cmd.append("--no-audio")
+    if not clipboard:
+        cmd.append("--no-clipboard")
+    if udp_target_host and udp_target_port:
+        cmd.extend(["--udp-host", str(udp_target_host), "--udp-port", str(int(udp_target_port))])
     return subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -215,6 +227,7 @@ def negotiate_v2_endpoint(uri, timeout=4.0):
                         pin=str(reply["pin"]),
                         key=str(reply["key"]),
                         monitor=int(reply.get("monitor", 1)),
+                        udp_port=int(reply.get("udp_port", 0)),
                     ),
                 )
             return None

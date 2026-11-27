@@ -274,6 +274,36 @@ impl UdpMediaSender {
         self.nack_cache.insert(fid, sealed_cache);
         Ok((fid, sent, dropped))
     }
+
+    /// Send an encrypted low-latency audio packet (e.g. 20ms Opus/PCM) over Brioche-UDP.
+    pub async fn send_audio_packet(&mut self, audio_bytes: &[u8]) -> std::io::Result<()> {
+        if audio_bytes.is_empty() || audio_bytes.len() > MAX_SHARD_PAYLOAD {
+            return Ok(());
+        }
+        let header = PacketHeader {
+            kind: PacketKind::AudioOpus,
+            stream_id: self.stream_id,
+            frame_id: 0,
+            stripe_idx: 0,
+            total_stripes: 0,
+            shard_idx: 0,
+            data_shards: 0,
+            fec_shards: 0,
+            flags: 0,
+            capture_ts_us: now_unix_us(),
+            seq_num: self.seq.fetch_add(1, Ordering::Relaxed),
+        };
+        if let Ok(dgram) = self.tx_cipher.seal(&header, audio_bytes) {
+            self.socket.send_to(&dgram, self.peer).await?;
+        }
+        Ok(())
+    }
+}
+
+pub enum ReceivedMedia {
+    Video(AssembledFrame),
+    Audio(Vec<u8>),
+    Pong { rtt_us: u64 },
 }
 
 pub struct UdpMediaReceiver {
@@ -415,7 +445,8 @@ impl UdpMediaReceiver {
         Ok(())
     }
 
-    pub async fn recv_frame(&mut self) -> std::io::Result<AssembledFrame> {
+    /// Receive the next decrypted media event (assembled video frame, audio packet, or Pong RTT).
+    pub async fn recv_media(&mut self) -> std::io::Result<ReceivedMedia> {
         loop {
             let (n, addr) = self.socket.recv_from(&mut self.buf).await?;
             if self.peer.is_none() {
@@ -425,8 +456,16 @@ impl UdpMediaReceiver {
             else {
                 continue;
             };
-            if matches!(header.kind, PacketKind::Pong | PacketKind::Ping) {
-                continue;
+            match header.kind {
+                PacketKind::Pong => {
+                    let rtt_us = now_unix_us().saturating_sub(header.capture_ts_us);
+                    return Ok(ReceivedMedia::Pong { rtt_us });
+                }
+                PacketKind::Ping => continue,
+                PacketKind::AudioOpus => {
+                    return Ok(ReceivedMedia::Audio(pt));
+                }
+                _ => {}
             }
             let mut ready = None;
             let mut pli_needed = false;
@@ -447,6 +486,14 @@ impl UdpMediaReceiver {
                 let _ = self.send_pli().await;
             }
             if let Some(frame) = ready {
+                return Ok(ReceivedMedia::Video(frame));
+            }
+        }
+    }
+
+    pub async fn recv_frame(&mut self) -> std::io::Result<AssembledFrame> {
+        loop {
+            if let ReceivedMedia::Video(frame) = self.recv_media().await? {
                 return Ok(frame);
             }
         }

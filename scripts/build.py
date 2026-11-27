@@ -20,6 +20,8 @@ args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir
         "--name", "Brioche", "--distpath", str(options.output_dir), "--workpath", str(options.work_dir), "--paths", str(root / "src"),
         "--collect-all", "av",
         "--collect-data", "brioche",
+        "--hidden-import", "PySide6.QtOpenGL",
+        "--hidden-import", "PySide6.QtOpenGLWidgets",
         "--add-data", f"{root / 'assets'}{os.pathsep}assets",
         "--copy-metadata", "brioche-desktop",
         "--add-binary", f"{helper}{os.pathsep}network"]

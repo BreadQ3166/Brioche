@@ -27,7 +27,9 @@ use brioche_transport::quic::{
     bind_quic_server, connect_quic_client, generate_self_signed_identity, recv_control, send_control,
     QuicConnection,
 };
-use brioche_transport::udp::{bind_tuned_udp, now_unix_us, UdpMediaReceiver, UdpMediaSender};
+use brioche_transport::udp::{
+    bind_tuned_udp, now_unix_us, ReceivedMedia, UdpMediaReceiver, UdpMediaSender,
+};
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -115,7 +117,140 @@ fn run_info() {
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
 }
 
-/// Live Brioche v3 Host: QUIC pinned control + MIT-SHM/XFixes capture + persistent NVENC + Brioche-UDP/FEC.
+fn read_system_clipboard() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    let out = std::process::Command::new("pbpaste").output().ok()?;
+    #[cfg(target_os = "linux")]
+    let out = std::process::Command::new("xclip")
+        .args(["-o", "-selection", "clipboard"])
+        .output()
+        .or_else(|_| {
+            std::process::Command::new("xsel")
+                .args(["--clipboard", "--output"])
+                .output()
+        })
+        .ok()?;
+    #[cfg(target_os = "windows")]
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", "Get-Clipboard"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    if text.is_empty() || text.len() > 128 * 1024 {
+        return None;
+    }
+    Some(text)
+}
+
+fn write_system_clipboard(text: &str) {
+    if text.is_empty() || text.len() > 128 * 1024 {
+        return;
+    }
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    #[cfg(target_os = "macos")]
+    let child = Command::new("pbcopy").stdin(Stdio::piped()).spawn();
+    #[cfg(target_os = "linux")]
+    let child = Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .or_else(|_| {
+            Command::new("xsel")
+                .args(["--clipboard", "--input"])
+                .stdin(Stdio::piped())
+                .spawn()
+        });
+    #[cfg(target_os = "windows")]
+    let child = Command::new("clip").stdin(Stdio::piped()).spawn();
+    if let Ok(mut proc) = child {
+        if let Some(mut stdin) = proc.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = proc.wait();
+    }
+}
+
+/// Spawn low-latency 10ms 24kHz stereo s16le (960B/packet, fits 1 encrypted UDP datagram!) audio capture on Linux.
+fn spawn_audio_capture(stop: Arc<AtomicBool>) -> Option<tokio::sync::mpsc::Receiver<Vec<u8>>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        let sink_out = Command::new("pactl").arg("get-default-sink").output().ok()?;
+        if !sink_out.status.success() {
+            return None;
+        }
+        let sink = String::from_utf8_lossy(&sink_out.stdout).trim().to_string();
+        if sink.is_empty() {
+            return None;
+        }
+        let mut child = Command::new("parec")
+            .args([
+                "--format=s16le",
+                "--rate=24000",
+                "--channels=2",
+                "--latency-msec=10",
+                "-d",
+                &format!("{sink}.monitor"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 960]; // 10ms @ 24kHz stereo s16le
+            while !stop.load(Ordering::Acquire) {
+                if stdout.read_exact(&mut buf).is_err() {
+                    break;
+                }
+                let _ = tx.try_send(buf.clone());
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        Some(rx)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = stop;
+        None
+    }
+}
+
+/// Spawn low-latency 10ms 24kHz stereo s16le audio playback sink on Linux (`pacat`).
+fn spawn_audio_playback() -> Option<std::process::ChildStdin> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("pacat")
+            .args([
+                "--playback",
+                "--format=s16le",
+                "--rate=24000",
+                "--channels=2",
+                "--latency-msec=15",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        child.stdin.take()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Live Brioche v3 Host: QUIC pinned control + zero-copy capture + NVENC/VideoToolbox + Brioche-UDP/FEC + Audio/Clipboard.
 async fn run_host_cli(args: &[String]) {
     let bind_ip = arg_val(args, "--bind").unwrap_or("127.0.0.1");
     let quic_port: u16 = arg_val(args, "--quic-port")
@@ -290,6 +425,8 @@ async fn run_host_session(
     let injector_rx = injector.clone();
     let stop_rx = stop_flag.clone();
     let requested_mon_rx = requested_mon.clone();
+    let last_remote_clip = Arc::new(std::sync::Mutex::new(String::new()));
+    let last_remote_clip_rx = last_remote_clip.clone();
     let input_task = tokio::spawn(async move {
         while let Ok(msg) = recv_control(&mut ctrl_recv).await {
             match msg {
@@ -301,6 +438,12 @@ async fn run_host_session(
                 ControlMessage::SwitchMonitor { monitor_id, .. } => {
                     requested_mon_rx.store(monitor_id, Ordering::Release);
                 }
+                ControlMessage::ClipboardText { text } if !view_only => {
+                    if let Ok(mut guard) = last_remote_clip_rx.lock() {
+                        *guard = text.clone();
+                    }
+                    std::thread::spawn(move || write_system_clipboard(&text));
+                }
                 _ => {}
             }
         }
@@ -309,6 +452,10 @@ async fn run_host_session(
         }
         stop_rx.store(true, Ordering::Release);
     });
+
+    let mut audio_rx = spawn_audio_capture(stop_flag.clone());
+    let mut last_clip_check = Instant::now();
+    let mut last_host_clip = String::new();
 
     let mut profile = EncodeProfile {
         src_width: mon.width,
@@ -337,6 +484,40 @@ async fn run_host_session(
     while !stop_flag.load(Ordering::Acquire) {
         let tick = Instant::now();
         let _ = sender.poll_feedback().await;
+
+        // Real closed-loop PLI (instant IDR on loss) & TWCC ABR (live bitrate adaptation)
+        if sender.take_pli() {
+            encoder.force_idr();
+        }
+        let quality = sender.current_quality();
+        encoder.update_bitrate(quality.bitrate_kbps);
+
+        // Drain encrypted low-latency UDP audio packets
+        if let Some(rx) = audio_rx.as_mut() {
+            for _ in 0..4 {
+                match rx.try_recv() {
+                    Ok(pcm) => {
+                        let _ = sender.send_audio_packet(&pcm).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
+        // Poll host clipboard every 1.2s for bidirectional text sync (non-blocking echo-guarded)
+        if !view_only && last_clip_check.elapsed() >= Duration::from_millis(1200) {
+            last_clip_check = Instant::now();
+            if let Some(txt) = read_system_clipboard() {
+                let is_echo = last_remote_clip
+                    .lock()
+                    .map(|g| *g == txt)
+                    .unwrap_or(false);
+                if !is_echo && txt != last_host_clip {
+                    last_host_clip = txt.clone();
+                    let _ = send_control(&mut ctrl_send, &ControlMessage::ClipboardText { text: txt }).await;
+                }
+            }
+        }
 
         // Atomic live monitor switch (zero window teardown / zero macOS crash)
         let wanted_mon = requested_mon.load(Ordering::Acquire);
@@ -394,7 +575,25 @@ async fn run_host_session(
             }
         }
 
-        let grabbed = cap.grab_frame();
+        // Zero-copy borrowed capture (no 33MB/frame heap clone on Linux SHM or Windows DXGI!)
+        let grabbed = cap.grab_frame_ref();
+        let mut push_failed = false;
+        if let Ok(frame) = grabbed {
+            // Idle frame pacing: static desktop drops to ~2 FPS heartbeat; wakes instantly on change
+            let force_send = frame.dirty || last_sent.elapsed() >= Duration::from_millis(500);
+            if force_send {
+                idle_streak = 0;
+                if encoder.push_bgra(frame.bgra).is_err() {
+                    push_failed = true;
+                }
+                last_sent = Instant::now();
+            } else {
+                idle_streak = idle_streak.saturating_add(1);
+            }
+        }
+        if push_failed {
+            break;
+        }
 
         // Separated hardware cursor sync over QUIC (deduped so idle cursor never floods control stream)
         if let Ok((cur, shape_changed)) = cap.grab_cursor() {
@@ -430,21 +629,6 @@ async fn run_host_session(
             }
         }
 
-        if let Ok(frame) = grabbed {
-            // Idle frame pacing: static desktop drops to ~2 FPS heartbeat; wakes instantly on change
-            let force_send = frame.dirty || last_sent.elapsed() >= Duration::from_millis(500);
-            if force_send {
-                idle_streak = 0;
-                if encoder.push_bgra(&frame.bgra).is_err() {
-                    break;
-                }
-                last_sent = Instant::now();
-            } else {
-                idle_streak = idle_streak.saturating_add(1);
-            }
-        }
-
-        let quality = sender.current_quality();
         while let Some(au) = encoder.try_recv_au() {
             let mut flags = 0u8;
             if au.is_idr {
@@ -495,9 +679,16 @@ fn run_view_cli(args: &[String]) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(20_000);
     let chroma_444 = !args.iter().any(|a| a == "--no-444");
+    let audio_enabled = !args.iter().any(|a| a == "--no-audio");
+    let clipboard_enabled = !args.iter().any(|a| a == "--no-clipboard");
+    let udp_override_host = arg_val(args, "--udp-host").map(|s| s.to_string());
+    let udp_override_port: u16 = arg_val(args, "--udp-port")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
 
     let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel::<ControlMessage>();
-    let _ = run_viewer_window(title, ctrl_tx, move |viewer_handle| {
+    let ctrl_rx = Arc::new(std::sync::Mutex::new(ctrl_rx));
+    let _ = run_viewer_window(title.clone(), ctrl_tx, move |viewer_handle| {
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -505,153 +696,280 @@ fn run_view_cli(args: &[String]) {
                 .unwrap();
             rt.block_on(async move {
                 let addr: SocketAddr = format!("{host}:{quic_port}").parse().unwrap();
-                let (_ep, conn) = match connect_quic_client(addr, &pin).await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        eprintln!("QUIC connect failed: {e}");
+                let delays = [1u64, 2, 3, 5, 8];
+                let mut attempt: usize = 0;
+
+                loop {
+                    if attempt > 0 {
+                        let wait = delays[(attempt - 1).min(delays.len() - 1)];
+                        viewer_handle.set_title(format!(
+                            "{title} · 连接中断，{wait}s 后自动重连（第 {attempt} 次）…"
+                        ));
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                    }
+                    attempt += 1;
+
+                    let (_ep, conn) = match connect_quic_client(addr, &pin).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("QUIC connect attempt {attempt} failed: {e}");
+                            if attempt >= 10 {
+                                viewer_handle.close();
+                                return;
+                            }
+                            continue;
+                        }
+                    };
+                    let Ok((mut send, mut recv)) = conn.open_bi().await else {
+                        continue;
+                    };
+                    let Ok(udp_sock) = bind_tuned_udp("0.0.0.0:0".parse().unwrap()) else {
                         viewer_handle.close();
                         return;
-                    }
-                };
-                let (mut send, mut recv) = conn.open_bi().await.unwrap();
-                let udp_sock = bind_tuned_udp("0.0.0.0:0".parse().unwrap()).unwrap();
-                let local_udp_port = udp_sock.local_addr().unwrap().port();
-                let _ = send_control(
-                    &mut send,
-                    &ControlMessage::SessionHello {
-                        udp_port: local_udp_port,
-                        requested_codec: "hevc".into(),
-                        chroma_444,
-                        fps,
-                        bitrate_kbps,
-                    },
-                )
-                .await;
+                    };
+                    let local_udp_port = udp_sock.local_addr().unwrap().port();
+                    let _ = send_control(
+                        &mut send,
+                        &ControlMessage::SessionHello {
+                            udp_port: local_udp_port,
+                            requested_codec: "hevc".into(),
+                            chroma_444,
+                            fps,
+                            bitrate_kbps,
+                        },
+                    )
+                    .await;
 
-                let Ok(ControlMessage::StreamDescriptor {
-                    stream_id,
-                    width,
-                    height,
-                    codec,
-                    chroma_444: actual_444,
-                    host_udp_port,
-                    ..
-                }) = recv_control(&mut recv).await
-                else {
-                    viewer_handle.close();
-                    return;
-                };
+                    let Ok(ControlMessage::StreamDescriptor {
+                        stream_id,
+                        width,
+                        height,
+                        codec,
+                        chroma_444: actual_444,
+                        host_udp_port,
+                        ..
+                    }) = recv_control(&mut recv).await
+                    else {
+                        continue;
+                    };
+                    attempt = 0; // Connected cleanly!
 
-                viewer_handle.set_title(format!(
-                    "Brioche v2.0 · {width}×{height} · {} {}",
-                    codec.to_uppercase(),
-                    if actual_444 { "4:4:4" } else { "4:2:0" }
-                ));
+                    let ffmpeg = brioche_codec::find_ffmpeg().unwrap_or_default();
+                    let vcodec = if codec == "hevc" {
+                        VideoCodec::Hevc
+                    } else {
+                        VideoCodec::H264
+                    };
+                    let pchroma = if actual_444 {
+                        PixelChroma::Yuv444p
+                    } else {
+                        PixelChroma::Yuv420p
+                    };
+                    let rchroma = if actual_444 {
+                        ChromaFormat::Yuv444p
+                    } else {
+                        ChromaFormat::Yuv420p
+                    };
+                    let mut decoder =
+                        match StreamingDecoder::start(&ffmpeg, vcodec, pchroma, width, height) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                eprintln!("decoder start failed: {e}");
+                                viewer_handle.close();
+                                return;
+                            }
+                        };
+                    let dec_label = decoder.decoder_name;
+                    let codec_label = format!(
+                        "{} {}",
+                        codec.to_uppercase(),
+                        if actual_444 { "4:4:4" } else { "4:2:0" }
+                    );
+                    viewer_handle.set_title(format!(
+                        "{title} · {width}×{height} · {codec_label} · {dec_label}"
+                    ));
 
-                // Outgoing input/control forwarder
-                tokio::spawn(async move {
-                    while let Ok(msg) = ctrl_rx.recv() {
-                        if send_control(&mut send, &msg).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-
-                // Incoming cursor/stream control listener
-                let vh_ctrl = viewer_handle.clone();
-                tokio::spawn(async move {
-                    while let Ok(msg) = recv_control(&mut recv).await {
-                        match msg {
-                            ControlMessage::CursorShape {
-                                width,
-                                height,
-                                rgba_hex,
-                                ..
-                            } => {
-                                if let Ok(rgba) = hex::decode(rgba_hex) {
-                                    vh_ctrl.update_cursor_shape(
-                                        width as u32,
-                                        height as u32,
-                                        rgba,
-                                    );
+                    let session_alive = Arc::new(AtomicBool::new(true));
+                    let alive_tx = session_alive.clone();
+                    let rx_shared = ctrl_rx.clone();
+                    let last_remote_clip = Arc::new(std::sync::Mutex::new(String::new()));
+                    let last_remote_clip_tx = last_remote_clip.clone();
+                    let out_task = tokio::spawn(async move {
+                        let mut last_clip_poll = Instant::now();
+                        let mut last_local_clip = String::new();
+                        while alive_tx.load(Ordering::Acquire) {
+                            let pending = rx_shared
+                                .lock()
+                                .ok()
+                                .and_then(|g| g.try_recv().ok());
+                            if let Some(msg) = pending {
+                                if send_control(&mut send, &msg).await.is_err() {
+                                    alive_tx.store(false, Ordering::Release);
+                                    break;
+                                }
+                                continue;
+                            }
+                            if clipboard_enabled && last_clip_poll.elapsed() >= Duration::from_millis(1200) {
+                                last_clip_poll = Instant::now();
+                                if let Some(txt) = read_system_clipboard() {
+                                    let is_echo = last_remote_clip_tx
+                                        .lock()
+                                        .map(|g| *g == txt)
+                                        .unwrap_or(false);
+                                    if !is_echo && txt != last_local_clip {
+                                        last_local_clip = txt.clone();
+                                        let _ = send_control(
+                                            &mut send,
+                                            &ControlMessage::ClipboardText { text: txt },
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
-                            ControlMessage::CursorPosition { x, y, visible } => {
-                                vh_ctrl.update_cursor_pos(x, y, visible);
-                            }
-                            _ => {}
+                            tokio::time::sleep(Duration::from_millis(4)).await;
                         }
-                    }
-                });
+                    });
 
-                let Some(ffmpeg) = brioche_codec::find_ffmpeg() else {
-                    eprintln!("ffmpeg not found; closing v2 viewer");
-                    viewer_handle.close();
-                    return;
-                };
-                let vcodec = if codec == "hevc" {
-                    VideoCodec::Hevc
-                } else {
-                    VideoCodec::H264
-                };
-                let pchroma = if actual_444 {
-                    PixelChroma::Yuv444p
-                } else {
-                    PixelChroma::Yuv420p
-                };
-                let rchroma = if actual_444 {
-                    ChromaFormat::Yuv444p
-                } else {
-                    ChromaFormat::Yuv420p
-                };
-                let mut decoder = match StreamingDecoder::start(&ffmpeg, vcodec, pchroma, width, height) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("decoder start failed: {e}");
-                        viewer_handle.close();
-                        return;
+                    let vh_ctrl = viewer_handle.clone();
+                    let alive_rx = session_alive.clone();
+                    let last_remote_clip_rx = last_remote_clip.clone();
+                    let in_task = tokio::spawn(async move {
+                        while let Ok(msg) = recv_control(&mut recv).await {
+                            match msg {
+                                ControlMessage::CursorShape {
+                                    width,
+                                    height,
+                                    rgba_hex,
+                                    ..
+                                } => {
+                                    if let Ok(rgba) = hex::decode(rgba_hex) {
+                                        vh_ctrl.update_cursor_shape(
+                                            width as u32,
+                                            height as u32,
+                                            rgba,
+                                        );
+                                    }
+                                }
+                                ControlMessage::CursorPosition { x, y, visible } => {
+                                    vh_ctrl.update_cursor_pos(x, y, visible);
+                                }
+                                ControlMessage::ClipboardText { text } if clipboard_enabled => {
+                                    if let Ok(mut guard) = last_remote_clip_rx.lock() {
+                                        *guard = text.clone();
+                                    }
+                                    std::thread::spawn(move || write_system_clipboard(&text));
+                                }
+                                _ => {}
+                            }
+                        }
+                        alive_rx.store(false, Ordering::Release);
+                    });
+
+                    let mut audio_out = if audio_enabled {
+                        spawn_audio_playback()
+                    } else {
+                        None
+                    };
+                    let mut receiver = UdpMediaReceiver::new(udp_sock, &key, stream_id);
+                    if let Some(ref uhost) = udp_override_host {
+                        if udp_override_port > 0 {
+                            if let Ok(target) = format!("{uhost}:{udp_override_port}").parse() {
+                                receiver.set_peer(target);
+                            }
+                        }
+                    } else if host_udp_port > 0 {
+                        receiver.set_peer(SocketAddr::new(addr.ip(), host_udp_port));
                     }
-                };
-                let mut receiver = UdpMediaReceiver::new(udp_sock, &key, stream_id);
-                if host_udp_port > 0 {
-                    receiver.set_peer(SocketAddr::new(addr.ip(), host_udp_port));
-                    // Symmetric UDP punch opens local firewall & router NAT pinholes immediately.
                     for _ in 0..3 {
                         let _ = receiver.send_ping().await;
                     }
-                }
-                let mut last_ping = Instant::now();
 
-                loop {
-                    if last_ping.elapsed() >= Duration::from_secs(2) {
-                        let _ = receiver.send_ping().await;
-                        last_ping = Instant::now();
-                    }
-                    match tokio::time::timeout(Duration::from_secs(2), receiver.recv_frame()).await {
-                        Ok(Ok(frame)) => {
-                            if decoder.push_access_unit(&frame.payload).is_err() {
-                                break;
-                            }
-                            if let Some(yuv) = decoder.recv_frame_timeout(Duration::from_millis(80)) {
-                                viewer_handle.publish_frame(PendingYuvFrame {
-                                    width: yuv.width,
-                                    height: yuv.height,
-                                    chroma: rchroma,
-                                    y: yuv.y,
-                                    u: yuv.u,
-                                    v: yuv.v,
-                                });
-                            }
-                        }
-                        Ok(Err(_)) => break,
-                        Err(_) => {
-                            // Periodic wakeup to send UDP keepalive ping while screen is idle.
+                    let mut last_ping = Instant::now();
+                    let mut last_twcc = Instant::now();
+                    let mut stats_since = Instant::now();
+                    let mut frames_sec = 0u32;
+                    let mut bytes_sec = 0usize;
+                    let mut last_rtt_ms = 0.0f64;
+                    let mut prev_dropped = 0u64;
+                    let mut prev_ok = 0u64;
+                    let mut idle_timeouts = 0u32;
+
+                    while session_alive.load(Ordering::Acquire) {
+                        if last_ping.elapsed() >= Duration::from_secs(2) {
                             let _ = receiver.send_ping().await;
                             last_ping = Instant::now();
                         }
+                        if last_twcc.elapsed() >= Duration::from_millis(500) {
+                            let (ok, _fec, drop_cnt) = receiver.stats();
+                            let d_ok = ok.saturating_sub(prev_ok);
+                            let d_drop = drop_cnt.saturating_sub(prev_dropped);
+                            prev_ok = ok;
+                            prev_dropped = drop_cnt;
+                            let total = (d_ok + d_drop).max(1);
+                            let loss_ppm = ((d_drop * 1_000_000) / total) as u32;
+                            let _ = receiver.send_twcc(loss_ppm, 0).await;
+                            last_twcc = Instant::now();
+                        }
+                        if stats_since.elapsed() >= Duration::from_secs(1) {
+                            let dt = stats_since.elapsed().as_secs_f64().max(0.001);
+                            let fps_now = frames_sec as f64 / dt;
+                            let mbps = (bytes_sec as f64 * 8.0) / (dt * 1_000_000.0);
+                            viewer_handle.set_title(format!(
+                                "{title} · {width}×{height} · {codec_label} · {fps_now:.0} FPS · {last_rtt_ms:.1}ms · {mbps:.1} Mbps · {dec_label}"
+                            ));
+                            frames_sec = 0;
+                            bytes_sec = 0;
+                            stats_since = Instant::now();
+                        }
+
+                        match tokio::time::timeout(Duration::from_secs(2), receiver.recv_media()).await {
+                            Ok(Ok(ReceivedMedia::Video(frame))) => {
+                                idle_timeouts = 0;
+                                bytes_sec += frame.payload.len();
+                                if decoder.push_access_unit(&frame.payload).is_err() {
+                                    break;
+                                }
+                                if let Some(yuv) = decoder.recv_frame_timeout(Duration::from_millis(80)) {
+                                    frames_sec += 1;
+                                    viewer_handle.publish_frame(PendingYuvFrame {
+                                        width: yuv.width,
+                                        height: yuv.height,
+                                        chroma: rchroma,
+                                        y: yuv.y,
+                                        u: yuv.u,
+                                        v: yuv.v,
+                                    });
+                                }
+                            }
+                            Ok(Ok(ReceivedMedia::Audio(pcm))) => {
+                                idle_timeouts = 0;
+                                if let Some(stdin) = audio_out.as_mut() {
+                                    use std::io::Write;
+                                    if stdin.write_all(&pcm).is_err() {
+                                        audio_out = None;
+                                    }
+                                }
+                            }
+                            Ok(Ok(ReceivedMedia::Pong { rtt_us })) => {
+                                idle_timeouts = 0;
+                                last_rtt_ms = rtt_us as f64 / 1000.0;
+                            }
+                            Ok(Err(_)) => break,
+                            Err(_) => {
+                                idle_timeouts += 1;
+                                let _ = receiver.send_ping().await;
+                                last_ping = Instant::now();
+                                if idle_timeouts >= 8 {
+                                    // 16s without any UDP media or Pong -> trigger seamless reconnect!
+                                    break;
+                                }
+                            }
+                        }
                     }
+                    session_alive.store(false, Ordering::Release);
+                    out_task.abort();
+                    in_task.abort();
                 }
-                viewer_handle.close();
             });
         });
     });

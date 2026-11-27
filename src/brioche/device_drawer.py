@@ -20,6 +20,7 @@ from .ui_components import RoundedComboBox
 class DeviceInspectorDrawer(QFrame):
     connect_requested = Signal(dict)
     lan_connect_requested = Signal(dict)
+    v2_connect_requested = Signal(dict)
     bind_lan_requested = Signal(dict)
     files_requested = Signal(dict)
     profile_changed = Signal(str, dict)
@@ -201,6 +202,11 @@ class DeviceInspectorDrawer(QFrame):
         lan_row.addWidget(self.bind_lan_btn)
         layout.addLayout(lan_row)
 
+        self.v2_lan_btn = QPushButton("🚀 v2.0 Rust UDP/GPU 极速直连")
+        self.v2_lan_btn.setToolTip("使用加密 UDP + RS-FEC + wgpu GPU 着色器 + 硬件光标极速连接此局域网设备")
+        self.v2_lan_btn.clicked.connect(self._emit_v2_connect)
+        layout.addWidget(self.v2_lan_btn)
+
         self.remove_btn = QPushButton("从局域网目录移除")
         self.remove_btn.setObjectName("danger")
         self.remove_btn.clicked.connect(self._emit_remove)
@@ -286,6 +292,8 @@ class DeviceInspectorDrawer(QFrame):
             self.lan_direct_btn.setText(
                 "仅局域网直连" if lan_ready else "局域网通道离线"
             )
+            self.v2_lan_btn.setVisible(bool(lan_ch))
+            self.v2_lan_btn.setEnabled(lan_ready)
             self.bind_lan_btn.setText("修改 LAN IP" if lan_ch else "指定局域网 IP 连接")
             self.remove_btn.setVisible("lan" in channels)
             self.show()
@@ -358,6 +366,10 @@ class DeviceInspectorDrawer(QFrame):
     def _emit_lan_connect(self):
         if self._device:
             self.lan_connect_requested.emit(self._device)
+
+    def _emit_v2_connect(self):
+        if self._device:
+            self.v2_connect_requested.emit(self._device)
 
     def _emit_bind_lan(self):
         if self._device:

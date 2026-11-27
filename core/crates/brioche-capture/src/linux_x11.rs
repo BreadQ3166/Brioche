@@ -10,7 +10,10 @@ use x11rb::protocol::xfixes::ConnectionExt as XFixesExt;
 use x11rb::protocol::xproto::ImageFormat;
 use x11rb::rust_connection::RustConnection;
 
-use crate::{hash_rgba, CaptureError, CapturedFrame, CursorSnapshot, DirtyDetector, MonitorInfo};
+use crate::{
+    hash_rgba, CaptureError, CapturedFrame, CapturedFrameRef, CursorSnapshot, DirtyDetector,
+    MonitorInfo,
+};
 
 pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
     let (conn, screen_num) = RustConnection::connect(None)
@@ -117,8 +120,8 @@ impl X11ShmCapturer {
         &self.monitor
     }
 
-    /// Grab one monitor frame directly into POSIX shared memory (zero X11 socket copy).
-    pub fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+    /// Zero-allocation MIT-SHM capture returning a borrowed slice straight into shared memory.
+    pub fn grab_frame_ref(&mut self) -> Result<CapturedFrameRef<'_>, CaptureError> {
         let started = Instant::now();
         self.conn
             .shm_get_image(
@@ -141,14 +144,26 @@ impl X11ShmCapturer {
         let dirty = self
             .dirty
             .check_bgra(slice, self.monitor.width, self.monitor.height, stride);
-        let bgra = slice.to_vec();
-        Ok(CapturedFrame {
+        Ok(CapturedFrameRef {
             width: self.monitor.width,
             height: self.monitor.height,
             stride,
-            bgra,
+            bgra: slice,
             dirty,
             capture_us: started.elapsed().as_micros() as u64,
+        })
+    }
+
+    /// Grab one monitor frame directly into POSIX shared memory (zero X11 socket copy).
+    pub fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        let r = self.grab_frame_ref()?;
+        Ok(CapturedFrame {
+            width: r.width,
+            height: r.height,
+            stride: r.stride,
+            bgra: r.bgra.to_vec(),
+            dirty: r.dirty,
+            capture_us: r.capture_us,
         })
     }
 

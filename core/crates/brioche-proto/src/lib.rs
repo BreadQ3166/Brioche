@@ -327,6 +327,9 @@ pub enum ControlMessage {
         rtt_us: u64,
         recv_bitrate_kbps: u32,
     },
+    ClipboardText {
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

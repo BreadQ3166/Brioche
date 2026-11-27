@@ -55,9 +55,20 @@ pub struct CapturedFrame {
     pub capture_us: u64,
 }
 
+/// Zero-copy borrowed view into SHM / DXGI staging / reusable capture buffer (saves 33MB/frame @ 4K).
+pub struct CapturedFrameRef<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub bgra: &'a [u8],
+    pub dirty: bool,
+    pub capture_us: u64,
+}
+
 pub trait ScreenCapturer: Send {
     fn monitor(&self) -> &MonitorInfo;
     fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError>;
+    fn grab_frame_ref(&mut self) -> Result<CapturedFrameRef<'_>, CaptureError>;
     fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError>;
 }
 
@@ -68,6 +79,9 @@ impl ScreenCapturer for linux_x11::X11ShmCapturer {
     }
     fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
         self.grab_frame()
+    }
+    fn grab_frame_ref(&mut self) -> Result<CapturedFrameRef<'_>, CaptureError> {
+        self.grab_frame_ref()
     }
     fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError> {
         self.grab_cursor()
@@ -82,6 +96,9 @@ impl ScreenCapturer for windows_dxgi::DxgiCapturer {
     fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
         self.grab_frame()
     }
+    fn grab_frame_ref(&mut self) -> Result<CapturedFrameRef<'_>, CaptureError> {
+        self.grab_frame_ref()
+    }
     fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError> {
         self.grab_cursor()
     }
@@ -94,6 +111,9 @@ impl ScreenCapturer for macos_cg::MacCgCapturer {
     }
     fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
         self.grab_frame()
+    }
+    fn grab_frame_ref(&mut self) -> Result<CapturedFrameRef<'_>, CaptureError> {
+        self.grab_frame_ref()
     }
     fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError> {
         self.grab_cursor()

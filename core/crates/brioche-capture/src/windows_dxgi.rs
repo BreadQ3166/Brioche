@@ -19,7 +19,9 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetCursorInfo, CURSORINFO, CURSOR_SHOWING};
 
-use crate::{CaptureError, CapturedFrame, CursorSnapshot, DirtyDetector, MonitorInfo};
+use crate::{
+    CaptureError, CapturedFrame, CapturedFrameRef, CursorSnapshot, DirtyDetector, MonitorInfo,
+};
 
 pub fn list_monitors() -> Result<Vec<MonitorInfo>, CaptureError> {
     unsafe {
@@ -143,7 +145,8 @@ impl DxgiCapturer {
         &self.monitor
     }
 
-    pub fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+    /// Zero-clone DXGI capture: skips GPU->CPU CopyResource completely when desktop is static.
+    pub fn grab_frame_ref(&mut self) -> Result<CapturedFrameRef<'_>, CaptureError> {
         let started = Instant::now();
         unsafe {
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
@@ -151,11 +154,11 @@ impl DxgiCapturer {
             match self.duplication.AcquireNextFrame(16, &mut info, &mut resource) {
                 Ok(()) => {}
                 Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
-                    return Ok(CapturedFrame {
+                    return Ok(CapturedFrameRef {
                         width: self.monitor.width,
                         height: self.monitor.height,
                         stride: self.monitor.width * 4,
-                        bgra: self.last_frame.clone(),
+                        bgra: &self.last_frame,
                         dirty: false,
                         capture_us: started.elapsed().as_micros() as u64,
                     });
@@ -164,6 +167,19 @@ impl DxgiCapturer {
                     return Err(CaptureError::System("DXGI access lost".into()));
                 }
                 Err(e) => return Err(CaptureError::System(e.to_string())),
+            }
+
+            // Cursor-only DXGI wakeups have AccumulatedFrames == 0: skip full GPU staging readback!
+            if info.AccumulatedFrames == 0 {
+                let _ = self.duplication.ReleaseFrame();
+                return Ok(CapturedFrameRef {
+                    width: self.monitor.width,
+                    height: self.monitor.height,
+                    stride: self.monitor.width * 4,
+                    bgra: &self.last_frame,
+                    dirty: false,
+                    capture_us: started.elapsed().as_micros() as u64,
+                });
             }
 
             let tex: ID3D11Texture2D = resource
@@ -198,10 +214,15 @@ impl DxgiCapturer {
             let row_bytes = w * 4;
             let src_pitch = mapped.RowPitch as usize;
             let src_ptr = mapped.pData as *const u8;
-            for row in 0..h {
-                let dst = &mut self.last_frame[row * row_bytes..(row + 1) * row_bytes];
-                let src = std::slice::from_raw_parts(src_ptr.add(row * src_pitch), row_bytes);
-                dst.copy_from_slice(src);
+            if src_pitch == row_bytes {
+                let src = std::slice::from_raw_parts(src_ptr, row_bytes * h);
+                self.last_frame.copy_from_slice(src);
+            } else {
+                for row in 0..h {
+                    let dst = &mut self.last_frame[row * row_bytes..(row + 1) * row_bytes];
+                    let src = std::slice::from_raw_parts(src_ptr.add(row * src_pitch), row_bytes);
+                    dst.copy_from_slice(src);
+                }
             }
             self.context.Unmap(staging, 0);
             let _ = self.duplication.ReleaseFrame();
@@ -212,15 +233,27 @@ impl DxgiCapturer {
                 self.monitor.height,
                 self.monitor.width * 4,
             );
-            Ok(CapturedFrame {
+            Ok(CapturedFrameRef {
                 width: self.monitor.width,
                 height: self.monitor.height,
                 stride: self.monitor.width * 4,
-                bgra: self.last_frame.clone(),
+                bgra: &self.last_frame,
                 dirty,
                 capture_us: started.elapsed().as_micros() as u64,
             })
         }
+    }
+
+    pub fn grab_frame(&mut self) -> Result<CapturedFrame, CaptureError> {
+        let r = self.grab_frame_ref()?;
+        Ok(CapturedFrame {
+            width: r.width,
+            height: r.height,
+            stride: r.stride,
+            bgra: r.bgra.to_vec(),
+            dirty: r.dirty,
+            capture_us: r.capture_us,
+        })
     }
 
     pub fn grab_cursor(&mut self) -> Result<(CursorSnapshot, bool), CaptureError> {

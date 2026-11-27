@@ -319,10 +319,11 @@ class Host:
                     await send(writer, pack_control({
                         "type": "v2_ready",
                         "quic_port": ep.quic_port,
+                        "udp_port": ep.udp_port,
                         "pin": ep.pin,
                         "key": ep.key,
                         "monitor": ep.monitor,
-                    }))
+                    }), lock=write_lock)
                 return
             if kind == CONTROL and hello.get("type") == "hello" and hello.get("version") != VERSION:
                 raise ProtocolError("两端 Brioche 版本不兼容，请都更新到 0.2 或更高版本")
@@ -800,6 +801,13 @@ class Host:
                     task.cancel()
             self.loop.call_soon_threadsafe(cancel)
 
+    @property
+    def core_udp_port(self):
+        with self._core_lock:
+            if self._core_host is not None and self._core_host.endpoint is not None:
+                return int(self._core_host.endpoint.udp_port or 0)
+        return 0
+
     def _ensure_core_host(self):
         if not self.v2_core_enabled:
             return None
@@ -849,7 +857,7 @@ class Viewer:
     def __init__(self, uri, config, on_frame, on_status=lambda message: None,
                  on_info=lambda info: None, on_stats=lambda stats: None,
                  on_clipboard=lambda text: None, audio_enabled=True,
-                 on_audio=lambda payload: None, reconnect=False):
+                 on_audio=lambda payload: None, reconnect=False, prefer_yuv=False):
         self.address = parse_uri(uri)
         self.config = config
         self.on_frame, self.on_status = on_frame, on_status
@@ -858,6 +866,7 @@ class Viewer:
         self.audio_enabled = bool(audio_enabled)
         self.on_audio = on_audio
         self.reconnect = bool(reconnect)
+        self.prefer_yuv = bool(prefer_yuv)
         self.commands = queue.Queue(maxsize=128)
         self._mouse = None
         self._mouse_lock = threading.Lock()
@@ -988,7 +997,11 @@ class Viewer:
             self.on_info(info)
             self.on_status("已连接 · 点击画面控制，Ctrl+Alt+Shift 释放输入" if info.get("input")
                            else "已连接 · 只读共享")
-            decoder = DesktopDecoder()
+            decoder = DesktopDecoder(
+                codec=info.get("codec", "h264"),
+                output_format="yuv" if self.prefer_yuv else "bgra",
+            )
+            self.on_stats({"decoder": decoder.decoder_name, "hw_decode": decoder.hw_accelerated})
             sender = asyncio.create_task(self._send_commands(writer))
             frames, byte_count, since = 0, 0, time.monotonic()
             decode_ms = convert_ms = submit_ms = 0.0
@@ -1029,7 +1042,11 @@ class Viewer:
                     w, h = validate_stream_info(payload)
                     if payload["stream_id"] <= self._stream_id:
                         raise ProtocolError("屏幕流序号未递增")
-                    decoder = DesktopDecoder()
+                    decoder = DesktopDecoder(
+                        codec=payload.get("codec", "h264"),
+                        output_format="yuv" if self.prefer_yuv else "bgra",
+                    )
+                    self.on_stats({"decoder": decoder.decoder_name, "hw_decode": decoder.hw_accelerated})
                     self._stream_id = payload["stream_id"]
                     self.monitors = payload["monitors"]
                     self._switching.clear()
