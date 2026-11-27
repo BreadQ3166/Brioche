@@ -1,5 +1,6 @@
 package com.brioche.android
 
+import android.content.Context
 import android.view.Surface
 import org.json.JSONObject
 import java.io.BufferedInputStream
@@ -11,33 +12,73 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import javax.net.ssl.SSLSocket
 
+data class StreamReadyInfo(
+    val width: Int,
+    val height: Int,
+    val codec: String,
+    val encoder: String,
+    val capture: String,
+    val remotePlatform: String,
+    val monitors: List<BriocheProtocol.MonitorInfo>,
+    val activeMonitor: Int,
+    val inputAllowed: Boolean,
+    val filesAllowed: Boolean,
+    val clipboardAllowed: Boolean,
+    val audioActive: Boolean,
+    val activeHost: String,
+    val activePort: Int,
+    val activePin: String,
+    val activeToken: String,
+)
+
+data class SessionStats(
+    val renderFps: Int,
+    val encodedFps: Double,
+    val rttMs: Int,
+    val mbps: Double,
+    val captureEncodeMs: Double,
+    val sendMs: Double,
+)
+
 /**
- * Threaded Brioche v2 pinned-TLS streaming client with hardware MediaCodec decode,
- * 2s ping/pong heartbeat, input coalescing, clipboard sync, monitor switch, and auto-reconnect.
+ * Threaded Brioche v2 pinned-TLS streaming client with:
+ * - Zero-copy hardware MediaCodec H.264/HEVC video decode
+ * - Low-latency MediaCodec Opus audio decode + AudioTrack playback
+ * - 2s ping/pong heartbeat, input coalescing, clipboard sync, monitor switch
+ * - Seamless auto-reconnect (both direct LAN and Tailscale WAN tunnel re-dial)
  */
 class BriocheClient(
-    private val host: String,
-    private val port: Int,
-    private val pin: String,
-    private val token: String,
+    private val appContext: Context,
+    private val initialHost: String,
+    private val initialPort: Int,
+    private val initialPin: String,
+    private val initialToken: String,
+    private val tailscaleIp: String = "",
+    private val initialTunnelId: String = "",
     private val config: BriocheProtocol.StreamConfig,
+    private val audioEnabled: Boolean = true,
     private val surfaceProvider: () -> Surface?,
     private val listener: Listener,
 ) {
     interface Listener {
         fun onStatus(message: String)
-        fun onStreamReady(width: Int, height: Int, codec: String, monitors: List<BriocheProtocol.MonitorInfo>, activeMonitor: Int, inputAllowed: Boolean)
-        fun onStats(fps: Int, rttMs: Int, mbps: Double)
+        fun onStreamReady(info: StreamReadyInfo)
+        fun onStats(stats: SessionStats)
         fun onClipboard(text: String)
         fun onFatalError(message: String)
     }
 
     private val stopped = AtomicBoolean(false)
+    private val muted = AtomicBoolean(false)
     private val outQueue = LinkedBlockingQueue<JSONObject>(128)
     @Volatile
     private var latestMove: JSONObject? = null
     @Volatile
     private var activeSocket: SSLSocket? = null
+    @Volatile
+    private var activeAudio: OpusAudioPlayer? = null
+    @Volatile
+    private var activeTunnelId: String = initialTunnelId
     @Volatile
     private var streamId: Int = 0
     private val requestSeq = AtomicInteger(1)
@@ -57,7 +98,19 @@ class BriocheClient(
             activeSocket?.close()
         } catch (_: Exception) {
         }
+        val tid = activeTunnelId
+        activeTunnelId = ""
+        if (tid.isNotEmpty()) {
+            Thread({ EmbeddedNetwork.get(appContext).closeTunnel(tid) }, "brioche-close-tun").start()
+        }
     }
+
+    fun setAudioMuted(mute: Boolean) {
+        muted.set(mute)
+        activeAudio?.setMuted(mute)
+    }
+
+    fun isAudioMuted(): Boolean = muted.get()
 
     fun sendMouseMove(nx: Float, ny: Float) {
         if (stopped.get()) return
@@ -144,6 +197,11 @@ class BriocheClient(
         val delaysSec = intArrayOf(1, 2, 3, 5, 8)
         var attempt = 0
         var connectedOnce = false
+        var curHost = initialHost
+        var curPort = initialPort
+        var curPin = initialPin
+        var curToken = initialToken
+
         while (!stopped.get()) {
             try {
                 if (attempt > 0) {
@@ -151,8 +209,28 @@ class BriocheClient(
                     listener.onStatus("连接中断，${wait} 秒后自动重连（第 $attempt 次）…")
                     Thread.sleep(wait * 1000L)
                     if (stopped.get()) break
+                    if (tailscaleIp.isNotEmpty()) {
+                        listener.onStatus("正在通过内置 Tailscale 重建外网隧道…")
+                        val oldTid = activeTunnelId
+                        if (oldTid.isNotEmpty()) {
+                            EmbeddedNetwork.get(appContext).closeTunnel(oldTid)
+                            activeTunnelId = ""
+                        }
+                        val ep = EmbeddedNetwork.get(appContext).openPeer(tailscaleIp)
+                        curHost = ep.localHost
+                        curPort = ep.localPort
+                        curPin = ep.pin
+                        curToken = ep.token
+                        activeTunnelId = ep.tunnelId
+                    }
                 }
-                connectOnce(isReconnect = connectedOnce || attempt > 0)
+                connectOnce(
+                    host = curHost,
+                    port = curPort,
+                    pin = curPin,
+                    token = curToken,
+                    isReconnect = connectedOnce || attempt > 0,
+                )
                 connectedOnce = true
                 attempt = 1
             } catch (sec: SecurityException) {
@@ -174,14 +252,22 @@ class BriocheClient(
     }
 
     private fun isFatalMessage(msg: String): Boolean {
-        return listOf("凭据", "证书", "配对", "权限", "版本不兼容", "已有活动连接", "不支持").any { msg.contains(it) }
+        return listOf("凭据", "证书", "配对", "权限", "版本不兼容", "已有活动连接", "不支持", "尚未开启").any { msg.contains(it) }
     }
 
-    private fun connectOnce(isReconnect: Boolean) {
-        listener.onStatus("正在建立加密连接 $host:$port…")
-        val (socket, _) = BriocheProtocol.openPinnedTls(host, port, pin, connectTimeoutMs = 10000, readTimeoutMs = 25000)
+    private fun connectOnce(
+        host: String,
+        port: Int,
+        pin: String,
+        token: String,
+        isReconnect: Boolean,
+    ) {
+        val label = if (tailscaleIp.isNotEmpty()) "Tailscale $tailscaleIp" else "$host:$port"
+        listener.onStatus("正在建立加密连接 $label…")
+        val (socket, _) = BriocheProtocol.openPinnedTls(host, port, pin, connectTimeoutMs = 10_000, readTimeoutMs = 25_000)
         activeSocket = socket
         var decoder: HardwareVideoDecoder? = null
+        var audioPlayer: OpusAudioPlayer? = null
         val senderStop = AtomicBoolean(false)
         var senderThread: Thread? = null
         try {
@@ -202,7 +288,7 @@ class BriocheClient(
                 put("version", BriocheProtocol.VERSION)
                 put("token", token)
                 put("config", config.toJson())
-                put("audio", false)
+                put("audio", audioEnabled)
                 if (isReconnect) put("reconnect", true)
             }
             writeControl(hello)
@@ -219,12 +305,44 @@ class BriocheClient(
             var width = welcome.getInt("width")
             var height = welcome.getInt("height")
             var codecName = welcome.optString("codec", "h264")
+            var encoderName = welcome.optString("encoder", codecName)
+            var captureName = welcome.optString("capture", "")
+            val remotePlatform = welcome.optString("platform", "Desktop")
             streamId = welcome.optInt("stream_id", 0)
             var monitors = BriocheProtocol.parseMonitors(welcome.optJSONArray("monitors"))
             var activeMonitor = welcome.optInt("monitor", 1)
             val inputAllowed = welcome.optBoolean("input", true)
+            val filesAllowed = welcome.optBoolean("files", false)
+            val clipboardAllowed = welcome.optBoolean("clipboard", false)
+            val audioActive = welcome.optBoolean("audio", false)
 
-            listener.onStreamReady(width, height, codecName, monitors, activeMonitor, inputAllowed)
+            if (audioActive && audioEnabled) {
+                audioPlayer = OpusAudioPlayer().also {
+                    it.setMuted(muted.get())
+                    activeAudio = it
+                }
+            }
+
+            listener.onStreamReady(
+                StreamReadyInfo(
+                    width = width,
+                    height = height,
+                    codec = codecName,
+                    encoder = encoderName,
+                    capture = captureName,
+                    remotePlatform = remotePlatform,
+                    monitors = monitors,
+                    activeMonitor = activeMonitor,
+                    inputAllowed = inputAllowed,
+                    filesAllowed = filesAllowed,
+                    clipboardAllowed = clipboardAllowed,
+                    audioActive = audioActive && (audioPlayer?.isReady == true),
+                    activeHost = host,
+                    activePort = port,
+                    activePin = pin,
+                    activeToken = token,
+                )
+            )
             listener.onStatus("已连接 · 硬件解码就绪")
 
             // Wait briefly for SurfaceView to be ready
@@ -275,6 +393,9 @@ class BriocheClient(
             var statsSince = System.currentTimeMillis()
             var lastRttMs = 0
             var prevFrames = 0
+            var encodedFps = 0.0
+            var captureEncodeMs = 0.0
+            var sendMs = 0.0
 
             while (!stopped.get()) {
                 val frame = BriocheProtocol.readFrame(inp)
@@ -291,8 +412,20 @@ class BriocheClient(
                             prevFrames = curFrames
                             bytesSec = 0L
                             statsSince = nowMs
-                            listener.onStats(fpsNow, lastRttMs, mbps)
+                            listener.onStats(
+                                SessionStats(
+                                    renderFps = fpsNow,
+                                    encodedFps = encodedFps,
+                                    rttMs = lastRttMs,
+                                    mbps = mbps,
+                                    captureEncodeMs = captureEncodeMs,
+                                    sendMs = sendMs,
+                                )
+                            )
                         }
+                    }
+                    BriocheProtocol.AUDIO -> {
+                        audioPlayer?.decodeAndPlay(frame.payload)
                     }
                     BriocheProtocol.CONTROL -> {
                         val json = JSONObject(String(frame.payload, Charsets.UTF_8))
@@ -302,10 +435,17 @@ class BriocheClient(
                                 val rtt = (System.currentTimeMillis() - (stampSec * 1000.0)).toInt().coerceAtLeast(0)
                                 lastRttMs = rtt
                             }
+                            "stats" -> {
+                                encodedFps = json.optDouble("encoded_fps", encodedFps)
+                                captureEncodeMs = json.optDouble("capture_encode_ms", captureEncodeMs)
+                                sendMs = json.optDouble("send_ms", sendMs)
+                            }
                             "stream" -> {
                                 width = json.getInt("width")
                                 height = json.getInt("height")
                                 codecName = json.optString("codec", "h264")
+                                encoderName = json.optString("encoder", codecName)
+                                captureName = json.optString("capture", captureName)
                                 streamId = json.optInt("stream_id", streamId + 1)
                                 monitors = BriocheProtocol.parseMonitors(json.optJSONArray("monitors"))
                                 activeMonitor = json.optInt("monitor", activeMonitor)
@@ -315,7 +455,26 @@ class BriocheClient(
                                     HardwareVideoDecoder(s, codecName, width, height)
                                 } else null
                                 prevFrames = 0
-                                listener.onStreamReady(width, height, codecName, monitors, activeMonitor, inputAllowed)
+                                listener.onStreamReady(
+                                    StreamReadyInfo(
+                                        width = width,
+                                        height = height,
+                                        codec = codecName,
+                                        encoder = encoderName,
+                                        capture = captureName,
+                                        remotePlatform = remotePlatform,
+                                        monitors = monitors,
+                                        activeMonitor = activeMonitor,
+                                        inputAllowed = inputAllowed,
+                                        filesAllowed = filesAllowed,
+                                        clipboardAllowed = clipboardAllowed,
+                                        audioActive = audioActive && (audioPlayer?.isReady == true),
+                                        activeHost = host,
+                                        activePort = port,
+                                        activePin = pin,
+                                        activeToken = token,
+                                    )
+                                )
                             }
                             "clipboard" -> {
                                 val text = json.optString("text", "")
@@ -332,6 +491,8 @@ class BriocheClient(
             senderStop.set(true)
             senderThread?.interrupt()
             decoder?.release()
+            activeAudio = null
+            audioPlayer?.release()
             try {
                 socket.close()
             } catch (_: Exception) {

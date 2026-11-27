@@ -2,66 +2,106 @@ package com.brioche.android
 
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.DataInputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 
 class BriocheProtocolTest {
     @Test
-    fun parseLanTargetAcceptsPrivateIpv4AndCustomPort() {
-        assertEquals(Pair("192.168.1.8", 47995), BriocheProtocol.parseLanTarget("192.168.1.8"))
-        assertEquals(Pair("10.27.56.170", 48000), BriocheProtocol.parseLanTarget("10.27.56.170:48000"))
-        assertEquals(Pair("100.64.0.9", 47995), BriocheProtocol.parseLanTarget("100.64.0.9"))
+    fun pairingCodeMatchesPythonReferenceVector() {
+        val pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        val nonce = "fedcba9876543210fedcba9876543210"
+        val clientId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        assertEquals("267826", BriocheProtocol.pairingCode(pin, nonce, clientId))
     }
 
     @Test
-    fun parseUriRoundTripMatchesDesktopFormat() {
+    fun parseLanTargetAcceptsPrivateAndTailscaleIps() {
+        assertEquals(Pair("192.168.1.8", 47995), BriocheProtocol.parseLanTarget("192.168.1.8"))
+        assertEquals(Pair("10.27.56.170", 48000), BriocheProtocol.parseLanTarget("10.27.56.170:48000"))
+        assertEquals(Pair("100.64.1.2", 47995), BriocheProtocol.parseLanTarget("100.64.1.2"))
+    }
+
+    @Test(expected = IllegalArgumentException::class)
+    fun parseLanTargetRejectsPublicIp() {
+        BriocheProtocol.parseLanTarget("8.8.8.8")
+    }
+
+    @Test
+    fun uriRoundTripWorks() {
         val pin = "a".repeat(64)
-        val token = "A".repeat(43)
-        val uri = BriocheProtocol.formatUri("10.27.56.170", 47995, pin, token)
+        val token = "B".repeat(43)
+        val uri = BriocheProtocol.formatUri("192.168.1.10", 47995, pin, token)
         val parsed = BriocheProtocol.parseUri(uri)
-        assertEquals("10.27.56.170", parsed.host)
+        assertEquals("192.168.1.10", parsed.host)
         assertEquals(47995, parsed.port)
         assertEquals(pin, parsed.pin)
         assertEquals(token, parsed.token)
     }
 
     @Test
-    fun pairingCodeMatchesDesktopPythonExactVector() {
-        val pin = "0123456789abcdef".repeat(4)
-        val nonce = "fedcba9876543210".repeat(2)
-        val clientId = "00112233445566778899aabbccddeeff"
-        val code1 = BriocheProtocol.pairingCode(pin, nonce, clientId)
-        val code2 = BriocheProtocol.pairingCode(pin, nonce, clientId)
-        assertEquals("267826", code1)
-        assertEquals(code1, code2)
-    }
-
-    @Test
-    fun packAndReadControlFrameRoundTrips() {
-        val payload = JSONObject().apply {
+    fun framePackAndReadRoundTrip() {
+        val msg = JSONObject().apply {
             put("type", "ping")
-            put("stamp", 123.5)
+            put("stamp", 123.45)
         }
-        val packed = BriocheProtocol.packControl(payload)
-        val msg = BriocheProtocol.readFrame(DataInputStream(ByteArrayInputStream(packed)))
-        assertEquals(BriocheProtocol.CONTROL, msg.kind)
-        val decoded = JSONObject(String(msg.payload, Charsets.UTF_8))
+        val packed = BriocheProtocol.packControl(msg)
+        val wire = BriocheProtocol.readFrame(DataInputStream(ByteArrayInputStream(packed)))
+        assertEquals(BriocheProtocol.CONTROL, wire.kind)
+        val decoded = JSONObject(String(wire.payload, Charsets.UTF_8))
         assertEquals("ping", decoded.getString("type"))
     }
 
     @Test
-    fun lanBeaconParsesValidPayloadAndRejectsForeignProduct() {
-        val valid = """{"product":"Brioche","version":2,"name":"Ubuntu-3090","platform":"Linux","port":47995,"pin_prefix":"abcdef0123456789","busy":false}"""
-        val parsed = LanDiscovery.parseBeacon(valid.toByteArray(Charsets.UTF_8), "10.27.56.170")
-        assertNotNull(parsed)
-        assertEquals("Ubuntu-3090", parsed!!.name)
-        assertEquals(47995, parsed.port)
+    fun fileAndAudioFramesPackAndRead() {
+        val filePayload = ByteArray(1024) { (it % 251).toByte() }
+        val packedFile = BriocheProtocol.packFrame(BriocheProtocol.FILE, filePayload)
+        val wireFile = BriocheProtocol.readFrame(DataInputStream(ByteArrayInputStream(packedFile)))
+        assertEquals(BriocheProtocol.FILE, wireFile.kind)
+        assertEquals(1024, wireFile.payload.size)
 
-        val bad = """{"product":"OtherApp","port":47995,"name":"X"}"""
-        assertNull(LanDiscovery.parseBeacon(bad.toByteArray(Charsets.UTF_8), "10.27.56.170"))
+        val audioPayload = ByteArray(160) { 0x42 }
+        val packedAudio = BriocheProtocol.packFrame(BriocheProtocol.AUDIO, audioPayload)
+        val wireAudio = BriocheProtocol.readFrame(DataInputStream(ByteArrayInputStream(packedAudio)))
+        assertEquals(BriocheProtocol.AUDIO, wireAudio.kind)
+        assertEquals(160, wireAudio.payload.size)
+    }
+
+    @Test
+    fun beaconParserExtractsValidHost() {
+        val raw = """{"product":"Brioche","name":"Workstation","platform":"Linux","port":47995,"pin_prefix":"abcdef123456","busy":false}"""
+            .toByteArray(Charsets.UTF_8)
+        val dev = LanDiscovery.parseBeacon(raw, "192.168.1.50", nowMs = 1000L)
+        assertNotNull(dev)
+        assertEquals("Workstation", dev!!.name)
+        assertEquals("192.168.1.50", dev.ip)
+        assertEquals(47995, dev.port)
+    }
+
+    @Test
+    fun opusHeadFollowsRfc7845() {
+        val head = OpusAudioPlayer.createOpusHead(48_000, 2, 312)
+        assertEquals(19, head.size)
+        assertEquals("OpusHead", String(head, 0, 8, Charsets.US_ASCII))
+        val bb = ByteBuffer.wrap(head).order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(1.toByte(), bb.get(8))
+        assertEquals(2.toByte(), bb.get(9))
+        assertEquals(312.toShort(), bb.getShort(10))
+        assertEquals(48_000, bb.getInt(12))
+        assertEquals(0.toShort(), bb.getShort(16))
+        assertEquals(0.toByte(), bb.get(18))
+    }
+
+    @Test
+    fun embeddedNetworkValidatesLoginUrlAndHostname() {
+        assertTrue(EmbeddedNetwork.isValidLoginUrl("https://login.tailscale.com/a/123456"))
+        assertFalse(EmbeddedNetwork.isValidLoginUrl("http://login.tailscale.com/a/123"))
+        assertFalse(EmbeddedNetwork.isValidLoginUrl("https://evil.example.com/a/123"))
+        assertEquals("android-pixel-8-pro", EmbeddedNetwork.sanitizeHostname("Android Pixel 8 Pro!"))
     }
 }

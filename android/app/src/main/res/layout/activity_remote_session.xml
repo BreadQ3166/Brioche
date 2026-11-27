@@ -6,7 +6,7 @@
     android:background="@color/brioche_dark_bg"
     android:keepScreenOn="true">
 
-    <!-- Hardware-decoded SurfaceView centered with exact monitor aspect ratio -->
+    <!-- Hardware-decoded SurfaceView centered with exact monitor aspect ratio or scale mode -->
     <SurfaceView
         android:id="@+id/videoSurface"
         android:layout_width="match_parent"
@@ -21,6 +21,23 @@
         android:alpha="0"
         android:imeOptions="flagNoExtractUi"
         android:inputType="textNoSuggestions" />
+
+    <!-- Toggleable Detailed Performance HUD Overlay -->
+    <TextView
+        android:id="@+id/tvDetailedHud"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_marginStart="12dp"
+        android:layout_marginTop="52dp"
+        android:background="@color/brioche_dark_pill"
+        android:fontFamily="monospace"
+        android:paddingHorizontal="10dp"
+        android:paddingVertical="6dp"
+        android:text="Brioche HW HUD"
+        android:textColor="#F0E9DD"
+        android:textSize="11sp"
+        android:visibility="gone" />
 
     <!-- Center status banner while connecting / reconnecting -->
     <TextView
@@ -41,7 +58,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="top|center_horizontal"
-        android:layout_marginTop="10dp"
+        android:layout_marginTop="8dp"
         android:scrollbars="none">
 
         <LinearLayout
@@ -51,95 +68,139 @@
             android:background="@color/brioche_dark_pill"
             android:gravity="center_vertical"
             android:orientation="horizontal"
-            android:paddingHorizontal="10dp"
-            android:paddingVertical="6dp">
+            android:paddingHorizontal="8dp"
+            android:paddingVertical="4dp">
 
             <TextView
                 android:id="@+id/tvHudStats"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:paddingEnd="10dp"
+                android:paddingHorizontal="6dp"
                 android:text="HW · -- FPS"
                 android:textColor="#E7E1D7"
-                android:textSize="12sp"
+                android:textSize="11sp"
                 android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btnToggleHud"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="32dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="7dp"
+                android:text="HUD"
+                android:textColor="#E7E1D7"
+                android:textSize="11sp" />
 
             <Button
                 android:id="@+id/btnMonitor"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="34dp"
+                android:layout_height="32dp"
                 android:minWidth="0dp"
-                android:paddingHorizontal="8dp"
+                android:paddingHorizontal="7dp"
                 android:text="屏幕"
                 android:textColor="#FFFDF9"
-                android:textSize="12sp" />
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btnAudio"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="32dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="7dp"
+                android:text="🔊 音频"
+                android:textColor="#9FE2BF"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btnFiles"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="32dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="7dp"
+                android:text="文件"
+                android:textColor="#FFFDF9"
+                android:textSize="11sp" />
+
+            <Button
+                android:id="@+id/btnScaleMode"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="32dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="7dp"
+                android:text="适应"
+                android:textColor="#FFFDF9"
+                android:textSize="11sp" />
 
             <Button
                 android:id="@+id/btnTouchMode"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="34dp"
+                android:layout_height="32dp"
                 android:minWidth="0dp"
-                android:paddingHorizontal="8dp"
+                android:paddingHorizontal="7dp"
                 android:text="触控板"
                 android:textColor="#F4B860"
-                android:textSize="12sp" />
+                android:textSize="11sp" />
 
             <Button
                 android:id="@+id/btnKeyboard"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="34dp"
+                android:layout_height="32dp"
                 android:minWidth="0dp"
-                android:paddingHorizontal="8dp"
+                android:paddingHorizontal="7dp"
                 android:text="键盘"
                 android:textColor="#FFFDF9"
-                android:textSize="12sp" />
+                android:textSize="11sp" />
 
             <Button
                 android:id="@+id/btnShortcuts"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="34dp"
+                android:layout_height="32dp"
                 android:minWidth="0dp"
-                android:paddingHorizontal="8dp"
+                android:paddingHorizontal="7dp"
                 android:text="快捷键"
                 android:textColor="#FFFDF9"
-                android:textSize="12sp" />
+                android:textSize="11sp" />
 
             <Button
                 android:id="@+id/btnClipboard"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="34dp"
+                android:layout_height="32dp"
                 android:minWidth="0dp"
-                android:paddingHorizontal="8dp"
+                android:paddingHorizontal="7dp"
                 android:text="剪贴板"
                 android:textColor="#FFFDF9"
-                android:textSize="12sp" />
+                android:textSize="11sp" />
 
             <Button
                 android:id="@+id/btnHideBar"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="34dp"
+                android:layout_height="32dp"
                 android:minWidth="0dp"
-                android:paddingHorizontal="8dp"
+                android:paddingHorizontal="7dp"
                 android:text="收起"
                 android:textColor="#B8B1A6"
-                android:textSize="12sp" />
+                android:textSize="11sp" />
 
             <Button
                 android:id="@+id/btnDisconnect"
                 style="@style/Widget.Material3.Button.TextButton"
                 android:layout_width="wrap_content"
-                android:layout_height="34dp"
+                android:layout_height="32dp"
                 android:minWidth="0dp"
-                android:paddingHorizontal="8dp"
+                android:paddingHorizontal="7dp"
                 android:text="断开"
                 android:textColor="#FF7B6B"
-                android:textSize="12sp" />
+                android:textSize="11sp" />
         </LinearLayout>
     </HorizontalScrollView>
 

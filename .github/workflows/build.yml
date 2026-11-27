@@ -270,6 +270,20 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: Set up Go for embedded Tailscale (tsnet)
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
+        with:
+          go-version-file: network-helper/go.mod
+          cache-dependency-path: network-helper/go.sum
+      - name: Cross-compile embedded Tailscale helper for Android ABIs
+        shell: bash
+        run: |
+          set -e
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a android/app/src/main/jniLibs/x86_64
+          (cd network-helper && go test ./...)
+          (cd network-helper && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o ../android/app/src/main/jniLibs/arm64-v8a/libbrioche_network.so .)
+          (cd network-helper && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ../android/app/src/main/jniLibs/x86_64/libbrioche_network.so .)
+          ls -lh android/app/src/main/jniLibs/*/libbrioche_network.so
       - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -298,6 +312,7 @@ jobs:
             echo "$BADGING" | grep -E "package:|launchable-activity:|application-icon"
             echo "$BADGING" | grep -q "launchable-activity: name='com.brioche.android.MainActivity'"
           fi
+          unzip -l "releases/Brioche-${VERSION}-android.apk" | grep -q "lib/arm64-v8a/libbrioche_network.so"
           python3 scripts/checksums.py releases
           ls -lh releases/
       - name: Upload Android APK

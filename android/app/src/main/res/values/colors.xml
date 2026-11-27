@@ -8,7 +8,9 @@
     <color name="brioche_accent">#C87D32</color>
     <color name="brioche_accent_dark">#A86421</color>
     <color name="brioche_online">#2E8B57</color>
+    <color name="brioche_warn">#C07A1C</color>
+    <color name="brioche_danger">#C84B31</color>
     <color name="brioche_border">#DDD6CA</color>
     <color name="brioche_dark_bg">#12110F</color>
-    <color name="brioche_dark_pill">#CC1F1C18</color>
+    <color name="brioche_dark_pill">#D91F1C18</color>
 </resources>

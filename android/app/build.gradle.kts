@@ -3,7 +3,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val briocheVersionName: String = (findProperty("briocheVersion") as String?) ?: "1.2.1"
+val briocheVersionName: String = (findProperty("briocheVersion") as String?) ?: "1.3.0"
 val briocheVersionCode: Int = briocheVersionName
     .split(".")
     .mapNotNull { it.toIntOrNull() }
@@ -64,6 +64,12 @@ android {
     }
     testOptions {
         unitTests.isReturnDefaultValues = true
+    }
+    packaging {
+        jniLibs {
+            // Keep libbrioche_network.so extracted into nativeLibraryDir so Android 10-15 allows exec()
+            useLegacyPackaging = true
+        }
     }
 }
 

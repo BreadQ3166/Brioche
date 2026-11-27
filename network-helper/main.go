@@ -616,17 +616,60 @@ func (b *bridge) command(ctx context.Context, r request) (any, error) {
 	}
 	return nil, errors.New("unknown_command")
 }
+func installFallbackDNS(raw string) {
+	var servers []string
+	for _, part := range strings.Split(raw, ",") {
+		s := strings.TrimSpace(part)
+		if s == "" {
+			continue
+		}
+		if _, _, err := net.SplitHostPort(s); err != nil {
+			s = net.JoinHostPort(s, "53")
+		}
+		servers = append(servers, s)
+	}
+	if len(servers) == 0 {
+		return
+	}
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 4 * time.Second}
+			var lastErr error
+			for _, srv := range servers {
+				conn, err := d.DialContext(ctx, network, srv)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			return nil, lastErr
+		},
+	}
+}
+
 func main() {
 	state := flag.String("state-dir", "", "private node state")
+	hostFlag := flag.String("hostname", "", "optional custom node hostname")
+	dnsFlag := flag.String("dns", "", "comma-separated fallback DNS servers")
 	flag.Parse()
 	if *state == "" {
 		os.Exit(2)
+	}
+	if *dnsFlag != "" {
+		installFallbackDNS(*dnsFlag)
 	}
 	if err := os.MkdirAll(*state, 0700); err != nil {
 		os.Exit(2)
 	}
 	os.Chmod(*state, 0700)
-	name, _ := os.Hostname()
+	name := strings.TrimSpace(*hostFlag)
+	if name == "" {
+		name, _ = os.Hostname()
+	}
+	if name == "" {
+		name = "device"
+	}
 	server := &tsnet.Server{Dir: *state, Hostname: "brioche-" + name, Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
 	log.SetOutput(io.Discard)
 	if err := server.Start(); err != nil {
