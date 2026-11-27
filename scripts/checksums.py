@@ -6,7 +6,7 @@ from pathlib import Path
 parser = argparse.ArgumentParser()
 parser.add_argument('directory', nargs='?', type=Path, default=Path('releases'))
 args = parser.parse_args()
-paths = sorted(p for p in args.directory.iterdir() if p.suffix in ('.zip', '.deb', '.exe'))
+paths = sorted(p for p in args.directory.iterdir() if p.suffix in ('.zip', '.deb', '.exe', '.apk'))
 if not paths:
     raise SystemExit('No packages found')
 lines = []
