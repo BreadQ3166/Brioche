@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Brioche</string>
+    <string name="tagline">高速加密远程桌面 · 硬件解码</string>
+    <string name="lan_direct_hint">输入局域网 IP（如 192.168.1.8 或 10.27.56.170:47995）</string>
+    <string name="btn_lan_connect">局域网直连</string>
+    <string name="btn_uri_connect">粘贴连接码</string>
+    <string name="section_nearby">附近自动发现的电脑</string>
+    <string name="section_saved">已配对设备</string>
+    <string name="no_nearby">正在监听局域网广播（239.255.47.95:47993）… 请确认电脑端已开启“允许局域网设备连接本机”。</string>
+    <string name="no_saved">暂无已配对设备，点选上方发现的电脑或输入 IP 即可配对直连。</string>
+</resources>

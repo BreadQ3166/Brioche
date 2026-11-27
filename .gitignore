@@ -35,3 +35,9 @@ ui-concept.png
 
 # Rust streaming core build artifacts
 core/target/
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties

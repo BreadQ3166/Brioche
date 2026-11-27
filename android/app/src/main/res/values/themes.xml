@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Brioche" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/brioche_accent</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSecondary">@color/brioche_accent_dark</item>
+        <item name="android:windowBackground">@color/brioche_bg</item>
+        <item name="android:statusBarColor">@color/brioche_bg</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+
+    <style name="Theme.Brioche.Fullscreen" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/brioche_accent</item>
+        <item name="android:windowBackground">@color/brioche_dark_bg</item>
+        <item name="android:statusBarColor">@color/brioche_dark_bg</item>
+        <item name="android:navigationBarColor">@color/brioche_dark_bg</item>
+    </style>
+</resources>

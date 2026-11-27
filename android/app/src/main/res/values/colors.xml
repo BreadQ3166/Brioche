@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brioche_bg">#F7F5F0</color>
+    <color name="brioche_surface">#FFFFFF</color>
+    <color name="brioche_surface_alt">#EFECE5</color>
+    <color name="brioche_text">#1D1A16</color>
+    <color name="brioche_muted">#6F685F</color>
+    <color name="brioche_accent">#C87D32</color>
+    <color name="brioche_accent_dark">#A86421</color>
+    <color name="brioche_online">#2E8B57</color>
+    <color name="brioche_border">#DDD6CA</color>
+    <color name="brioche_dark_bg">#12110F</color>
+    <color name="brioche_dark_pill">#CC1F1C18</color>
+</resources>

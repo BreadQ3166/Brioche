@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/rootSession"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/brioche_dark_bg"
+    android:keepScreenOn="true">
+
+    <!-- Hardware-decoded SurfaceView centered with exact monitor aspect ratio -->
+    <SurfaceView
+        android:id="@+id/videoSurface"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:layout_gravity="center" />
+
+    <!-- Hidden IME bridge input for mobile keyboard -->
+    <EditText
+        android:id="@+id/hiddenKeyboardInput"
+        android:layout_width="1dp"
+        android:layout_height="1dp"
+        android:alpha="0"
+        android:imeOptions="flagNoExtractUi"
+        android:inputType="textNoSuggestions" />
+
+    <!-- Center status banner while connecting / reconnecting -->
+    <TextView
+        android:id="@+id/tvSessionStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="@color/brioche_dark_pill"
+        android:paddingHorizontal="18dp"
+        android:paddingVertical="10dp"
+        android:text="正在建立加密连接…"
+        android:textColor="#F7F5F0"
+        android:textSize="14sp" />
+
+    <!-- Top floating pill toolbar -->
+    <HorizontalScrollView
+        android:id="@+id/toolbarScroll"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="10dp"
+        android:scrollbars="none">
+
+        <LinearLayout
+            android:id="@+id/floatingToolbar"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@color/brioche_dark_pill"
+            android:gravity="center_vertical"
+            android:orientation="horizontal"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="6dp">
+
+            <TextView
+                android:id="@+id/tvHudStats"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingEnd="10dp"
+                android:text="HW · -- FPS"
+                android:textColor="#E7E1D7"
+                android:textSize="12sp"
+                android:textStyle="bold" />
+
+            <Button
+                android:id="@+id/btnMonitor"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="8dp"
+                android:text="屏幕"
+                android:textColor="#FFFDF9"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnTouchMode"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="8dp"
+                android:text="触控板"
+                android:textColor="#F4B860"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnKeyboard"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="8dp"
+                android:text="键盘"
+                android:textColor="#FFFDF9"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnShortcuts"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="8dp"
+                android:text="快捷键"
+                android:textColor="#FFFDF9"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnClipboard"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="8dp"
+                android:text="剪贴板"
+                android:textColor="#FFFDF9"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnHideBar"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="8dp"
+                android:text="收起"
+                android:textColor="#B8B1A6"
+                android:textSize="12sp" />
+
+            <Button
+                android:id="@+id/btnDisconnect"
+                style="@style/Widget.Material3.Button.TextButton"
+                android:layout_width="wrap_content"
+                android:layout_height="34dp"
+                android:minWidth="0dp"
+                android:paddingHorizontal="8dp"
+                android:text="断开"
+                android:textColor="#FF7B6B"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </HorizontalScrollView>
+
+    <!-- Collapsed handle pill -->
+    <Button
+        android:id="@+id/btnExpandBar"
+        style="@style/Widget.Material3.Button.TextButton"
+        android:layout_width="wrap_content"
+        android:layout_height="28dp"
+        android:layout_gravity="top|center_horizontal"
+        android:layout_marginTop="4dp"
+        android:background="@color/brioche_dark_pill"
+        android:minWidth="0dp"
+        android:paddingHorizontal="14dp"
+        android:text="▼ 工具栏"
+        android:textColor="#E7E1D7"
+        android:textSize="11sp"
+        android:visibility="gone" />
+</FrameLayout>
