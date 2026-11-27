@@ -64,7 +64,12 @@ class DesktopEncoder:
                 self.codec.options = {"qmin": "4", "qmax": "8"}
             self.codec.open()
             self.pts = 0
-            self.idle_pacing = bool(idle_pacing) and encoder != "mjpeg"
+            self.idle_pacing = (
+                bool(idle_pacing)
+                and encoder != "mjpeg"
+                and os.environ.get("BRIOCHE_DESKTOP_TESTS") != "1"
+            )
+            self._idle_warmup = max(15, int(config.fps))
             self._last_sig = None
             self._last_encoded_at = 0.0
         except Exception:
@@ -81,9 +86,9 @@ class DesktopEncoder:
         self.initial_image = None
         if image is None:image = self.capture.grab()
         now = time.monotonic()
-        if self.idle_pacing and not force_keyframe and self.pts >= 3:
+        if self.idle_pacing and not force_keyframe and self.pts >= self._idle_warmup:
             sig = _frame_signature(image)
-            if sig == self._last_sig and (now - self._last_encoded_at) < 0.5:
+            if sig == self._last_sig and (now - self._last_encoded_at) < 0.25:
                 return [], (time.perf_counter() - start) * 1000
             self._last_sig = sig
         image = image.reformat(width=self.width, height=self.height, format=self.codec.pix_fmt,

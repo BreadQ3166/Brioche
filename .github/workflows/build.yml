@@ -113,7 +113,7 @@ jobs:
           python3 - <<'PY'
           import hashlib, os
           from pathlib import Path
-          unchanged = hashlib.sha256(Path('scripts/build_media.py').read_bytes()).hexdigest() == 'd0d25f5e5203c3f7534a4cc1f12f141a7ef678dd1083b41f860df82e0cc4b07d'
+          unchanged = hashlib.sha256(Path('scripts/build_media.py').read_bytes()).hexdigest() == '88cfd48ad639524bfbd6f3f09e3fbd37cec8b5cdf31041b99fee8b4d14232b78'
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('unchanged=' + str(unchanged).lower() + '\n')
           PY
@@ -124,7 +124,7 @@ jobs:
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
           name: media-${{ matrix.platform }}
-          run-id: 44660747066
+          run-id: 45953780327
           github-token: ${{ github.token }}
           path: .
       - name: Install media build tools

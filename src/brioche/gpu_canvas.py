@@ -123,8 +123,8 @@ void main() {
 
 
 def gpu_opengl_allowed():
-    """Skip QOpenGLWidget in offscreen/minimal test backends where GL contexts are unavailable."""
-    if os.environ.get("BRIOCHE_DISABLE_GL") == "1":
+    """Skip QOpenGLWidget in offscreen/Xvfb test backends where hardware GL is unavailable."""
+    if os.environ.get("BRIOCHE_DISABLE_GL") == "1" or os.environ.get("BRIOCHE_DESKTOP_TESTS") == "1":
         return False
     platform_name = os.environ.get("QT_QPA_PLATFORM", "").lower()
     if platform_name in ("offscreen", "minimal"):

@@ -67,6 +67,7 @@ struct VTDecompressionOutputCallbackRecord {
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     static kCFAllocatorDefault: CFAllocatorRef;
+    static kCFAllocatorNull: CFAllocatorRef;
     static kCFBooleanTrue: CFBooleanRef;
     static kCFBooleanFalse: CFBooleanRef;
     static kCFTypeDictionaryKeyCallBacks: c_void;
@@ -233,6 +234,7 @@ extern "C" {
         source_frame_refcon: *mut c_void,
         info_flags_out: *mut u32,
     ) -> OSStatus;
+    fn VTDecompressionSessionWaitForAsynchronousFrames(session: VTDecompressionSessionRef) -> OSStatus;
     fn VTDecompressionSessionInvalidate(session: VTDecompressionSessionRef);
 }
 
@@ -718,11 +720,12 @@ impl VtDecoder {
         }
         unsafe {
             let mut block: CMBlockBufferRef = ptr::null_mut();
+            // CRITICAL: pass kCFAllocatorNull so CoreMedia does NOT call free() on Rust's Vec<u8>!
             let rc = CMBlockBufferCreateWithMemoryBlock(
                 kCFAllocatorDefault,
                 avcc.as_mut_ptr() as *mut c_void,
                 avcc.len(),
-                ptr::null(),
+                kCFAllocatorNull,
                 ptr::null(),
                 0,
                 avcc.len(),
@@ -750,6 +753,7 @@ impl VtDecoder {
                 return Err(CodecError::Process(format!("CMSampleBufferCreateReady failed: {src}")));
             }
             let drc = VTDecompressionSessionDecodeFrame(session, sbuf, 0, ptr::null_mut(), ptr::null_mut());
+            let _ = VTDecompressionSessionWaitForAsynchronousFrames(session);
             CFRelease(sbuf as CFTypeRef);
             if drc != 0 {
                 return Err(CodecError::Process(format!("VTDecompressionSessionDecodeFrame failed: {drc}")));

@@ -156,6 +156,7 @@ pub fn find_ffmpeg() -> Option<PathBuf> {
     fallback
 }
 
+#[cfg(not(target_os = "macos"))]
 fn test_encoder(ffmpeg: &Path, encoder: &str, pix_fmt: &str) -> bool {
     let mut cmd = Command::new(ffmpeg);
     cmd.args([
