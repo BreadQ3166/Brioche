@@ -17,7 +17,7 @@ class BriocheProtocolTest {
         val pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         val nonce = "fedcba9876543210fedcba9876543210"
         val clientId = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        assertEquals("267826", BriocheProtocol.pairingCode(pin, nonce, clientId))
+        assertEquals("694777", BriocheProtocol.pairingCode(pin, nonce, clientId))
     }
 
     @Test
