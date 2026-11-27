@@ -109,6 +109,13 @@ class RemoteSessionActivity : AppCompatActivity(), SurfaceHolder.Callback, Brioc
         ).also { it.start() }
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            enterImmersive()
+        }
+    }
+
     private fun enterImmersive() {
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
             window.insetsController?.let { ctl ->

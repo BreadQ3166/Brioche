@@ -1,10 +1,10 @@
-# Brioche 1.2.0
+# Brioche 1.2.1
 
 简洁现代的多功能远程桌面，提供统一设备工作台（内置 Tailscale 外网 + 局域网自动发现与配对）、双栏远程文件管理器、多标签沉浸会话窗口、原生 **Android APP** 客户端（MediaCodec 硬解 + 触控板/直触双模式）和局域网网页控制。Ubuntu、Windows、macOS 12 和 Android 均在 GitHub Releases 提供独立安装包，无需额外安装 Python、Go、Tailscale、Sunshine 或 Moonlight。
 
 ## Android 客户端 (`android/`)
 
-- 在 [Releases](https://github.com/BreadQ3166/Brioche/releases) 直接下载 `Brioche-1.2.0-android.apk` 安装到 Android 8.0+ 手机或平板。
+- 在 [Releases](https://github.com/BreadQ3166/Brioche/releases) 直接下载 `Brioche-1.2.1-android.apk` 安装到 Android 8.0+ 手机或平板。
 - 自动发现同一局域网下已开启共享的 Ubuntu / Windows / macOS 桌面端，也支持“指定局域网 IP 直连”（`192.168.x.x[:47995]`）或粘贴 `brioche://` 连接码。
 - 与桌面端共用 SHA-256 证书固定 + 6 位配对码确认、MediaCodec 低延迟硬件 H.264/HEVC 解码直接渲染到 Surface、触控板/直接触控双模式、多显示器实时切换、软键盘/组合键菜单、双向剪贴板同步和断线自动重连。详见 [android/README.md](android/README.md)。
 

@@ -292,6 +292,12 @@ jobs:
               "$SIGNER" verify --verbose "releases/Brioche-${VERSION}-android.apk"
             fi
           fi
+          AAPT2=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$AAPT2" ]; then
+            BADGING=$("$AAPT2" dump badging "releases/Brioche-${VERSION}-android.apk")
+            echo "$BADGING" | grep -E "package:|launchable-activity:|application-icon"
+            echo "$BADGING" | grep -q "launchable-activity: name='com.brioche.android.MainActivity'"
+          fi
           python3 scripts/checksums.py releases
           ls -lh releases/
       - name: Upload Android APK
