@@ -154,23 +154,15 @@ class ConnectionStabilityTests(unittest.TestCase):
     def test_embedded_network_poll_timeout_does_not_kill_active_helper(self):
         with tempfile.TemporaryDirectory() as tmp:
             net = EmbeddedNetwork(folder=Path(tmp))
+            net._save_config("test-net", "secret1234")
             terminated = []
             net._terminate = lambda: terminated.append(True)
-
-            class FakeStdin:
-                def write(self, _):
-                    pass
-
-                def flush(self):
-                    pass
-
-            net.process = SimpleNamespace(poll=lambda: None, stdin=FakeStdin())
+            net.process = SimpleNamespace(poll=lambda: None)
             net._start = lambda: None
-            # Empty responses queue simulates a slow devices poll
-            with patch.object(net.responses, "get", side_effect=queue.Empty()):
-                with self.assertRaises(RuntimeError):
-                    net.request("devices")
-            self.assertEqual(terminated, [], "Background devices poll timeout must NOT kill brioche-network!")
+            with patch.object(net, "_cli_json", side_effect=TimeoutError("rpc poll timeout")):
+                status = net.status(probe=True)
+            self.assertFalse(status["ready"])
+            self.assertEqual(terminated, [], "Background devices poll timeout must NOT kill easytier-core!")
 
     def test_same_peer_reconnect_reclaims_active_session_seamlessly(self):
         class FakeMedia:

@@ -106,7 +106,7 @@ class RemoteSessionActivity : AppCompatActivity(), SurfaceHolder.Callback, Brioc
         btnTouchMode.text = if (trackpadMode) "触控板" else "直触"
         peerName = intent.getStringExtra(EXTRA_NAME) ?: "远端电脑"
         tailscaleIp = intent.getStringExtra(EXTRA_TAILSCALE_IP) ?: ""
-        pathLabel = intent.getStringExtra(EXTRA_PATH_LABEL) ?: if (tailscaleIp.isNotEmpty()) "Tailscale 外网" else "局域网直连"
+        pathLabel = intent.getStringExtra(EXTRA_PATH_LABEL) ?: if (tailscaleIp.isNotEmpty()) "EasyTier 全球直连" else "局域网直连"
 
         videoSurface.holder.addCallback(this)
         setupToolbar()

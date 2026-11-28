@@ -96,7 +96,7 @@
                                 android:layout_width="0dp"
                                 android:layout_height="wrap_content"
                                 android:layout_weight="1"
-                                android:text="🌐 内置 Tailscale 外网"
+                                android:text="🌐 内置 EasyTier 全球直连"
                                 android:textColor="@color/brioche_text"
                                 android:textSize="15sp"
                                 android:textStyle="bold" />
@@ -119,7 +119,7 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:layout_marginTop="4dp"
-                            android:text="点击登录同账号即可发现并连接公网/跨网电脑，无需安装 Tailscale 客户端"
+                            android:text="输入相同网络名称与密钥即可与电脑自动 P2P 直连（免安装客户端 / 拒绝海外高延迟）"
                             android:textColor="@color/brioche_muted"
                             android:textSize="12sp" />
 
@@ -136,7 +136,7 @@
                                 android:layout_height="wrap_content"
                                 android:layout_marginEnd="8dp"
                                 android:layout_weight="1"
-                                android:text="登录 Tailscale"
+                                android:text="登录 EasyTier"
                                 android:textSize="12sp" />
 
                             <com.google.android.material.button.MaterialButton
@@ -322,7 +322,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:paddingBottom="6dp"
-                    android:text="外网同账号设备（Tailscale）"
+                    android:text="外网同网络设备（EasyTier）"
                     android:textColor="@color/brioche_text"
                     android:textSize="14sp"
                     android:textStyle="bold" />
@@ -338,7 +338,7 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:paddingBottom="12dp"
-                    android:text="登录内置 Tailscale 后将自动列出同一账号下运行 Brioche 的电脑。"
+                    android:text="登录内置 EasyTier 后将自动发现同网络下运行 Brioche 的电脑，优先 P2P 直连。"
                     android:textColor="@color/brioche_muted"
                     android:textSize="12sp" />
 
@@ -654,7 +654,7 @@
                             android:layout_width="wrap_content"
                             android:layout_height="wrap_content"
                             android:paddingBottom="6dp"
-                            android:text="内置 Tailscale 外网账号"
+                            android:text="内置 EasyTier 全球直连网络"
                             android:textColor="@color/brioche_text"
                             android:textSize="15sp"
                             android:textStyle="bold" />
@@ -724,7 +724,7 @@
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:paddingBottom="10dp"
-                            android:text="Brioche Android · 端到端 TLS SHA-256 证书固定 + MediaCodec 硬件解码 + 内置 Tailscale tsnet"
+                            android:text="Brioche Android · 端到端 TLS SHA-256 证书固定 + MediaCodec 硬件解码 + 内置 EasyTier P2P"
                             android:textColor="@color/brioche_muted"
                             android:textSize="12sp" />
 

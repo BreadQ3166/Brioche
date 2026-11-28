@@ -381,7 +381,7 @@ class FileBrowserActivity : AppCompatActivity() {
 
     private fun resolveTransferEndpoint(): Triple<String, Int, String> {
         return if (tailscaleIp.isNotEmpty()) {
-            val (localPort, tid) = EmbeddedNetwork.get(this).openTunnel(tailscaleIp, 47995)
+            val (localPort, tid) = EmbeddedNetwork.get(this).openTunnel(tailscaleIp, EmbeddedNetwork.STREAM_PORT)
             Triple("127.0.0.1", localPort, tid)
         } else {
             Triple(host, port, "")

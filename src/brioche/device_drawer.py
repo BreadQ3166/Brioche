@@ -161,7 +161,7 @@ class DeviceInspectorDrawer(QFrame):
         self.preferred_channel.addItem("自动择优（LAN 优先）", "auto")
         self.preferred_channel.addItem("仅局域网直连（不走外网）", "lan_only")
         self.preferred_channel.addItem("优先局域网（离线回退外网）", "lan")
-        self.preferred_channel.addItem("优先外网 Tailscale", "tailscale")
+        self.preferred_channel.addItem("优先外网 EasyTier", "tailscale")
 
         for label, widget in (
             ("分辨率", self.resolution),
@@ -192,7 +192,7 @@ class DeviceInspectorDrawer(QFrame):
         lan_row = QHBoxLayout()
         lan_row.setSpacing(8)
         self.lan_direct_btn = QPushButton("仅通过局域网连接")
-        self.lan_direct_btn.setToolTip("强制通过局域网直连此设备，不经过 Tailscale 外网")
+        self.lan_direct_btn.setToolTip("强制通过局域网直连此设备，不经过 EasyTier 外网")
         self.lan_direct_btn.clicked.connect(self._emit_lan_connect)
         self.bind_lan_btn = QPushButton("指定局域网 IP")
         self.bind_lan_btn.setObjectName("ghost")

@@ -98,10 +98,13 @@ class BriocheProtocolTest {
     }
 
     @Test
-    fun embeddedNetworkValidatesLoginUrlAndHostname() {
-        assertTrue(EmbeddedNetwork.isValidLoginUrl("https://login.tailscale.com/a/123456"))
-        assertFalse(EmbeddedNetwork.isValidLoginUrl("http://login.tailscale.com/a/123"))
-        assertFalse(EmbeddedNetwork.isValidLoginUrl("https://evil.example.com/a/123"))
+    fun embeddedNetworkParsesPeersAndDerivesDeterministicIps() {
+        val parsed = EmbeddedNetwork.parsePeerUrls("tcp://1.2.3.4:11010, bad://x udp://5.6.7.8:11010")
+        assertEquals(listOf("tcp://1.2.3.4:11010", "udp://5.6.7.8:11010"), parsed)
+        assertEquals(EmbeddedNetwork.DEFAULT_PEERS, EmbeddedNetwork.parsePeerUrls(""))
+        val (vip, pip) = EmbeddedNetwork.deriveNodeIps("00000000-1111-2222-3333-444444444444")
+        assertTrue(vip.startsWith("10.144."))
+        assertTrue(pip.startsWith("10.145."))
         assertEquals("android-pixel-8-pro", EmbeddedNetwork.sanitizeHostname("Android Pixel 8 Pro!"))
     }
 }

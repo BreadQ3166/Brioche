@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -87,31 +88,34 @@ class PhaseCV2AndWanUdpTests(unittest.TestCase):
     def test_embedded_network_publish_includes_core_udp_port_and_open_udp_tunnel(self):
         with tempfile.TemporaryDirectory() as tmp:
             net = EmbeddedNetwork(folder=Path(tmp))
-            calls = []
+            try:
+                net._start = lambda: None
+                net._rpc_port = 15888
+                net._start_discovery_http = lambda: None
+                fake_host = SimpleNamespace(
+                    bind="127.0.0.1",
+                    port=47995,
+                    pin="a" * 64,
+                    token="t" * 43,
+                    session_gate=SimpleNamespace(active=False),
+                    stop_requested=SimpleNamespace(is_set=lambda: False),
+                    core_udp_port=50123,
+                )
+                with patch("brioche.embedded_network._TcpBridgeServer") as mock_tcp, patch(
+                    "brioche.embedded_network._UdpRelayServer"
+                ) as mock_udp:
+                    net.publish(fake_host)
+                    self.assertEqual(net._shared["udp_port"], 50123)
+                    mock_tcp.assert_called_once()
+                    mock_udp.assert_called_once()
 
-            def fake_request(op, **kwargs):
-                calls.append((op, kwargs))
-                if op == "udp_tunnel":
-                    return {"port": 51234, "tunnel": "udp-1"}
-                return {"ok": True}
-
-            net.request = fake_request
-            fake_host = SimpleNamespace(
-                bind="127.0.0.1",
-                port=47995,
-                pin="a" * 64,
-                token="t" * 43,
-                session_gate=SimpleNamespace(active=False),
-                stop_requested=SimpleNamespace(is_set=lambda: False),
-                core_udp_port=50123,
-            )
-            net.publish(fake_host)
-            self.assertEqual(calls[0][0], "share")
-            self.assertEqual(calls[0][1]["share"]["udp_port"], 50123)
-
-            local_port, tid = net.open_udp_tunnel("100.64.0.9")
-            self.assertEqual(local_port, 51234)
-            self.assertEqual(tid, "udp-1")
+                with patch("subprocess.run", return_value=SimpleNamespace(returncode=0, stdout="ok", stderr="")) as mock_run:
+                    local_port, tid = net.open_udp_tunnel("10.145.1.9")
+                    self.assertGreater(local_port, 0)
+                    self.assertTrue(tid.startswith("udp:127.0.0.1:"))
+                    self.assertIn("port-forward", mock_run.call_args.args[0])
+            finally:
+                net.close()
 
 
 if __name__ == "__main__":

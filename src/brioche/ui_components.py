@@ -422,7 +422,7 @@ class AddLanDeviceDialog(QDialog):
         layout.addWidget(title)
 
         hint_text = (
-            "输入同一局域网电脑的 IPv4 地址（默认端口 47995），或从下方附近发现列表直接点选。此连接仅走局域网直连，不经过 Tailscale 外网或 DERP 中继。"
+            "输入同一局域网电脑的 IPv4 地址（默认端口 47995），或从下方附近发现列表直接点选。此连接仅走局域网直连，不经过 EasyTier 外网或中继。"
             if connect_primary
             else "输入同一局域网电脑的 IPv4 地址（默认端口 47995），或从下方附近发现列表直接点选。首次连接将核对六位配对码。"
         )
@@ -518,6 +518,84 @@ class AddLanDeviceDialog(QDialog):
 
     def value(self):
         return self.ip_input.text().strip()
+
+
+class EasyTierLoginDialog(QDialog):
+    """Modal dialog to sign into an EasyTier P2P mesh network (zero browser / zero TUN)."""
+
+    def __init__(self, initial_name="", initial_secret="", initial_peers="", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("登录 EasyTier 全球直连网络")
+        self.setFixedWidth(500)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 20)
+        layout.setSpacing(10)
+
+        title = QLabel("登录 EasyTier 极速直连网络")
+        title.setObjectName("subheading")
+        layout.addWidget(title)
+
+        hint = QLabel(
+            "所有填入相同「网络名称」和「网络密钥」的设备（Ubuntu / Windows / macOS / Android）会自动加密组网，优先 P2P 直连并自动启用 KCP 加速，免安装客户端与管理员权限。"
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        lbl_name = QLabel("网络名称（相当于账号 / 房间名）")
+        lbl_name.setObjectName("sectionLabel")
+        self.name_input = QLineEdit(initial_name)
+        self.name_input.setPlaceholderText("例如：bread-home（至少 3 个字符）")
+        layout.addWidget(lbl_name)
+        layout.addWidget(self.name_input)
+
+        lbl_secret = QLabel("网络密钥（端到端加密密码）")
+        lbl_secret.setObjectName("sectionLabel")
+        self.secret_input = QLineEdit(initial_secret)
+        self.secret_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.secret_input.setPlaceholderText("请输入自定义连接密码（两端需一致）")
+        layout.addWidget(lbl_secret)
+        layout.addWidget(self.secret_input)
+
+        lbl_peers = QLabel("引导 / 中继节点（默认内置低延迟公共节点，可改为自建节点）")
+        lbl_peers.setObjectName("sectionLabel")
+        self.peers_input = QLineEdit(initial_peers)
+        self.peers_input.setPlaceholderText("tcp://183.230.36.171:11010, tcp://et.sumnight.top:11010")
+        layout.addWidget(lbl_peers)
+        layout.addWidget(self.peers_input)
+
+        self.err_label = QLabel("")
+        self.err_label.setObjectName("muted")
+        self.err_label.setVisible(False)
+        layout.addWidget(self.err_label)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        ok_btn = QPushButton("立即连接 EasyTier")
+        ok_btn.setObjectName("primary")
+        ok_btn.clicked.connect(self._submit)
+        self.secret_input.returnPressed.connect(self._submit)
+        buttons.addWidget(cancel)
+        buttons.addWidget(ok_btn)
+        layout.addLayout(buttons)
+
+    def _submit(self):
+        name = self.name_input.text().strip()
+        secret = self.secret_input.text().strip()
+        if len(name) < 2 or len(secret) < 4:
+            self.err_label.setText("请填写网络名称（至少 2 位）和网络密钥（至少 4 位）。")
+            self.err_label.setVisible(True)
+            return
+        self.accept()
+
+    def values(self):
+        return (
+            self.name_input.text().strip(),
+            self.secret_input.text().strip(),
+            self.peers_input.text().strip(),
+        )
 
 
 class PageTransition:

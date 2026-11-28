@@ -13,7 +13,7 @@ parser.add_argument('--output-dir', type=Path, default=root / 'releases')
 args = parser.parse_args()
 if platform.system() != 'Windows' or platform.machine().lower() not in ('amd64', 'x86_64'):
     raise SystemExit('Build this portable package on Windows x64')
-for path in ('Brioche.exe', '_internal/network/brioche-network.exe'):
+for path in ('Brioche.exe', '_internal/network/easytier-core.exe', '_internal/network/easytier-cli.exe'):
     if not (args.binary_dir / path).is_file():
         raise SystemExit('Incomplete Windows bundle; build it first')
 version = runpy.run_path(str(root / 'src/brioche/__init__.py'))['__version__']

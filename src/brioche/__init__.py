@@ -1,3 +1,3 @@
 """Brioche remote desktop. Platform, media, transport and UI stay separate."""
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"

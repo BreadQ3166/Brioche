@@ -285,7 +285,7 @@ class SettingsView(QWidget):
             "本机被控权限",
             "控制其他设备如何连接这台电脑。局域网和外网共享可同时开启，共用单活动会话互斥。",
         )
-        self.external_allowed = QCheckBox("允许同账号 Tailscale 设备连接这台电脑（记住此选择）")
+        self.external_allowed = QCheckBox("允许同 EasyTier 网络设备连接这台电脑（记住此选择）")
         self.external_allowed.setChecked(bool(self.store.setting("external_allowed", False)))
         self.lan_allowed = QCheckBox("允许局域网设备连接这台电脑（首次配对需本机确认）")
         self.lan_allowed.setChecked(bool(self.store.setting("lan_allowed", False)))
@@ -388,10 +388,10 @@ class SettingsView(QWidget):
         col.setContentsMargins(0, 0, 6, 0)
         col.setSpacing(14)
 
-        ts_card, ts_layout = _card("内置 Tailscale 外网", "无需额外安装客户端，同账号设备自动出现在统一设备工作台。")
+        ts_card, ts_layout = _card("内置 EasyTier 全球直连", "免安装客户端与管理员权限，相同网络名称与密钥的设备自动 P2P 直连。")
         ts_row = QHBoxLayout()
-        self.account_status = _muted("正在检查账号…")
-        self.login_button = QPushButton("登录 Tailscale")
+        self.account_status = _muted("正在检查 EasyTier 网络…")
+        self.login_button = QPushButton("登录 EasyTier")
         self.login_button.setObjectName("primary")
         ts_row.addWidget(self.account_status, 1)
         ts_row.addWidget(self.login_button)

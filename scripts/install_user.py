@@ -17,7 +17,7 @@ parser.add_argument("--reuse-libraries", action="store_true", help="Hardlink byt
 args = parser.parse_args()
 package = root / f"releases/brioche_{version}_amd64.deb"
 if args.bundle:
-    if not (args.bundle / "Brioche").is_file() or not (args.bundle / "_internal/network/brioche-network").is_file():
+    if not (args.bundle / "Brioche").is_file() or not (args.bundle / "_internal/network/easytier-core").is_file():
         raise SystemExit("本地构建目录不完整")
 else:
     expected = next(line.split()[0] for line in (root / "releases/SHA256SUMS").read_text().splitlines()

@@ -75,7 +75,7 @@ class MainActivity : AppCompatActivity() {
     private var activeFilter = "all" // all | online | wan | lan | fav
     private var searchQuery = ""
     private var latestNearby: List<NearbyLanDevice> = emptyList()
-    private var latestTsStatus: TailscaleStatus? = null
+    private var latestTsStatus: EasyTierStatus? = null
     private val timeFmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
 
     private val transferListener: () -> Unit = {
@@ -269,8 +269,8 @@ class MainActivity : AppCompatActivity() {
         }
         findViewById<MaterialButton>(R.id.btnSettingTsLogout).setOnClickListener {
             AlertDialog.Builder(this)
-                .setTitle("退出内置 Tailscale 账号")
-                .setMessage("退出后将无法连接外网设备，直到重新登录授权。")
+                .setTitle("退出内置 EasyTier 网络")
+                .setMessage("退出后将无法连接外网设备，直到重新输入网络名称与密钥登录。")
                 .setPositiveButton("退出") { _, _ ->
                     io.execute {
                         EmbeddedNetwork.get(this).logout()
@@ -406,36 +406,70 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startTailscaleLogin() {
-        tvTsStatus.text = "正在启动内置 Tailscale 节点并获取登录授权链接…"
-        io.execute {
-            try {
-                val st = EmbeddedNetwork.get(this).login()
-                latestTsStatus = st
-                runOnUiThread {
-                    updateTailscaleUI(st)
-                    if (EmbeddedNetwork.isValidLoginUrl(st.authUrl)) {
-                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(st.authUrl)))
-                        Toast.makeText(this, "请在浏览器完成 Tailscale 账号登录后返回 Brioche", Toast.LENGTH_LONG).show()
-                    } else if (st.ready) {
-                        Toast.makeText(this, "内置 Tailscale 已连接", Toast.LENGTH_SHORT).show()
-                        refreshTailscale(probe = true)
-                    } else {
-                        Toast.makeText(this, st.message, Toast.LENGTH_LONG).show()
+        val net = EmbeddedNetwork.get(this)
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 8)
+        }
+        val etName = EditText(this).apply {
+            hint = "网络名称（相当于账号 / 房间名，如 bread-home）"
+            setText(net.networkName())
+            isSingleLine = true
+        }
+        val etSecret = EditText(this).apply {
+            hint = "网络密钥（两端需一致，至少 4 位）"
+            setText(net.networkSecret())
+            isSingleLine = true
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val etPeers = EditText(this).apply {
+            hint = "引导节点（默认公共节点，支持自定义 VPS）"
+            setText(net.peersCsv())
+            minLines = 2
+            maxLines = 4
+            textSize = 12f
+        }
+        container.addView(TextView(this).apply { text = "网络名称"; textSize = 12f })
+        container.addView(etName)
+        container.addView(TextView(this).apply { text = "网络密钥（端到端加密密码）"; textSize = 12f; setPadding(0, 14, 0, 0) })
+        container.addView(etSecret)
+        container.addView(TextView(this).apply { text = "公共 / 自建引导节点（逗号分隔）"; textSize = 12f; setPadding(0, 14, 0, 0) })
+        container.addView(etPeers)
+
+        AlertDialog.Builder(this)
+            .setTitle("登录 EasyTier 全球直连网络")
+            .setMessage("手机与电脑填入相同的网络名称和密钥即可自动 P2P 直连（免客户端、低延迟）。")
+            .setView(container)
+            .setPositiveButton("连接 EasyTier") { _, _ ->
+                val name = etName.text.toString().trim()
+                val secret = etSecret.text.toString().trim()
+                val peers = etPeers.text.toString().trim()
+                tvTsStatus.text = "正在加入 EasyTier 网络「$name」…"
+                io.execute {
+                    try {
+                        val st = net.login(name, secret, peers)
+                        latestTsStatus = st
+                        runOnUiThread {
+                            updateTailscaleUI(st)
+                            renderAllDeviceLists()
+                            Toast.makeText(this, st.message, Toast.LENGTH_LONG).show()
+                        }
+                    } catch (ex: Exception) {
+                        runOnUiThread {
+                            tvTsStatus.text = ex.message ?: "启动 EasyTier 失败"
+                            Toast.makeText(this, tvTsStatus.text, Toast.LENGTH_LONG).show()
+                        }
                     }
                 }
-            } catch (ex: Exception) {
-                runOnUiThread {
-                    tvTsStatus.text = ex.message ?: "启动 Tailscale 失败"
-                    Toast.makeText(this, tvTsStatus.text, Toast.LENGTH_LONG).show()
-                }
             }
-        }
+            .setNegativeButton("取消", null)
+            .show()
     }
 
-    private fun updateTailscaleUI(st: TailscaleStatus) {
+    private fun updateTailscaleUI(st: EasyTierStatus) {
         tvTsStatus.text = st.message
         tvSettingTsDetail.text = if (st.ready) {
-            "已连接 · 本机 Tailscale IP: ${st.ips.firstOrNull() ?: "-"} · 发现 ${st.peers.size} 台同账号 Brioche 设备"
+            "已连接 · 网络: ${st.networkName} · 虚拟 IP: ${st.ips.firstOrNull() ?: "-"} · 发现 ${st.peers.size} 台 Brioche 设备"
         } else {
             st.message
         }
@@ -443,17 +477,12 @@ class MainActivity : AppCompatActivity() {
             st.ready -> {
                 tvTsBadge.text = "已连接"
                 tvTsBadge.setTextColor(getColor(R.color.brioche_online))
-                btnTsAction.text = "外网已就绪"
-            }
-            EmbeddedNetwork.isValidLoginUrl(st.authUrl) -> {
-                tvTsBadge.text = "待浏览器授权"
-                tvTsBadge.setTextColor(getColor(R.color.brioche_warn))
-                btnTsAction.text = "打开浏览器完成登录"
+                btnTsAction.text = "切换网络 / 节点"
             }
             else -> {
-                tvTsBadge.text = if (st.state == "Starting") "连接中…" else "未登录"
-                tvTsBadge.setTextColor(getColor(R.color.brioche_muted))
-                btnTsAction.text = "登录 Tailscale"
+                tvTsBadge.text = if (st.state == "Unavailable") "异常" else "未登录"
+                tvTsBadge.setTextColor(getColor(if (st.state == "Unavailable") R.color.brioche_danger else R.color.brioche_muted))
+                btnTsAction.text = "登录 EasyTier"
             }
         }
     }
@@ -516,18 +545,18 @@ class MainActivity : AppCompatActivity() {
         discoverAndPairThenConnect(ip, port, existing?.pin)
     }
 
-    private fun connectTailscalePeer(peer: TailscalePeer, openFilesOnly: Boolean = false) {
+    private fun connectTailscalePeer(peer: EasyTierPeer, openFilesOnly: Boolean = false) {
         val meta = repo.getPeerMeta(peer.ip)
         val display = meta.alias.ifBlank { peer.name }
         if (openFilesOnly) {
-            openFileBrowser(display, "127.0.0.1", 47995, "", "", tailscaleIp = peer.ip)
+            openFileBrowser(display, "127.0.0.1", EmbeddedNetwork.STREAM_PORT, "", "", tailscaleIp = peer.ip)
             return
         }
         if (meta.lanOnly) {
             Toast.makeText(this, "「$display」已锁定仅局域网直连，请在设备配置中关闭锁定或使用局域网 IP", Toast.LENGTH_LONG).show()
             return
         }
-        showStatus("正在通过内置 Tailscale 连接 $display（${peer.ip}）…")
+        showStatus("正在通过内置 EasyTier 连接 $display（${peer.ip}）…")
         io.execute {
             try {
                 val ep = EmbeddedNetwork.get(this).openPeer(peer.ip)
@@ -535,11 +564,11 @@ class MainActivity : AppCompatActivity() {
                     tvStatus.visibility = View.GONE
                     repo.recordRecent(
                         RecentConnection(
-                            id = "ts:${peer.ip}",
+                            id = "et:${peer.ip}",
                             name = display,
                             mode = "tailscale",
                             address = peer.ip,
-                            port = 47995,
+                            port = EmbeddedNetwork.STREAM_PORT,
                             pin = ep.pin,
                             token = ep.token,
                             connectedAtMs = System.currentTimeMillis(),
@@ -554,7 +583,7 @@ class MainActivity : AppCompatActivity() {
                         putExtra(RemoteSessionActivity.EXTRA_NAME, display)
                         putExtra(RemoteSessionActivity.EXTRA_TAILSCALE_IP, peer.ip)
                         putExtra(RemoteSessionActivity.EXTRA_TUNNEL_ID, ep.tunnelId)
-                        putExtra(RemoteSessionActivity.EXTRA_PATH_LABEL, "Tailscale · ${peer.path}")
+                        putExtra(RemoteSessionActivity.EXTRA_PATH_LABEL, "EasyTier · ${peer.path}")
                         putExtra(RemoteSessionActivity.EXTRA_RESOLUTION, cfg.resolution)
                         putExtra(RemoteSessionActivity.EXTRA_FPS, cfg.fps)
                         putExtra(RemoteSessionActivity.EXTRA_BITRATE, cfg.bitrateMbps)
@@ -565,7 +594,7 @@ class MainActivity : AppCompatActivity() {
                 }
             } catch (ex: Exception) {
                 runOnUiThread {
-                    showStatus("Tailscale 连接失败：${ex.message}")
+                    showStatus("EasyTier 连接失败：${ex.message}")
                 }
             }
         }
@@ -719,7 +748,7 @@ class MainActivity : AppCompatActivity() {
                 else -> true
             }
             okFilter && matchesQuery(p.name, meta.alias, p.ip)
-        }.sortedWith(compareByDescending<TailscalePeer> { repo.getPeerMeta(it.ip).favorite }.thenByDescending { it.sharing }.thenBy { it.name.lowercase() })
+        }.sortedWith(compareByDescending<EasyTierPeer> { repo.getPeerMeta(it.ip).favorite }.thenByDescending { it.sharing }.thenBy { it.name.lowercase() })
 
         tvNoTsPeers.visibility = if (peers.isEmpty()) View.VISIBLE else View.GONE
         val inflater = LayoutInflater.from(this)
@@ -729,7 +758,7 @@ class MainActivity : AppCompatActivity() {
             val star = if (meta.favorite) "★ " else ""
             val lockTag = if (meta.lanOnly) " · 🔒仅LAN" else ""
             card.findViewById<TextView>(R.id.tvDeviceName).text = "$star${meta.alias.ifBlank { peer.name }}"
-            card.findViewById<TextView>(R.id.tvDeviceMeta).text = "Tailscale · ${peer.ip} · ${peer.path}$lockTag"
+            card.findViewById<TextView>(R.id.tvDeviceMeta).text = "EasyTier · ${peer.ip} · ${peer.path}$lockTag"
             val badge = card.findViewById<TextView>(R.id.tvDeviceBadge)
             when {
                 peer.busy -> {
@@ -884,7 +913,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun showTsPeerConfigDialog(peer: TailscalePeer) {
+    private fun showTsPeerConfigDialog(peer: EasyTierPeer) {
         val meta = repo.getPeerMeta(peer.ip)
         val display = meta.alias.ifBlank { peer.name }
         val actions = arrayOf(
@@ -944,7 +973,7 @@ class MainActivity : AppCompatActivity() {
             val card = inflater.inflate(R.layout.item_device_card, recentsContainer, false)
             card.findViewById<TextView>(R.id.tvDeviceName).text = r.name
             val ts = if (r.connectedAtMs > 0) timeFmt.format(Date(r.connectedAtMs)) else ""
-            val modeLabel = if (r.mode == "tailscale") "Tailscale 外网" else "局域网直连"
+            val modeLabel = if (r.mode == "tailscale") "EasyTier 全球直连" else "局域网直连"
             card.findViewById<TextView>(R.id.tvDeviceMeta).text = "$modeLabel · ${r.address} · $ts"
             card.findViewById<TextView>(R.id.tvDeviceBadge).text = "一键重连"
             val btnFiles = card.findViewById<MaterialButton>(R.id.btnDeviceFiles)
@@ -952,7 +981,7 @@ class MainActivity : AppCompatActivity() {
             btnFiles.setOnClickListener {
                 if (r.mode == "tailscale") {
                     connectTailscalePeer(
-                        TailscalePeer(r.address, r.name, online = true, reachable = true, sharing = true, busy = false, path = "外网"),
+                        EasyTierPeer(r.address, r.name, online = true, reachable = true, sharing = true, busy = false, path = "外网"),
                         openFilesOnly = true
                     )
                 } else {
@@ -962,7 +991,7 @@ class MainActivity : AppCompatActivity() {
             card.setOnClickListener {
                 if (r.mode == "tailscale") {
                     connectTailscalePeer(
-                        TailscalePeer(r.address, r.name, online = true, reachable = true, sharing = true, busy = false, path = "外网")
+                        EasyTierPeer(r.address, r.name, online = true, reachable = true, sharing = true, busy = false, path = "外网")
                     )
                 } else {
                     launchLanSession(r.address, r.port, r.pin, r.token, r.name, repo.effectiveConfigFor(null))

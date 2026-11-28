@@ -33,7 +33,7 @@ from .device_model import (
     filter_devices,
 )
 from .device_store import DeviceStore
-from .embedded_network import EmbeddedNetwork, login_url
+from .embedded_network import DEFAULT_EASYTIER_PEERS, EmbeddedNetwork, login_url
 from .lan import discover, pair, target
 from .lan_discovery import LanBeaconBroadcaster, LanBeaconListener
 from .network import lan_addresses
@@ -47,6 +47,7 @@ from .transfer_ui import TransferBoard, downloads
 from .ui_components import (
     AddLanDeviceDialog,
     DeviceList,
+    EasyTierLoginDialog,
     FilterPillBar,
     PageTransition,
 )
@@ -290,7 +291,7 @@ class MainWindow(QMainWindow):
         self.sidebar_account_label = QLabel("正在检查外网账号…")
         self.sidebar_account_label.setObjectName("muted")
         self.sidebar_account_label.setWordWrap(True)
-        self.sidebar_login_btn = QPushButton("登录 Tailscale")
+        self.sidebar_login_btn = QPushButton("登录 EasyTier")
         self.sidebar_login_btn.setObjectName("primary")
         self.sidebar_login_btn.clicked.connect(self.account_action)
         ac_layout.addWidget(self.sidebar_account_label)
@@ -372,7 +373,7 @@ class MainWindow(QMainWindow):
         self.device_list.context_requested.connect(self._device_context_menu)
         left_col.addWidget(self.device_list, 1)
 
-        self.empty_label = text("暂无设备。登录 Tailscale 显示同账号设备，或点击右上角“+ 添加局域网设备”。")
+        self.empty_label = text("暂无设备。登录 EasyTier 即可自动发现同网络全球直连设备，或点击右上角“+ 添加局域网设备”。")
         left_col.addWidget(self.empty_label)
 
         self.drawer = DeviceInspectorDrawer(self)
@@ -642,7 +643,7 @@ class MainWindow(QMainWindow):
             if all_devs:
                 self.empty_label.setText("没有符合当前筛选条件的设备，尝试清空搜索或切换分类。")
             elif self.environment["tailscale"]["ready"]:
-                self.empty_label.setText("暂无同账号设备。请在另一台电脑登录同一 Tailscale 账号，或点击“+ 添加局域网设备”。")
+                self.empty_label.setText("暂无同网络在线设备。请在另一台电脑或手机登录相同 EasyTier 网络名与密钥，或点击“+ 添加局域网设备”。")
             else:
                 self.empty_label.setText("登录后自动显示同账号外网设备；也可点击右上角“+ 添加局域网设备”免登录连接。")
 
@@ -779,7 +780,7 @@ class MainWindow(QMainWindow):
         bind_lan_act.triggered.connect(lambda: self.open_direct_lan_dialog(device))
 
         if ts_ch and lan_ch:
-            ts_act = menu.addAction(f"仅通过外网 Tailscale 连接 ({ts_ch['ip']})")
+            ts_act = menu.addAction(f"仅通过 EasyTier 外网连接 ({ts_ch['ip']})")
             ts_act.setEnabled(bool(ts_ch.get("connectable")))
             ts_act.triggered.connect(lambda: self.connect_device_via_tailscale(device))
 
@@ -1215,9 +1216,9 @@ class MainWindow(QMainWindow):
         if status["ready"]:
             self._auth_url = ""
         btn_label = (
-            "账号 / 退出"
+            "EasyTier / 退出"
             if status["ready"]
-            else "继续登录" if self._auth_url else "登录 Tailscale"
+            else "登录 EasyTier"
         )
         self.login_button.setText(btn_label)
         self.sidebar_login_btn.setText(btn_label)
@@ -1859,21 +1860,55 @@ class MainWindow(QMainWindow):
 
     def account_action(self):
         if self.environment["tailscale"]["ready"]:
-            answer = QMessageBox.question(
-                self, "退出账号", "退出后会停止本机外网共享及外网连接。局域网不受影响。"
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
-            for win in list(self._all_session_windows()):
-                win.close_sessions_by_mode("tailscale")
-            host = self.hosts["tailscale"]
-            if host:
-                host.stop()
-            self.work("logout", self.network.logout)
+            net_name = self.environment["tailscale"].get("network_name", "")
+            box = QMessageBox(self)
+            box.setWindowTitle("EasyTier 网络管理")
+            box.setText(f"当前已加入 EasyTier 网络：{net_name or '已连接'}\n\n退出后会停止本机外网共享及外网连接，局域网不受影响。")
+            switch_btn = box.addButton("切换网络 / 节点", QMessageBox.ButtonRole.ActionRole)
+            logout_btn = box.addButton("退出 EasyTier", QMessageBox.ButtonRole.DestructiveRole)
+            box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is logout_btn:
+                for win in list(self._all_session_windows()):
+                    win.close_sessions_by_mode("tailscale")
+                host = self.hosts["tailscale"]
+                if host:
+                    host.stop()
+                self.work("logout", self.network.logout)
+            elif clicked is switch_btn:
+                self._prompt_easytier_login()
         else:
-            self.login_button.setEnabled(False)
-            self.sidebar_login_btn.setEnabled(False)
-            self.work("login", self.network.login)
+            self._prompt_easytier_login()
+
+    def _prompt_easytier_login(self):
+        saved = self.network.load_config() or {}
+        initial_name = saved.get("network_name", "")
+        initial_secret = saved.get("network_secret", "")
+        initial_peers = ", ".join(saved.get("peers") or DEFAULT_EASYTIER_PEERS)
+        dialog = EasyTierLoginDialog(
+            initial_name=initial_name,
+            initial_secret=initial_secret,
+            initial_peers=initial_peers,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, secret, peers = dialog.values()
+        self.login_button.setEnabled(False)
+        self.sidebar_login_btn.setEnabled(False)
+        self.account_status.setText(f"正在加入 EasyTier 网络「{name}」…")
+        self.sidebar_account_label.setText(f"正在加入 EasyTier「{name}」…")
+        device_name = self.store.name
+        self.work(
+            "login",
+            lambda: self.network.login(
+                network_name=name,
+                network_secret=secret,
+                peers=peers,
+                hostname=device_name,
+            ),
+        )
 
     def copy_browser(self):
         host = self.hosts["lan"]

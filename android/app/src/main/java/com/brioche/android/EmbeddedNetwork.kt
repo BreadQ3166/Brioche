@@ -1,21 +1,27 @@
 package com.brioche.android
 
 import android.content.Context
-import android.net.ConnectivityManager
 import android.os.Build
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedInputStream
 import java.io.BufferedReader
-import java.io.BufferedWriter
+import java.io.DataInputStream
 import java.io.File
 import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import java.net.URI
-import java.util.concurrent.LinkedBlockingQueue
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.security.MessageDigest
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
-data class TailscalePeer(
+data class EasyTierPeer(
     val ip: String,
     val name: String,
     val online: Boolean,
@@ -25,16 +31,16 @@ data class TailscalePeer(
     val path: String,
 )
 
-data class TailscaleStatus(
+data class EasyTierStatus(
     val ready: Boolean,
     val state: String,
     val ips: List<String>,
-    val peers: List<TailscalePeer>,
-    val authUrl: String,
+    val peers: List<EasyTierPeer>,
+    val networkName: String,
     val message: String,
 )
 
-data class TailscaleEndpoint(
+data class EasyTierEndpoint(
     val localHost: String,
     val localPort: Int,
     val pin: String,
@@ -42,12 +48,97 @@ data class TailscaleEndpoint(
     val tunnelId: String,
 )
 
+private class LocalSocksBridge(
+    private val socksPort: Int,
+    private val targetIp: String,
+    private val targetPort: Int,
+) {
+    private val stopped = AtomicBoolean(false)
+    private val server = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+    val localPort: Int = server.localPort
+
+    init {
+        Thread({
+            while (!stopped.get()) {
+                val client = try {
+                    server.accept()
+                } catch (_: Exception) {
+                    break
+                }
+                Thread({ relay(client) }, "brioche-et-relay").apply {
+                    isDaemon = true
+                    start()
+                }
+            }
+        }, "brioche-et-accept-$localPort").apply {
+            isDaemon = true
+            start()
+        }
+    }
+
+    private fun relay(a: Socket) {
+        var b: Socket? = null
+        try {
+            a.tcpNoDelay = true
+            a.keepAlive = true
+            b = EmbeddedNetwork.socks5Connect(socksPort, targetIp, targetPort, timeoutMs = 8000)
+            b.tcpNoDelay = true
+            b.keepAlive = true
+            val upstream = b
+            val t1 = Thread({ copyStream(a, upstream) }, "brioche-et-up").apply { isDaemon = true; start() }
+            val t2 = Thread({ copyStream(upstream, a) }, "brioche-et-dn").apply { isDaemon = true; start() }
+            t1.join()
+            t2.join()
+        } catch (_: Exception) {
+        } finally {
+            try { a.close() } catch (_: Exception) {}
+            try { b?.close() } catch (_: Exception) {}
+        }
+    }
+
+    private fun copyStream(src: Socket, dst: Socket) {
+        val buf = ByteArray(65536)
+        try {
+            val inp = src.getInputStream()
+            val out = dst.getOutputStream()
+            while (true) {
+                val n = inp.read(buf)
+                if (n <= 0) break
+                out.write(buf, 0, n)
+                out.flush()
+            }
+        } catch (_: Exception) {
+        } finally {
+            try { dst.shutdownOutput() } catch (_: Exception) {}
+        }
+    }
+
+    fun close() {
+        stopped.set(true)
+        try { server.close() } catch (_: Exception) {}
+    }
+}
+
 /**
- * Private stdin/stdout IPC manager for the bundled Go tsnet binary (libbrioche_network.so).
- * Provides zero-config Tailscale WAN discovery and encrypted TCP/UDP tunnels without VPN permissions.
+ * Embedded EasyTier v2.6.4 userspace P2P mesh controller (zero root, zero TUN, zero VPN permission).
+ * Connects directly to Brioche desktop hosts via P2P UDP/QUIC/KCP or low-latency community/custom relays.
  */
 class EmbeddedNetwork private constructor(private val appContext: Context) {
     companion object {
+        const val DISCOVERY_PORT = 47984
+        const val STREAM_PORT = 47985
+
+        val DEFAULT_PEERS = listOf(
+            "tcp://183.230.36.171:11010",
+            "tcp://easytier.weiai.org.cn:11010",
+            "tcp://et.sumnight.top:11010",
+            "tcp://225284.xyz:11010",
+        )
+
+        private val PEER_URL_REGEX = Regex("^(tcp|udp|quic|ws|wss|wg|faketcp)://\\S+$", RegexOption.IGNORE_CASE)
+        private val PIN_REGEX = Regex("^[a-f0-9]{64}$")
+        private val TOKEN_REGEX = Regex("^[A-Za-z0-9_-]{43}$")
+
         @Volatile
         private var instance: EmbeddedNetwork? = null
 
@@ -57,26 +148,20 @@ class EmbeddedNetwork private constructor(private val appContext: Context) {
             }
         }
 
-        private val ERRORS = mapOf(
-            "different_account" to "仅允许连接同一 Tailscale 账号的设备，且设备不能使用标签身份",
-            "peer_unavailable" to "无法联系这台设备，请确认另一端 Brioche 已启动并登录",
-            "peer_not_sharing" to "对方尚未开启 Brioche 外网共享，或账号无访问权限",
-            "invalid_peer" to "对方不是兼容的 Brioche 共享服务",
-            "login_failed" to "无法发起登录，请检查网络后重试",
-            "status_unavailable" to "内置网络暂不可用，请稍后刷新",
-        )
+        fun parsePeerUrls(raw: String?): List<String> {
+            val list = raw.orEmpty()
+                .split(Regex("[\\s,;]+"))
+                .map { it.trim() }
+                .filter { PEER_URL_REGEX.matches(it) }
+                .distinct()
+            return if (list.isEmpty()) DEFAULT_PEERS else list
+        }
 
-        fun isValidLoginUrl(value: String?): Boolean {
-            if (value.isNullOrBlank()) return false
-            return try {
-                val uri = URI(value)
-                uri.scheme == "https" &&
-                    uri.host == "login.tailscale.com" &&
-                    (uri.port == -1 || uri.port == 443) &&
-                    uri.userInfo == null
-            } catch (_: Exception) {
-                false
-            }
+        fun deriveNodeIps(machineId: String): Pair<String, String> {
+            val digest = MessageDigest.getInstance("SHA-256").digest(machineId.toByteArray(Charsets.UTF_8))
+            val a = ((digest[0].toInt() and 0xFF) % 250) + 1
+            val b = ((digest[1].toInt() and 0xFF) % 250) + 1
+            return Pair("10.144.$a.$b", "10.145.$a.$b")
         }
 
         fun sanitizeHostname(raw: String): String {
@@ -86,124 +171,163 @@ class EmbeddedNetwork private constructor(private val appContext: Context) {
                 .take(32)
             return cleaned.ifEmpty { "android" }
         }
+
+        fun socks5Connect(socksPort: Int, dstIp: String, dstPort: Int, timeoutMs: Int = 6000): Socket {
+            val sock = Socket()
+            sock.connect(InetSocketAddress("127.0.0.1", socksPort), timeoutMs)
+            sock.soTimeout = timeoutMs
+            try {
+                val out = sock.getOutputStream()
+                val inp = DataInputStream(BufferedInputStream(sock.getInputStream()))
+                out.write(byteArrayOf(0x05, 0x01, 0x00))
+                out.flush()
+                val v = inp.readByte().toInt()
+                val m = inp.readByte().toInt()
+                if (v != 0x05 || m != 0x00) {
+                    throw IllegalStateException("EasyTier SOCKS5 握手失败")
+                }
+                val ipBytes = InetAddress.getByName(dstIp).address
+                val req = ByteArray(10)
+                req[0] = 0x05; req[1] = 0x01; req[2] = 0x00; req[3] = 0x01
+                System.arraycopy(ipBytes, 0, req, 4, 4)
+                req[8] = ((dstPort shr 8) and 0xFF).toByte()
+                req[9] = (dstPort and 0xFF).toByte()
+                out.write(req)
+                out.flush()
+                val head = ByteArray(4)
+                inp.readFully(head)
+                if (head[1].toInt() != 0) {
+                    throw IllegalStateException("EasyTier 目标不可达 (code=${head[1].toInt()})")
+                }
+                when (head[3].toInt()) {
+                    1 -> inp.readFully(ByteArray(6))
+                    3 -> {
+                        val len = inp.readUnsignedByte()
+                        inp.readFully(ByteArray(len + 2))
+                    }
+                    4 -> inp.readFully(ByteArray(18))
+                }
+                sock.soTimeout = 0
+                return sock
+            } catch (ex: Exception) {
+                try { sock.close() } catch (_: Exception) {}
+                throw ex
+            }
+        }
+
+        fun socks5HttpGetJson(socksPort: Int, dstIp: String, dstPort: Int, path: String, timeoutMs: Int = 2500): Pair<Int, JSONObject> {
+            val sock = socks5Connect(socksPort, dstIp, dstPort, timeoutMs)
+            sock.use { s ->
+                s.soTimeout = timeoutMs
+                val req = "GET $path HTTP/1.1\r\nHost: $dstIp:$dstPort\r\nConnection: close\r\n\r\n"
+                s.getOutputStream().write(req.toByteArray(Charsets.US_ASCII))
+                s.getOutputStream().flush()
+                val raw = s.getInputStream().readBytes().toString(Charsets.UTF_8)
+                val idx = raw.indexOf("\r\n\r\n")
+                if (idx < 0) return Pair(0, JSONObject())
+                val statusLine = raw.substring(0, idx).lineSequence().firstOrNull().orEmpty()
+                val code = statusLine.split(" ").getOrNull(1)?.toIntOrNull() ?: 0
+                val body = raw.substring(idx + 4)
+                if (code != 200) return Pair(code, JSONObject())
+                return Pair(code, JSONObject(body))
+            }
+        }
     }
 
-    private val folder = File(appContext.filesDir, "network")
-    private val enabledMarker = File(folder, "enabled")
-    private val stateDir = File(folder, "state")
+    private val prefs = appContext.getSharedPreferences("brioche_easytier_v1", Context.MODE_PRIVATE)
     private val lock = Any()
-    private val serial = AtomicInteger(0)
+    private val bridges = ConcurrentHashMap<String, LocalSocksBridge>()
+    private val bridgeSeq = AtomicInteger(0)
     private var process: Process? = null
-    private var writer: BufferedWriter? = null
-    private var responses = LinkedBlockingQueue<JSONObject>()
+    private var rpcPort: Int = 0
+    private var socksPort: Int = 0
+    private var virtualIp: String = ""
     @Volatile
     private var lastStderr: String = ""
 
     val isEnabled: Boolean
-        get() = enabledMarker.exists()
+        get() = networkName().isNotEmpty() && networkSecret().isNotEmpty()
 
-    fun binaryFile(): File {
-        return File(appContext.applicationInfo.nativeLibraryDir, "libbrioche_network.so")
+    fun networkName(): String = prefs.getString("network_name", "") ?: ""
+    fun networkSecret(): String = prefs.getString("network_secret", "") ?: ""
+    fun peersCsv(): String = prefs.getString("peers_csv", DEFAULT_PEERS.joinToString(", ")) ?: DEFAULT_PEERS.joinToString(", ")
+
+    private fun machineId(): String {
+        val existing = prefs.getString("machine_id", null)
+        if (!existing.isNullOrBlank()) return existing
+        val created = UUID.randomUUID().toString()
+        prefs.edit().putString("machine_id", created).apply()
+        return created
     }
+
+    fun coreBinaryFile(): File = File(appContext.applicationInfo.nativeLibraryDir, "libeasytier_core.so")
+    fun cliBinaryFile(): File = File(appContext.applicationInfo.nativeLibraryDir, "libeasytier_cli.so")
 
     fun isBinaryAvailable(): Boolean {
-        val bin = binaryFile()
-        return bin.isFile && bin.canExecute()
+        val core = coreBinaryFile()
+        val cli = cliBinaryFile()
+        return core.isFile && core.canExecute() && cli.isFile && cli.canExecute()
     }
 
-    private fun resolveAndroidInterfacesSpec(): String {
-        val parts = mutableListOf<String>()
-        try {
-            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            val net = cm?.activeNetwork
-            val props = if (net != null) cm.getLinkProperties(net) else null
-            if (props != null) {
-                val ifName = (props.interfaceName ?: "wlan0").replace(Regex("[^a-zA-Z0-9._-]"), "")
-                val cidrs = props.linkAddresses.mapNotNull { la ->
-                    val host = la.address?.hostAddress?.substringBefore('%')
-                    if (!host.isNullOrBlank()) "$host/${la.prefixLength}" else null
-                }
-                if (cidrs.isNotEmpty()) {
-                    parts.add("$ifName=${cidrs.joinToString(",")}")
-                }
-            }
-        } catch (_: Exception) {
-        }
-        return parts.joinToString(";")
-    }
-
-    private fun resolveAndroidDnsCsv(): String {
-        val out = LinkedHashSet<String>()
-        try {
-            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            val net = cm?.activeNetwork
-            val props = if (net != null) cm.getLinkProperties(net) else null
-            props?.dnsServers?.forEach { addr ->
-                val host = addr.hostAddress
-                if (!host.isNullOrBlank() && !host.contains('%')) {
-                    out.add(host)
-                }
-            }
-        } catch (_: Exception) {
-        }
-        // Always append reliable fallback DNS servers for Android networks without /etc/resolv.conf
-        out.add("223.5.5.5")
-        out.add("119.29.29.29")
-        out.add("1.1.1.1")
-        out.add("8.8.8.8")
-        return out.joinToString(",")
+    private fun findFreeTcpPort(): Int {
+        ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { return it.localPort }
     }
 
     private fun ensureStarted() {
         val existing = process
         if (existing != null && existing.isAlive) return
-        val bin = binaryFile()
-        if (!bin.isFile || !bin.canExecute()) {
-            throw IllegalStateException("当前架构未包含内置 Tailscale 组件（${Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"}）")
+        val netName = networkName()
+        val netSecret = networkSecret()
+        if (netName.isEmpty() || netSecret.isEmpty()) {
+            throw IllegalStateException("尚未登录 EasyTier 网络")
         }
-        stateDir.mkdirs()
-        val xdgConfig = File(folder, "config").apply { mkdirs() }
+        if (!isBinaryAvailable()) {
+            throw IllegalStateException("当前架构未包含内置 EasyTier 组件（${Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"}）")
+        }
+        rpcPort = findFreeTcpPort()
+        socksPort = findFreeTcpPort()
+        val mid = machineId()
+        val (vip, _) = deriveNodeIps(mid)
+        virtualIp = vip
         val hostName = sanitizeHostname("android-${Build.MODEL}")
-        val dnsCsv = resolveAndroidDnsCsv()
-        val ifacesSpec = resolveAndroidInterfacesSpec()
         val cmd = mutableListOf(
-            bin.absolutePath,
-            "--state-dir", stateDir.absolutePath,
-            "--hostname", hostName,
-            "--dns", dnsCsv,
-            "--android-safe",
+            coreBinaryFile().absolutePath,
+            "--no-tun",
+            "--use-smoltcp",
+            "-i", "$vip/16",
+            "--hostname", "brioche-$hostName",
+            "--machine-id", mid,
+            "--network-name", netName,
+            "--network-secret", netSecret,
+            "--latency-first",
+            "--enable-kcp-proxy",
+            "--socks5", socksPort.toString(),
+            "--rpc-portal", "127.0.0.1:$rpcPort",
+            "--disable-env-parsing",
         )
-        if (ifacesSpec.isNotEmpty()) {
-            cmd.add("--ifaces")
-            cmd.add(ifacesSpec)
+        parsePeerUrls(peersCsv()).forEach { peerUrl ->
+            cmd.add("-p")
+            cmd.add(peerUrl)
         }
         val pb = ProcessBuilder(cmd)
-        pb.redirectErrorStream(false)
+        pb.redirectErrorStream(true)
         val env = pb.environment()
-        env.keys.filter { it.startsWith("TS_") || it.startsWith("TSNET_") || it.startsWith("TAILSCALE_") }
-            .forEach { env.remove(it) }
-        env["HOME"] = folder.absolutePath
-        env["XDG_CONFIG_HOME"] = xdgConfig.absolutePath
-        env["XDG_CACHE_HOME"] = appContext.cacheDir.absolutePath
+        env.keys.filter { it.startsWith("ET_") }.forEach { env.remove(it) }
+        env["HOME"] = appContext.filesDir.absolutePath
         env["TMPDIR"] = appContext.cacheDir.absolutePath
-        env["TS_NO_LOGS_NO_SUPPORT"] = "true"
 
         lastStderr = ""
         val proc = pb.start()
-        val queue = LinkedBlockingQueue<JSONObject>()
         process = proc
-        writer = BufferedWriter(OutputStreamWriter(proc.outputStream, Charsets.UTF_8))
-        responses = queue
-
         Thread({
             try {
-                BufferedReader(InputStreamReader(proc.errorStream, Charsets.UTF_8)).use { errReader ->
+                BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { reader ->
                     val lines = ArrayDeque<String>()
                     while (true) {
-                        val line = errReader.readLine() ?: break
-                        val trimmed = line.trim()
-                        if (trimmed.isNotEmpty()) {
-                            lines.addLast(trimmed)
+                        val line = reader.readLine() ?: break
+                        val t = line.trim()
+                        if (t.isNotEmpty()) {
+                            lines.addLast(t)
                             while (lines.size > 4) lines.removeFirst()
                             lastStderr = lines.joinToString(" | ").take(240)
                         }
@@ -211,236 +335,247 @@ class EmbeddedNetwork private constructor(private val appContext: Context) {
                 }
             } catch (_: Exception) {
             }
-        }, "brioche-network-stderr").apply {
+        }, "brioche-et-log").apply {
             isDaemon = true
             start()
         }
 
-        Thread({
-            try {
-                BufferedReader(InputStreamReader(proc.inputStream, Charsets.UTF_8)).use { reader ->
-                    while (true) {
-                        val line = reader.readLine() ?: break
-                        if (line.length > 1024 * 1024) break
-                        try {
-                            queue.put(JSONObject(line))
-                        } catch (_: Exception) {
-                        }
-                    }
-                }
-            } catch (_: Exception) {
-            } finally {
-                val exitCode = try {
-                    if (proc.isAlive) -1 else proc.exitValue()
-                } catch (_: Exception) {
-                    -1
-                }
-                queue.put(JSONObject().apply {
-                    put("__eof", true)
-                    put("__exit", exitCode)
-                })
-            }
-        }, "brioche-network-ipc").apply {
-            isDaemon = true
-            start()
-        }
-    }
-
-    private fun request(op: String, extra: Map<String, Any> = emptyMap()): JSONObject {
-        synchronized(lock) {
-            ensureStarted()
-            val reqId = serial.incrementAndGet()
-            val waitMs = if (op == "devices") 35_000L else 25_000L
-            val payload = JSONObject().apply {
-                put("id", reqId)
-                put("op", op)
-                extra.forEach { (k, v) -> put(k, v) }
-            }
-            try {
-                val w = writer ?: throw IllegalStateException("内置网络未就绪")
-                w.write(payload.toString())
-                w.write("\n")
-                w.flush()
-                val deadline = System.currentTimeMillis() + waitMs
-                while (true) {
-                    val remaining = deadline - System.currentTimeMillis()
-                    if (remaining <= 0) {
-                        if (op == "devices" || op == "status") {
-                            throw IllegalStateException("内置网络状态轮询超时，保持现有连接")
-                        }
-                        terminateLocked()
-                        throw IllegalStateException("内置网络响应超时，请检查网络后重试")
-                    }
-                    val resp = responses.poll(remaining, TimeUnit.MILLISECONDS)
-                        ?: continue
-                    if (resp.optBoolean("__eof", false)) {
-                        val exitCode = resp.optInt("__exit", -1)
-                        val detail = lastStderr
-                        terminateLocked()
-                        val suffix = buildString {
-                            if (exitCode >= 0) append(" (exit=$exitCode)")
-                            if (detail.isNotEmpty()) append(": $detail")
-                        }
-                        throw IllegalStateException("内置网络模块已退出$suffix")
-                    }
-                    val cid = resp.optInt("id", -1)
-                    if (cid == reqId) {
-                        val err = resp.optString("error", "")
-                        if (err.isNotEmpty()) {
-                            throw IllegalStateException(ERRORS[err] ?: "外网操作失败（$err）")
-                        }
-                        return resp.optJSONObject("result") ?: JSONObject()
-                    }
-                    if (cid in 1 until reqId) {
-                        continue // discard stale response from earlier poll
-                    }
-                }
-            } catch (ex: IllegalStateException) {
-                throw ex
-            } catch (ex: Exception) {
+        val deadline = System.currentTimeMillis() + 5000L
+        while (System.currentTimeMillis() < deadline) {
+            if (!proc.isAlive) {
+                val code = proc.exitValue()
                 terminateLocked()
-                throw IllegalStateException("内置网络通信中断：${ex.message ?: "请稍后重试"}")
+                throw IllegalStateException("EasyTier 启动失败 (exit=$code): $lastStderr")
+            }
+            try {
+                Socket().use { s ->
+                    s.connect(InetSocketAddress("127.0.0.1", rpcPort), 200)
+                }
+                return
+            } catch (_: Exception) {
+                Thread.sleep(80)
             }
         }
     }
 
-    fun status(probe: Boolean = false): TailscaleStatus {
+    private fun runCliJson(subCmd: String): JSONArray {
+        val pb = ProcessBuilder(
+            cliBinaryFile().absolutePath,
+            "-p", "127.0.0.1:$rpcPort",
+            "-o", "json",
+            subCmd,
+        )
+        pb.redirectErrorStream(false)
+        val proc = pb.start()
+        val stdout = proc.inputStream.bufferedReader(Charsets.UTF_8).readText()
+        val ok = proc.waitFor(5, TimeUnit.SECONDS)
+        if (!ok) {
+            proc.destroyForcibly()
+            throw IllegalStateException("EasyTier CLI 查询超时")
+        }
+        if (proc.exitValue() != 0) {
+            val err = proc.errorStream.bufferedReader(Charsets.UTF_8).readText().trim()
+            throw IllegalStateException(err.ifEmpty { "EasyTier CLI 返回 ${proc.exitValue()}" })
+        }
+        return JSONArray(stdout.trim().ifEmpty { "[]" })
+    }
+
+    fun login(networkName: String, networkSecret: String, peersRaw: String): EasyTierStatus {
+        val cleanName = networkName.trim().take(64)
+        val cleanSecret = networkSecret.trim().take(64)
+        if (cleanName.length < 2 || cleanSecret.length < 4) {
+            throw IllegalArgumentException("请填写网络名称（至少 2 位）和网络密钥（至少 4 位）")
+        }
+        val cleanPeers = parsePeerUrls(peersRaw).joinToString(", ")
+        synchronized(lock) {
+            terminateLocked()
+            prefs.edit()
+                .putString("network_name", cleanName)
+                .putString("network_secret", cleanSecret)
+                .putString("peers_csv", cleanPeers)
+                .apply()
+            ensureStarted()
+        }
+        return status(probe = true)
+    }
+
+    fun status(probe: Boolean = false): EasyTierStatus {
         if (!isBinaryAvailable()) {
-            return TailscaleStatus(
+            return EasyTierStatus(
                 ready = false,
                 state = "Unavailable",
                 ips = emptyList(),
                 peers = emptyList(),
-                authUrl = "",
-                message = "内置 Tailscale 仅支持 arm64 / x86_64 设备",
+                networkName = "",
+                message = "内置 EasyTier 仅支持 arm64 / x86_64 设备",
             )
         }
         if (!isEnabled) {
-            return TailscaleStatus(
+            return EasyTierStatus(
                 ready = false,
                 state = "NeedsLogin",
                 ips = emptyList(),
                 peers = emptyList(),
-                authUrl = "",
-                message = "点击“登录 Tailscale”，无需另外安装客户端",
+                networkName = "",
+                message = "点击“登录 EasyTier”，输入网络名与密钥即可全球直连",
             )
         }
         return try {
-            val raw = request(if (probe) "devices" else "status")
-            val state = raw.optString("state", "Starting")
-            val ips = parseStringArray(raw.optJSONArray("ips")).filter { !it.contains(':') }
-            val ready = state == "Running" && ips.isNotEmpty()
-            val peers = parsePeers(raw.optJSONArray("peers"))
-            val authUrl = raw.optString("auth_url", "")
-            val msg = when {
-                ready -> "内置 Tailscale 已连接 · ${ips.first()}"
-                state == "NeedsMachineAuth" -> "请在 Tailscale 管理页批准这台设备"
-                state == "NeedsLogin" -> "请点击登录，完成浏览器授权"
-                state == "Starting" -> "正在连接 Tailscale，请稍后刷新"
-                else -> "内置网络正在启动（$state）"
+            val sp: Int
+            val vip: String
+            synchronized(lock) {
+                ensureStarted()
+                sp = socksPort
+                vip = virtualIp
             }
-            TailscaleStatus(ready, state, ips, peers, authUrl, msg)
+            val routes = runCliJson("route")
+            val peerRows = runCliJson("peer")
+            val peerByV4 = HashMap<String, JSONObject>()
+            for (i in 0 until peerRows.length()) {
+                val o = peerRows.optJSONObject(i) ?: continue
+                val ip = o.optString("ipv4", "").substringBefore('/')
+                if (ip.isNotEmpty()) peerByV4[ip] = o
+            }
+
+            val peers = mutableListOf<EasyTierPeer>()
+            for (i in 0 until routes.length()) {
+                val r = routes.optJSONObject(i) ?: continue
+                val hostname = r.optString("hostname", "")
+                if (r.optString("next_hop_hostname") == "Local" || !hostname.startsWith("brioche-")) continue
+                val proxyCidrs = r.optString("proxy_cidrs", "")
+                val targetIp = proxyCidrs.split(Regex("[\\s,]+"))
+                    .map { it.substringBefore('/').trim() }
+                    .firstOrNull { it.startsWith("10.145.") }
+                    ?: continue
+                val v4 = r.optString("ipv4", "").substringBefore('/')
+                val prow = peerByV4[v4]
+                val cost = prow?.optString("cost", "")?.lowercase().orEmpty()
+                val lat = prow?.optString("lat_ms", "")?.trim().orEmpty()
+                val proto = prow?.optString("tunnel_proto", "")?.trim().orEmpty()
+                val isP2p = cost == "p2p" || r.optString("next_hop_hostname").equals("DIRECT", ignoreCase = true)
+                val latTxt = if (lat.isNotEmpty() && lat != "-") " · ${lat}ms" else ""
+                val protoTxt = if (proto.isNotEmpty() && proto != "-") " (${proto.uppercase()})" else ""
+                val pathLabel = if (isP2p) "P2P 直连$latTxt$protoTxt" else "EasyTier 中继$latTxt"
+                peers.add(
+                    EasyTierPeer(
+                        ip = targetIp,
+                        name = hostname.removePrefix("brioche-").ifEmpty { targetIp },
+                        online = true,
+                        reachable = false,
+                        sharing = false,
+                        busy = false,
+                        path = pathLabel,
+                    )
+                )
+            }
+
+            val finalPeers = if (probe && peers.isNotEmpty()) {
+                val pool = Executors.newFixedThreadPool(minOf(6, peers.size))
+                try {
+                    val futures = peers.map { p ->
+                        pool.submit<EasyTierPeer> {
+                            try {
+                                val (code, json) = socks5HttpGetJson(sp, p.ip, DISCOVERY_PORT, "/presence", timeoutMs = 2000)
+                                if (code == 200 && json.optString("product").startsWith("Brioche/")) {
+                                    p.copy(
+                                        reachable = true,
+                                        sharing = json.optBoolean("sharing", false),
+                                        busy = json.optBoolean("busy", false),
+                                    )
+                                } else p
+                            } catch (_: Exception) {
+                                p
+                            }
+                        }
+                    }
+                    futures.map { it.get(3, TimeUnit.SECONDS) }
+                } catch (_: Exception) {
+                    peers
+                } finally {
+                    pool.shutdownNow()
+                }
+            } else {
+                peers
+            }
+
+            val netName = networkName()
+            EasyTierStatus(
+                ready = true,
+                state = "Running",
+                ips = listOf(vip),
+                peers = finalPeers,
+                networkName = netName,
+                message = "EasyTier 已连接 · $netName ($vip)",
+            )
         } catch (ex: Exception) {
-            TailscaleStatus(
+            EasyTierStatus(
                 ready = false,
                 state = "Unavailable",
                 ips = emptyList(),
                 peers = emptyList(),
-                authUrl = "",
-                message = ex.message ?: "内置网络暂不可用，请刷新",
+                networkName = networkName(),
+                message = ex.message ?: "EasyTier 暂不可用，请重试",
             )
         }
     }
 
-    fun login(): TailscaleStatus {
-        folder.mkdirs()
-        if (!enabledMarker.exists()) {
-            enabledMarker.writeText("1\n")
+    fun openPeer(proxyIp: String): EasyTierEndpoint {
+        val sp = synchronized(lock) {
+            ensureStarted()
+            socksPort
         }
-        val cur = status(probe = false)
-        if (cur.ready) return cur
-        request("login")
-        return status(probe = false)
+        val (code, info) = try {
+            socks5HttpGetJson(sp, proxyIp, DISCOVERY_PORT, "/info", timeoutMs = 6000)
+        } catch (ex: Exception) {
+            throw IllegalStateException("无法联系该 EasyTier 设备（${ex.message ?: "请确认对方已开启外网共享"}）")
+        }
+        if (code == 409) throw IllegalStateException("对方尚未开启 Brioche 外网共享")
+        if (code != 200 || !info.optString("product").startsWith("Brioche/")) {
+            throw IllegalStateException("对方不是兼容的 Brioche 共享服务")
+        }
+        val pin = info.optString("pin", "")
+        val token = info.optString("token", "")
+        val remotePort = info.optInt("port", STREAM_PORT)
+        if (!PIN_REGEX.matches(pin) || !TOKEN_REGEX.matches(token)) {
+            throw IllegalStateException("对方返回的设备凭据无效")
+        }
+        val (localPort, tid) = openTunnel(proxyIp, remotePort)
+        return EasyTierEndpoint("127.0.0.1", localPort, pin, token, tid)
     }
 
-    fun openPeer(ip: String): TailscaleEndpoint {
-        val result = request("connect", mapOf("ip" to ip))
-        val port = result.getInt("port")
-        val pin = result.getString("pin")
-        val token = result.getString("token")
-        val tunnel = result.optString("tunnel", "")
-        return TailscaleEndpoint("127.0.0.1", port, pin, token, tunnel)
-    }
-
-    fun openTunnel(ip: String, port: Int = 47995): Pair<Int, String> {
-        val result = request("tunnel", mapOf("ip" to ip, "port" to port))
-        return Pair(result.getInt("port"), result.optString("tunnel", ""))
+    fun openTunnel(proxyIp: String, remotePort: Int = STREAM_PORT): Pair<Int, String> {
+        val sp = synchronized(lock) {
+            ensureStarted()
+            socksPort
+        }
+        val bridge = LocalSocksBridge(sp, proxyIp, remotePort)
+        val tid = "et-${bridgeSeq.incrementAndGet()}"
+        bridges[tid] = bridge
+        return Pair(bridge.localPort, tid)
     }
 
     fun closeTunnel(tunnelId: String) {
         if (tunnelId.isEmpty()) return
-        try {
-            request("close_tunnel", mapOf("tunnel" to tunnelId))
-        } catch (_: Exception) {
-        }
+        bridges.remove(tunnelId)?.close()
     }
 
     fun logout() {
         synchronized(lock) {
-            if (isEnabled) {
-                try {
-                    request("logout")
-                } catch (_: Exception) {
-                }
-                enabledMarker.delete()
-            }
+            bridges.values.forEach { it.close() }
+            bridges.clear()
             terminateLocked()
+            prefs.edit()
+                .remove("network_name")
+                .remove("network_secret")
+                .apply()
         }
     }
 
     private fun terminateLocked() {
         try {
-            writer?.close()
-        } catch (_: Exception) {
-        }
-        writer = null
-        try {
             process?.destroy()
         } catch (_: Exception) {
         }
         process = null
-    }
-
-    private fun parseStringArray(arr: JSONArray?): List<String> {
-        if (arr == null) return emptyList()
-        val out = mutableListOf<String>()
-        for (i in 0 until arr.length()) {
-            val s = arr.optString(i, "")
-            if (s.isNotEmpty()) out.add(s)
-        }
-        return out
-    }
-
-    private fun parsePeers(arr: JSONArray?): List<TailscalePeer> {
-        if (arr == null) return emptyList()
-        val out = mutableListOf<TailscalePeer>()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            val ip = o.optString("ip", "")
-            val name = o.optString("name", ip)
-            if (ip.isEmpty()) continue
-            out.add(
-                TailscalePeer(
-                    ip = ip,
-                    name = name,
-                    online = o.optBoolean("online", false),
-                    reachable = o.optBoolean("reachable", false),
-                    sharing = o.optBoolean("sharing", false),
-                    busy = o.optBoolean("busy", false),
-                    path = o.optString("path", "待检测"),
-                )
-            )
-        }
-        return out
     }
 }

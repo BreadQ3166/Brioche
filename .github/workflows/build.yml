@@ -270,29 +270,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - name: Set up Go for embedded Tailscale (tsnet)
-        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5
-        with:
-          go-version-file: network-helper/go.mod
-          cache-dependency-path: network-helper/go.sum
-      - name: Cross-compile embedded Tailscale helper for Android ABIs
+      - name: Bundle embedded EasyTier binaries for Android ABIs
         shell: bash
         run: |
           set -e
-          mkdir -p android/app/src/main/jniLibs/arm64-v8a android/app/src/main/jniLibs/x86_64
-          (cd network-helper && go test ./...)
-          NDK_ROOT="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
-          if [ -z "$NDK_ROOT" ] && [ -n "$ANDROID_HOME" ]; then
-            NDK_ROOT=$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)
-          fi
-          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "Using Android NDK toolchain: $TOOLCHAIN"
-          test -x "$TOOLCHAIN/aarch64-linux-android26-clang"
-          test -x "$TOOLCHAIN/x86_64-linux-android26-clang"
-          (cd network-helper && CGO_ENABLED=1 GOOS=android GOARCH=arm64 CC="$TOOLCHAIN/aarch64-linux-android26-clang" go build -trimpath -ldflags="-s -w" -o ../android/app/src/main/jniLibs/arm64-v8a/libbrioche_network.so .)
-          (cd network-helper && CGO_ENABLED=1 GOOS=android GOARCH=amd64 CC="$TOOLCHAIN/x86_64-linux-android26-clang" go build -trimpath -ldflags="-s -w" -o ../android/app/src/main/jniLibs/x86_64/libbrioche_network.so .)
-          ls -lh android/app/src/main/jniLibs/*/libbrioche_network.so
-          file android/app/src/main/jniLibs/*/libbrioche_network.so
+          python3 scripts/build_network.py --os android --arch arm64 --android-so --output-dir android/app/src/main/jniLibs/arm64-v8a
+          python3 scripts/build_network.py --os android --arch x86_64 --android-so --output-dir android/app/src/main/jniLibs/x86_64
+          ls -lh android/app/src/main/jniLibs/*/libeasytier_*.so
+          file android/app/src/main/jniLibs/*/libeasytier_*.so
       - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -321,7 +306,8 @@ jobs:
             echo "$BADGING" | grep -E "package:|launchable-activity:|application-icon"
             echo "$BADGING" | grep -q "launchable-activity: name='com.brioche.android.MainActivity'"
           fi
-          unzip -l "releases/Brioche-${VERSION}-android.apk" | grep -q "lib/arm64-v8a/libbrioche_network.so"
+          unzip -l "releases/Brioche-${VERSION}-android.apk" | grep -q "lib/arm64-v8a/libeasytier_core.so"
+          unzip -l "releases/Brioche-${VERSION}-android.apk" | grep -q "lib/arm64-v8a/libeasytier_cli.so"
           python3 scripts/checksums.py releases
           ls -lh releases/
       - name: Upload Android APK

@@ -3,7 +3,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-val briocheVersionName: String = (findProperty("briocheVersion") as String?) ?: "1.3.1"
+val briocheVersionName: String = (findProperty("briocheVersion") as String?) ?: "1.4.0"
 val briocheVersionCode: Int = briocheVersionName
     .split(".")
     .mapNotNull { it.toIntOrNull() }

@@ -1,11 +1,16 @@
-# Brioche 1.3.1
+# Brioche 1.4.0
 
-简洁现代的多功能远程桌面，提供统一设备工作台（内置 Tailscale 外网 + 局域网自动发现与配对）、双栏远程文件管理器、多标签沉浸会话窗口、全功能原生 **Android APP** 客户端（内置 Tailscale 外网 + 远端文件管理器 + Opus 低延迟音频 + MediaCodec 硬解）和局域网网页控制。Ubuntu、Windows、macOS 12 和 Android 均在 GitHub Releases 提供独立安装包，无需额外安装 Python、Go、Tailscale、Sunshine 或 Moonlight。
+简洁现代的多功能远程桌面，提供统一设备工作台（内置 **EasyTier 全球极速 P2P 组网** + 局域网自动发现与配对）、双栏远程文件管理器、多标签沉浸会话窗口、全功能原生 **Android APP** 客户端（内置 EasyTier + 远端文件管理器 + Opus 低延迟音频 + MediaCodec 硬解）和局域网网页控制。Ubuntu、Windows、macOS 12 和 Android 均在 GitHub Releases 提供独立安装包，无需额外安装 Python、Go、EasyTier、Tailscale、Sunshine 或 Moonlight。
+
+## 外网登录（内置 EasyTier 全球直连，免费无设备数上限）
+
+1. 在电脑与手机的 Brioche 中点击「登录 EasyTier」，输入相同的**网络名称**与**网络密钥**即可立即加入同一加密虚拟网络（无需浏览器跳转授权，无需管理员权限或 VPN 权限）。
+2. 默认内置已验证的低延迟公共引导节点，也支持随时切换为你自己的 VPS 节点；优先自动建立 **0 跳 P2P 直连（UDP/QUIC/KCP 穿透，NAT4 成功率远高于 Tailscale）**，弱网自动开启 KCP 加速。
 
 ## Android 客户端 (`android/`)
 
-- 在 [Releases](https://github.com/BreadQ3166/Brioche/releases) 直接下载 `Brioche-1.3.1-android.apk` 安装到 Android 8.0+ 手机或平板。
-- **全功能对齐桌面端**：内置 Tailscale (`tsnet`) 免客户端公网直连/同账号自动发现、局域网自动发现与指定 IP 直连、远端文件管理器（浏览电脑目录/上传/下载到 `Download/Brioche/`/新建文件夹/重命名/删除 + SHA-256 校验 + 传输队列与限速）、Opus 48kHz 低延迟系统音频播放、MediaCodec 硬件 H.264/HEVC 解码、详细性能 HUD、缩放模式、触控板/直触双模式、多显示器实时切换、全套桌面快捷键、双向剪贴板同步、Light/Dark 双主题及单设备独立配置。详见 [android/README.md](android/README.md)。
+- 在 [Releases](https://github.com/BreadQ3166/Brioche/releases) 直接下载 `Brioche-1.4.0-android.apk` 安装到 Android 8.0+ 手机或平板。
+- **全功能对齐桌面端**：内置 EasyTier v2.6.4 免客户端全球 P2P 直连、局域网自动发现与指定 IP 直连、远端文件管理器（浏览电脑目录/上传/下载到 `Download/Brioche/`/新建文件夹/重命名/删除 + SHA-256 校验 + 传输队列与限速）、Opus 48kHz 低延迟系统音频播放、MediaCodec 硬件 H.264/HEVC 解码、详细性能 HUD、缩放模式、触控板/直触双模式、多显示器实时切换、全套桌面快捷键、双向剪贴板同步、Light/Dark 双主题及单设备独立配置。详见 [android/README.md](android/README.md)。
 
 0.9 带来全面现代化升级：统一设备工作台与 Light/Dark 双主题、右侧单设备独立配置抽屉、多标签远程窗口（顶部自动隐藏悬浮胶囊工具栏、可拖拽性能 HUD、缩放模式、组合键菜单）、断线无感自动重连、双向文本剪贴板同步、长按按键重复与水平滚轮/Mac↔Win 键位映射、局域网自动发现与逐台撤销配对、双栏远程文件管理器（支持文件夹递归、无人值守直传、画布拖拽上传与可调高速传输）、Opus 低延迟系统音频与被控端桌面悬浮控制条。
 

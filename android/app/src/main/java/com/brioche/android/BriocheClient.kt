@@ -210,7 +210,7 @@ class BriocheClient(
                     Thread.sleep(wait * 1000L)
                     if (stopped.get()) break
                     if (tailscaleIp.isNotEmpty()) {
-                        listener.onStatus("正在通过内置 Tailscale 重建外网隧道…")
+                        listener.onStatus("正在通过内置 EasyTier 重建外网隧道…")
                         val oldTid = activeTunnelId
                         if (oldTid.isNotEmpty()) {
                             EmbeddedNetwork.get(appContext).closeTunnel(oldTid)
@@ -262,7 +262,7 @@ class BriocheClient(
         token: String,
         isReconnect: Boolean,
     ) {
-        val label = if (tailscaleIp.isNotEmpty()) "Tailscale $tailscaleIp" else "$host:$port"
+        val label = if (tailscaleIp.isNotEmpty()) "EasyTier $tailscaleIp" else "$host:$port"
         listener.onStatus("正在建立加密连接 $label…")
         val (socket, _) = BriocheProtocol.openPinnedTls(host, port, pin, connectTimeoutMs = 10_000, readTimeoutMs = 25_000)
         activeSocket = socket

@@ -66,16 +66,21 @@ async def browser_check(url, folder):
             await ws.send_json({"type":"bye"})
             await ws.close()
     await asyncio.sleep(.25)
-# The shipped helper must work without a system tailscale executable or daemon.
+# The shipped EasyTier binaries must work without root or TUN devices.
 from brioche.embedded_network import EmbeddedNetwork
 with tempfile.TemporaryDirectory() as node_state:
-    network = EmbeddedNetwork(folder=node_state, executable=args.binary.parent / "_internal/network/brioche-network")
+    et_core = args.binary.parent / "_internal/network/easytier-core"
+    et_cli = args.binary.parent / "_internal/network/easytier-cli"
+    assert et_core.is_file() and et_cli.is_file(), "Missing bundled EasyTier binaries"
+    ver = subprocess.run([str(et_core), "--version"], capture_output=True, text=True, timeout=10)
+    assert ver.returncode == 0, ver.stderr
+    network = EmbeddedNetwork(folder=node_state, executable=et_core, cli_executable=et_cli)
     try:
-        result = network.request("status")
-        assert result.get("state") in ("NoState", "Starting", "NeedsLogin", "NeedsMachineAuth", "Running", "Stopped")
+        result = network.status()
+        assert result.get("state") == "NeedsLogin"
     finally:
         network.close()
-    print("Bundled tsnet helper: private IPC startup/shutdown passed without system Tailscale")
+    print(f"Bundled EasyTier helper verified: {ver.stdout.strip()}")
 
 with tempfile.TemporaryDirectory() as state:
     process = subprocess.Popen([str(args.binary), "host", "--port", "0",

@@ -6,8 +6,10 @@ import os
 import argparse
 
 root = Path(__file__).resolve().parents[1]
-helper = root / "runtime/network" / ("brioche-network.exe" if sys.platform == "win32" else "brioche-network")
-if not helper.is_file():
+ext = ".exe" if sys.platform == "win32" else ""
+et_core = root / "runtime/network" / f"easytier-core{ext}"
+et_cli = root / "runtime/network" / f"easytier-cli{ext}"
+if not et_core.is_file() or not et_cli.is_file():
     raise SystemExit("Build the embedded network module first: scripts/build_network.py")
 media = root / "runtime/media" / ("ffmpeg.exe" if sys.platform == "win32" else "ffmpeg")
 if sys.platform != 'darwin' and not media.is_file():
@@ -24,7 +26,8 @@ args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir
         "--hidden-import", "PySide6.QtOpenGLWidgets",
         "--add-data", f"{root / 'assets'}{os.pathsep}assets",
         "--copy-metadata", "brioche-desktop",
-        "--add-binary", f"{helper}{os.pathsep}network"]
+        "--add-binary", f"{et_core}{os.pathsep}network",
+        "--add-binary", f"{et_cli}{os.pathsep}network"]
 if sys.platform == 'darwin':
     args += ['--additional-hooks-dir',str(root/'scripts/macos_hooks')]
 else:
@@ -36,9 +39,9 @@ if sys.platform != 'darwin':
 core_bin = root / "runtime/core" / ("brioche-core.exe" if sys.platform == "win32" else "brioche-core")
 if core_bin.is_file():
     args += ["--add-binary", f"{core_bin}{os.pathsep}core"]
-if (helper.parent / "licenses").is_dir():
-    args += ["--add-data", f"{helper.parent / 'licenses'}{os.pathsep}network/licenses",
-             "--add-data", f"{helper.parent / 'DEPENDENCIES.txt'}{os.pathsep}network"]
+if (et_core.parent / "licenses").is_dir():
+    args += ["--add-data", f"{et_core.parent / 'licenses'}{os.pathsep}network/licenses",
+             "--add-data", f"{et_core.parent / 'DEPENDENCIES.txt'}{os.pathsep}network"]
 if sys.platform.startswith("linux"):
     library = root / "runtime/linux/usr/lib/x86_64-linux-gnu/libxcb-cursor.so.0"
     if library.exists():

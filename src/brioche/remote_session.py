@@ -463,7 +463,7 @@ class RemoteSessionPage(QWidget):
         self._path_text = {
             "lan": "局域网",
             "loopback": "回环",
-            "tailscale": "Tailscale",
+            "tailscale": "EasyTier",
         }[self.network_mode]
 
         layout = QVBoxLayout(self)
