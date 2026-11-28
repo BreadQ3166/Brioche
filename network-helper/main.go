@@ -15,11 +15,14 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
 	"tailscale.com/client/local"
+	"tailscale.com/net/netmon"
+	"tailscale.com/net/netns"
 	"tailscale.com/tsnet"
 )
 
@@ -648,18 +651,129 @@ func installFallbackDNS(raw string) {
 	}
 }
 
+func probeOutboundIPv4() net.IP {
+	for _, target := range []string{"1.1.1.1:53", "223.5.5.5:53", "8.8.8.8:53"} {
+		conn, err := net.DialTimeout("udp4", target, 800*time.Millisecond)
+		if err != nil {
+			continue
+		}
+		localAddr, ok := conn.LocalAddr().(*net.UDPAddr)
+		conn.Close()
+		if ok && localAddr.IP != nil && !localAddr.IP.IsLoopback() {
+			return localAddr.IP
+		}
+	}
+	return nil
+}
+
+// buildAndroidSafeInterfaces constructs a netmon interface list without calling Linux netlinkrib,
+// which Android 11+ SELinux blocks for unprivileged app UIDs.
+func buildAndroidSafeInterfaces(rawIfaces string) []netmon.Interface {
+	_, lo4, _ := net.ParseCIDR("127.0.0.1/8")
+	_, lo6, _ := net.ParseCIDR("::1/128")
+	result := []netmon.Interface{
+		{
+			Interface: &net.Interface{
+				Index: 1,
+				MTU:   65536,
+				Name:  "lo",
+				Flags: net.FlagUp | net.FlagLoopback | net.FlagRunning,
+			},
+			AltAddrs: []net.Addr{lo4, lo6},
+		},
+	}
+	seenIPs := map[string]bool{"127.0.0.1": true, "::1": true}
+	idx := 2
+	for _, entry := range strings.Split(rawIfaces, ";") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, addrList, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name == "" {
+			name = fmt.Sprintf("net%d", idx)
+		}
+		var addrs []net.Addr
+		for _, cidr := range strings.Split(addrList, ",") {
+			cidr = strings.TrimSpace(cidr)
+			if cidr == "" {
+				continue
+			}
+			ip, ipNet, err := net.ParseCIDR(cidr)
+			if err != nil {
+				if parsed := net.ParseIP(cidr); parsed != nil {
+					mask := net.CIDRMask(24, 32)
+					if parsed.To4() == nil {
+						mask = net.CIDRMask(64, 128)
+					}
+					ip = parsed
+					ipNet = &net.IPNet{IP: parsed, Mask: mask}
+				} else {
+					continue
+				}
+			} else {
+				ipNet.IP = ip
+			}
+			seenIPs[ip.String()] = true
+			addrs = append(addrs, ipNet)
+		}
+		if len(addrs) > 0 {
+			result = append(result, netmon.Interface{
+				Interface: &net.Interface{
+					Index: idx,
+					MTU:   1500,
+					Name:  name,
+					Flags: net.FlagUp | net.FlagBroadcast | net.FlagRunning | net.FlagMulticast,
+				},
+				AltAddrs: addrs,
+			})
+			idx++
+		}
+	}
+	// Always include live outbound IPv4 if phone switched Wi-Fi <-> 5G after startup
+	if liveIP := probeOutboundIPv4(); liveIP != nil && !seenIPs[liveIP.String()] {
+		result = append(result, netmon.Interface{
+			Interface: &net.Interface{
+				Index: idx,
+				MTU:   1500,
+				Name:  "wlan0",
+				Flags: net.FlagUp | net.FlagBroadcast | net.FlagRunning | net.FlagMulticast,
+			},
+			AltAddrs: []net.Addr{
+				&net.IPNet{IP: liveIP, Mask: net.CIDRMask(24, 32)},
+			},
+		})
+	}
+	return result
+}
+
 func main() {
 	state := flag.String("state-dir", "", "private node state")
 	hostFlag := flag.String("hostname", "", "optional custom node hostname")
 	dnsFlag := flag.String("dns", "", "comma-separated fallback DNS servers")
+	androidSafe := flag.Bool("android-safe", false, "avoid netlinkrib and SO_MARK on Android app sandbox")
+	ifacesFlag := flag.String("ifaces", "", "semicolon-separated iface=cidr,cidr entries from Android ConnectivityManager")
 	flag.Parse()
 	if *state == "" {
+		fmt.Fprintln(os.Stderr, "missing --state-dir")
 		os.Exit(2)
 	}
 	if *dnsFlag != "" {
 		installFallbackDNS(*dnsFlag)
 	}
+	if *androidSafe || runtime.GOOS == "android" {
+		netns.SetEnabled(false)
+		rawIfaces := *ifacesFlag
+		netmon.RegisterInterfaceGetter(func() ([]netmon.Interface, error) {
+			return buildAndroidSafeInterfaces(rawIfaces), nil
+		})
+	}
 	if err := os.MkdirAll(*state, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "mkdir state-dir: %v\n", err)
 		os.Exit(2)
 	}
 	os.Chmod(*state, 0700)
@@ -673,11 +787,13 @@ func main() {
 	server := &tsnet.Server{Dir: *state, Hostname: "brioche-" + name, Logf: func(string, ...any) {}, UserLogf: func(string, ...any) {}}
 	log.SetOutput(io.Discard)
 	if err := server.Start(); err != nil {
+		fmt.Fprintf(os.Stderr, "tsnet start: %v\n", err)
 		os.Exit(3)
 	}
 	defer server.Close()
 	localClient, err := server.LocalClient()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "tsnet localclient: %v\n", err)
 		os.Exit(3)
 	}
 	b := &bridge{server: server, client: localClient, tunnels: map[string]net.Listener{}, udpTunnels: map[string]io.Closer{}, connections: map[net.Conn]bool{}, udpAuth: map[string]udpAuthEntry{}}

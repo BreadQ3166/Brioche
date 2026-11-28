@@ -33,6 +33,10 @@ func TestEndpointAndOwnership(t *testing.T) {
 	if validShare(share{Port: 22, Pin: "x", Token: "x"}) {
 		t.Fatal("invalid credentials accepted")
 	}
+	ifaces := buildAndroidSafeInterfaces("wlan0=192.168.1.42/24,fe80::1/64;rmnet0=10.20.30.40/32")
+	if len(ifaces) < 3 || ifaces[0].Name != "lo" || ifaces[1].Name != "wlan0" || len(ifaces[1].AltAddrs) != 2 {
+		t.Fatalf("unexpected android safe interfaces: %+v", ifaces)
+	}
 }
 func TestEmbeddedTransport(t *testing.T) {
 	for _, same := range []bool{true, false} {

@@ -96,6 +96,8 @@ class EmbeddedNetwork private constructor(private val appContext: Context) {
     private var process: Process? = null
     private var writer: BufferedWriter? = null
     private var responses = LinkedBlockingQueue<JSONObject>()
+    @Volatile
+    private var lastStderr: String = ""
 
     val isEnabled: Boolean
         get() = enabledMarker.exists()
@@ -107,6 +109,27 @@ class EmbeddedNetwork private constructor(private val appContext: Context) {
     fun isBinaryAvailable(): Boolean {
         val bin = binaryFile()
         return bin.isFile && bin.canExecute()
+    }
+
+    private fun resolveAndroidInterfacesSpec(): String {
+        val parts = mutableListOf<String>()
+        try {
+            val cm = appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            val net = cm?.activeNetwork
+            val props = if (net != null) cm.getLinkProperties(net) else null
+            if (props != null) {
+                val ifName = (props.interfaceName ?: "wlan0").replace(Regex("[^a-zA-Z0-9._-]"), "")
+                val cidrs = props.linkAddresses.mapNotNull { la ->
+                    val host = la.address?.hostAddress?.substringBefore('%')
+                    if (!host.isNullOrBlank()) "$host/${la.prefixLength}" else null
+                }
+                if (cidrs.isNotEmpty()) {
+                    parts.add("$ifName=${cidrs.joinToString(",")}")
+                }
+            }
+        } catch (_: Exception) {
+        }
+        return parts.joinToString(";")
     }
 
     private fun resolveAndroidDnsCsv(): String {
@@ -139,26 +162,59 @@ class EmbeddedNetwork private constructor(private val appContext: Context) {
             throw IllegalStateException("当前架构未包含内置 Tailscale 组件（${Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"}）")
         }
         stateDir.mkdirs()
+        val xdgConfig = File(folder, "config").apply { mkdirs() }
         val hostName = sanitizeHostname("android-${Build.MODEL}")
         val dnsCsv = resolveAndroidDnsCsv()
-        val pb = ProcessBuilder(
+        val ifacesSpec = resolveAndroidInterfacesSpec()
+        val cmd = mutableListOf(
             bin.absolutePath,
             "--state-dir", stateDir.absolutePath,
             "--hostname", hostName,
             "--dns", dnsCsv,
+            "--android-safe",
         )
+        if (ifacesSpec.isNotEmpty()) {
+            cmd.add("--ifaces")
+            cmd.add(ifacesSpec)
+        }
+        val pb = ProcessBuilder(cmd)
         pb.redirectErrorStream(false)
         val env = pb.environment()
         env.keys.filter { it.startsWith("TS_") || it.startsWith("TSNET_") || it.startsWith("TAILSCALE_") }
             .forEach { env.remove(it) }
         env["HOME"] = folder.absolutePath
+        env["XDG_CONFIG_HOME"] = xdgConfig.absolutePath
+        env["XDG_CACHE_HOME"] = appContext.cacheDir.absolutePath
         env["TMPDIR"] = appContext.cacheDir.absolutePath
+        env["TS_NO_LOGS_NO_SUPPORT"] = "true"
 
+        lastStderr = ""
         val proc = pb.start()
         val queue = LinkedBlockingQueue<JSONObject>()
         process = proc
         writer = BufferedWriter(OutputStreamWriter(proc.outputStream, Charsets.UTF_8))
         responses = queue
+
+        Thread({
+            try {
+                BufferedReader(InputStreamReader(proc.errorStream, Charsets.UTF_8)).use { errReader ->
+                    val lines = ArrayDeque<String>()
+                    while (true) {
+                        val line = errReader.readLine() ?: break
+                        val trimmed = line.trim()
+                        if (trimmed.isNotEmpty()) {
+                            lines.addLast(trimmed)
+                            while (lines.size > 4) lines.removeFirst()
+                            lastStderr = lines.joinToString(" | ").take(240)
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }, "brioche-network-stderr").apply {
+            isDaemon = true
+            start()
+        }
 
         Thread({
             try {
@@ -174,7 +230,15 @@ class EmbeddedNetwork private constructor(private val appContext: Context) {
                 }
             } catch (_: Exception) {
             } finally {
-                queue.put(JSONObject().apply { put("__eof", true) })
+                val exitCode = try {
+                    if (proc.isAlive) -1 else proc.exitValue()
+                } catch (_: Exception) {
+                    -1
+                }
+                queue.put(JSONObject().apply {
+                    put("__eof", true)
+                    put("__exit", exitCode)
+                })
             }
         }, "brioche-network-ipc").apply {
             isDaemon = true
@@ -210,8 +274,14 @@ class EmbeddedNetwork private constructor(private val appContext: Context) {
                     val resp = responses.poll(remaining, TimeUnit.MILLISECONDS)
                         ?: continue
                     if (resp.optBoolean("__eof", false)) {
+                        val exitCode = resp.optInt("__exit", -1)
+                        val detail = lastStderr
                         terminateLocked()
-                        throw IllegalStateException("内置网络模块已退出，请重试")
+                        val suffix = buildString {
+                            if (exitCode >= 0) append(" (exit=$exitCode)")
+                            if (detail.isNotEmpty()) append(": $detail")
+                        }
+                        throw IllegalStateException("内置网络模块已退出$suffix")
                     }
                     val cid = resp.optInt("id", -1)
                     if (cid == reqId) {
