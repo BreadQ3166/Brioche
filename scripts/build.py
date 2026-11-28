@@ -28,6 +28,8 @@ args = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onedir
         "--copy-metadata", "brioche-desktop",
         "--add-binary", f"{et_core}{os.pathsep}network",
         "--add-binary", f"{et_cli}{os.pathsep}network"]
+for dll in sorted(et_core.parent.glob("*.dll")):
+    args += ["--add-binary", f"{dll}{os.pathsep}network"]
 if sys.platform == 'darwin':
     args += ['--additional-hooks-dir',str(root/'scripts/macos_hooks')]
 else:

@@ -55,16 +55,21 @@ def download_file(url: str, dest: Path):
 def extract_binaries(archive: Path, out_dir: Path, is_windows: bool, rename_so: bool = False):
     ext = ".exe" if is_windows else ""
     wanted = {f"easytier-core{ext}": None, f"easytier-cli{ext}": None}
+    extra_dlls = {}
     with zipfile.ZipFile(archive) as zf:
         for member in zf.namelist():
             base = Path(member).name
-            if base in wanted and not member.endswith("/"):
+            if member.endswith("/"):
+                continue
+            if base in wanted:
                 wanted[base] = member
+            elif is_windows and base.lower().endswith(".dll"):
+                extra_dlls[base] = member
         missing = [k for k, v in wanted.items() if v is None]
         if missing:
             raise SystemExit(f"Missing {missing} in {archive.name}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        for base, member in wanted.items():
+        for base, member in {**wanted, **extra_dlls}.items():
             if rename_so:
                 dst_name = "libeasytier_core.so" if "core" in base else "libeasytier_cli.so"
             else:
